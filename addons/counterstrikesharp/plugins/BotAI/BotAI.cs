@@ -23,7 +23,7 @@ public static class BotOffsets
 public class BotAI : BasePlugin
 {
     public override string ModuleName        => "Patches - Bot AI";
-    public override string ModuleVersion     => "1.7.0";
+    public override string ModuleVersion     => "1.7.1";
     public override string ModuleAuthor      => "K4ryuu & Austin (updated by ed0ard)";
     public override string ModuleDescription =>
         "Improve and fix bots' behavior comprehensively";
@@ -61,7 +61,7 @@ public class BotAI : BasePlugin
 
         // EscapeFromBombState::OnEnter tail-call jmp → ret (prevents crash)
         ["EscapeFromBomb_OnEnter_NoEquipKnife"] = (
-            signature:        "C6 83 64 4F 00 00 00 C6 83 8C 4F 00 00 00 48 83 C4 20 5B E9",
+            signature:        "C6 83 ? ? 00 00 00 C6 83 ? ? 00 00 00 48 83 C4 20 5B E9",
             patch:            "C3 90 90 90 90",
             expectedOriginal: "E9 ? ? ? ?",
             patchOffset:      19
@@ -77,18 +77,10 @@ public class BotAI : BasePlugin
 
         // EscapeFromFlamesState::OnEnter call → NOP
         ["EscapeFromFlames_OnEnter_NoEquipKnife"] = (
-            signature:        "48 8B CB 40 88 BB 64 4F 00 00 40 88 BB 8C 4F 00 00 E8 ? ? ? ? F3 0F 10 0D",
+            signature:        "48 8B CB 40 88 BB ? ? 00 00 40 88 BB ? ? 00 00 E8 ? ? ? ? F3 0F 10 0D",
             patch:            "90 90 90 90 90",
             expectedOriginal: "E8 ? ? ? ?",
             patchOffset:      17
-        ),
-
-
-        ["InvestigateNoise_SkipSelfDefenseCheck"] = (
-            signature:        "83 BB 08 53 00 00 02 74 1E",
-            patch:            "90 90",
-            expectedOriginal: "74 1E",
-            patchOffset:      7    // VA 0x180335696: je → NOP NOP
         ),
 
 
@@ -223,7 +215,7 @@ public class BotAI : BasePlugin
         ),
 
         ["AllSkill_KeepMoving_WhenSeeSniper"] = (
-            signature:        "0F 2F 05 ? ? ? ? 76 0D 80 BF AC 05 00 00 00 0F 85",
+            signature:        "0F 2F 05 ? ? ? ? 76 0D 80 BF ? ? 00 00 00 0F 85",
             patch:            "90 90",
             expectedOriginal: "76 0D",
             patchOffset:      7    // RVA 0x2cbb4d: jbe +0D → NOP
@@ -245,21 +237,21 @@ public class BotAI : BasePlugin
 
 
         ["Vision_AlwaysWatchApproachPoints"] = (
-            signature:        "80 BF B1 5C 00 00 00 75 25 0F 2F",
+            signature:        "80 BF ? ? 00 00 00 75 25 0F 2F",
             patch:            "EB 25",
             expectedOriginal: "75 25",
             patchOffset:      7    // VA 0x180319304: jne→jmp
         ),
 
         ["Vision_ApproachBody_SkipSkillCheck"] = (
-            signature:        "0F 2F C7 76 3B 80 BF B1 5C 00 00 00 74 32",
+            signature:        "0F 2F C7 76 3B 80 BF ? ? 00 00 00 74 32",
             patch:            "90 90",
             expectedOriginal: "76 3B",
             patchOffset:      3
         ),
 
         ["Vision_ApproachBody_SkipHidingSpotCheck"] = (
-            signature:        "0F 2F C7 76 3B 80 BF B1 5C 00 00 00 74 32",
+            signature:        "0F 2F C7 76 3B 80 BF ? ? 00 00 00 74 32",
             patch:            "90 90",
             expectedOriginal: "74 32",
             patchOffset:      12
@@ -280,6 +272,13 @@ public class BotAI : BasePlugin
         ),
 
 
+        ["InvestigateNoise_SkipSelfDefenseCheck"] = (
+            signature:        "83 BB ? ? 00 00 02 74 1E",
+            patch:            "90 90",
+            expectedOriginal: "74 1E",
+            patchOffset:      7     // VA 0x180335696: je → NOP NOP
+        ),
+
         // Source: IdleState::OnUpdate, T-side "bomb planted but site unknown" path
         //   bombSite = GetGameState()->GetNextBombsiteToSearch();
         //   → replaced with:
@@ -287,9 +286,9 @@ public class BotAI : BasePlugin
         // With the patch active: [gameState+0x68] is set at plant time for all bots.
         //  directly to the planted site instead of random searching.
         ["TBot_BombsiteSearch_UseKnownPlantedSite"] = (
-            signature:        "48 8B 8E 18 5E 00 00 E8 ? ? ? ? 49 8B CC E8 ? ? ? ? 4C 8B 05 ? ? ? ? 85 C0",
-            patch:            "E8 35 49 F9 FF",
-            expectedOriginal: "E8 B5 42 F9 FF",
+            signature:        "48 8B 8E ? ? 00 00 E8 ? ? ? ? 49 8B CC E8 ? ? ? ? 4C 8B 05 ? ? ? ? 85 C0",
+            patch:            "E8 55 4A F9 FF",
+            expectedOriginal: "E8 D5 43 F9 FF",
             patchOffset:      15
         ),
 
@@ -336,7 +335,7 @@ public class BotAI : BasePlugin
         //       UpdatePlantedBomb(plantingPlayer->GetAbsOrigin());
         // NOP the jne (75 6D → 90 90) → ALL bots get
         ["OnBombPlanted_AllBotsLearnSite"] = (
-            signature:        "80 BA 44 03 00 00 02 75 6D 48 85 DB 74 68",
+            signature:        "80 BA ? ? 00 00 02 75 6D 48 85 DB 74 68",
             patch:            "90 90",
             expectedOriginal: "75 6D",
             patchOffset:      7
@@ -349,7 +348,7 @@ public class BotAI : BasePlugin
         // Patch edx=2 → edx=0 (ENGAGE_AND_INVESTIGATE) so the defusing CT
         // will chase noises and actively hunt while moving to defuse.
         ["CT_Defuse_EngageAndInvestigate"] = (
-            signature:        "C7 86 B0 05 00 00 03 00 00 00 BA 02 00 00 00 48 8B CE",
+            signature:        "C7 86 ? ? 00 00 03 00 00 00 BA 02 00 00 00 48 8B CE",
             patch:            "BA 00 00 00 00",
             expectedOriginal: "BA 02 00 00 00",
             patchOffset:      10
@@ -358,8 +357,8 @@ public class BotAI : BasePlugin
         // Source: cs_bot_defuse_bomb.cpp — DefuseBombState::OnUpdate
         //   me->SetDisposition(CCSBot::SELF_DEFENSE); 
         // mov edx, 2 (SELF_DEFENSE)-> 0 (ENGAGE_AND_INVESTIGATE)
-        ["DefuseBombState_OnUpdate_OpportunityFire"] = (
-            signature:        "48 8D 8A 10 51 00 00 48 8B DA E8 ? ? ? ? BA 02 00 00 00 48 8B CB",
+        ["DefuseBombState_OnUpdate_EngageAndInvestigate"] = (
+            signature:        "48 8D 8A ? ? 00 00 48 8B DA E8 ? ? ? ? BA 02 00 00 00 48 8B CB",
             patch:            "BA 00 00 00 00",
             expectedOriginal: "BA 02 00 00 00",
             patchOffset:      15
@@ -383,9 +382,9 @@ public class BotAI : BasePlugin
         //   m_me->StopAiming();      ← PATCHED OUT
         //   return false;            ← KEPT (return value unchanged, avoid crash)
         ["FlashbangAvoidance_Disable"] = (
-            signature:        "49 8B 0E 0F 14 E3 F2 0F 11 65 17 F3 0F 11 55 1F F3 0F 11 4C 24 20 E8 ? ? ? ? 49 8B 06 C6 80 64 5C 00 00 00",
+            signature:        "49 8B 0E 0F 14 E3 F2 0F 11 65 17 F3 0F 11 55 1F F3 0F 11 4C 24 20 E8 ? ? ? ? 49 8B 06 C6 80 ? ? 00 00 00",
             patch:            "90 90 90 90 90 90 90 90 90 90 90 90 90 90 90",
-            expectedOriginal: "E8 8E BA 02 00 49 8B 06 C6 80 64 5C 00 00 00",
+            expectedOriginal: "E8 CE BC 02 00 49 8B 06 C6 80 84 5C 00 00 00",
             patchOffset:      22
         ),
     };
