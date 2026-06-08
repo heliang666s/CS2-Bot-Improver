@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes;
@@ -16,8 +17,8 @@ namespace BotAimImprover;
 public class BotAimImprover : BasePlugin
 {
     public override string ModuleName => "BotAimImprover";
-    public override string ModuleVersion => "2.0.2";
-    public override string ModuleAuthor => "ed0ard";
+    public override string ModuleVersion => "2.1.0";
+    public override string ModuleAuthor => "ed0ard & htfy96";
     public override string ModuleDescription => "Restores intelligent aim part selection for CS2 bots.";
 
     // ============================================================
@@ -92,21 +93,36 @@ public class BotAimImprover : BasePlugin
         16               // FEET
     };
     // ============================================================
-    // Memory offsets (2026-05-19)
+    // Platform-specific memory layout (PickNewAimSpot hook + CCSBot fields).
+    //   Linux  libserver.so 2026-05-28
+    //   Windows server.dll  2026-05-19 / 2026-06-02
     // ============================================================
-    // CCSBot fields:
-    private const int OFF_M_TARGETSPOT       = 0x59A4; // Vector(3 floats)
-    private const int OFF_M_ENEMY_HANDLE     = 0x5A10; // CHandle (4 bytes)
-    private const int OFF_M_IS_ENEMY_VISIBLE = 0x5A14; // bool
+    private readonly struct Offsets
+    {
+        public readonly int TargetSpot;   // Vector(3) m_targetSpot
+        public readonly int Enemy;        // CHandle m_enemy
+        public readonly int IsVisible;    // bool m_isEnemyVisible
+        public readonly int PBot;         // CCSPlayerPawn->m_pBot
+        public readonly string Sig;
+        public Offsets(int ts, int en, int vis, int pbot, string sig)
+        {
+            TargetSpot = ts;
+            Enemy = en;
+            IsVisible = vis;
+            PBot = pbot;
+            Sig = sig;
+        }
+    }
 
-    // CCSPlayerPawn->m_pBot is a CCSBot*. Used to map controller -> pawn -> bot for caching.
-    private const int OFF_PAWN_M_PBOT = 0x1298;
+    private static readonly Offsets LinuxOffsets = new(
+        ts: 0x597C, en: 0x59E8, vis: 0x59EC, pbot: 0x1568,
+        sig: "55 48 89 E5 41 55 41 54 53 48 89 FB 48 83 EC 58 8B 8F E8 59 00 00 83 F9 FF");
 
-    // ============================================================
-    // Function signature - server.dll 2026-05-19 build, Windows x64.
-    // ============================================================
-    private const string SIG_PICK_NEW_AIM_SPOT =
-        "48 8B C4 55 57 48 8D 68 A1 48 81 EC A8 00 00 00 48 8B F9 0F 29 70 D8 8B 89 10 5A 00 00 83 F9 FF";
+    private static readonly Offsets WindowsOffsets = new(
+        ts: 0x59A4, en: 0x5A10, vis: 0x5A14, pbot: 0x1298,
+        sig: "48 8B C4 55 57 48 8D 68 A1 48 81 EC A8 00 00 00 48 8B F9 0F 29 70 D8 8B 89 10 5A 00 00 83 F9 FF");
+
+    private Offsets _off;
 
     private MemoryFunctionVoid<IntPtr>? _pickNewAimSpot;
     private static readonly PluginCapability<CRayTraceInterface> _rayTraceCapability =
@@ -136,11 +152,15 @@ public class BotAimImprover : BasePlugin
     // ============================================================
     // Lifecycle
     // ============================================================
+
     public override void Load(bool hotReload)
     {
+        bool win = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        _off = win ? WindowsOffsets : LinuxOffsets;
+
         try
         {
-            _pickNewAimSpot = new MemoryFunctionVoid<IntPtr>(SIG_PICK_NEW_AIM_SPOT);
+            _pickNewAimSpot = new MemoryFunctionVoid<IntPtr>(_off.Sig);
 
             long pnaRuntime = _pickNewAimSpot.Handle.ToInt64();
             if (pnaRuntime == 0)
@@ -148,7 +168,8 @@ public class BotAimImprover : BasePlugin
 
             _pickNewAimSpot.Hook(OnPickNewAimSpotPost, HookMode.Post);
 
-            Logger.LogInformation("[BotAimImprover] Loaded. PickNewAimSpot=0x{Pna:X16}", pnaRuntime);
+            Logger.LogInformation("[BotAimImprover] Loaded ({Plat}). PickNewAimSpot=0x{Pna:X16}",
+                win ? "Windows" : "Linux", pnaRuntime);
         }
         catch (Exception ex)
         {
@@ -228,11 +249,11 @@ public class BotAimImprover : BasePlugin
 
             // 1) Gate: enemy must be generally visible before we
             //    spend any raytraces. Otherwise the native used last-known position.
-            if (ReadByte(pCCSBot + OFF_M_IS_ENEMY_VISIBLE) == 0)
+            if (ReadByte(pCCSBot + _off.IsVisible) == 0)
                 return HookResult.Continue;
 
             // 2) Resolve enemy pawn from m_enemy CHandle.
-            int enemyHandleRaw = ReadInt32(pCCSBot + OFF_M_ENEMY_HANDLE);
+            int enemyHandleRaw = ReadInt32(pCCSBot + _off.Enemy);
             if (enemyHandleRaw == -1)
                 return HookResult.Continue;
 
@@ -276,7 +297,7 @@ public class BotAimImprover : BasePlugin
             // 7) Overwrite only m_targetSpot.xyz.
             unsafe
             {
-                float* dst = (float*)(pCCSBot + OFF_M_TARGETSPOT).ToPointer();
+                float* dst = (float*)(pCCSBot + _off.TargetSpot).ToPointer();
                 dst[0] = rx; dst[1] = ry; dst[2] = rz;
             }
 
@@ -321,7 +342,7 @@ public class BotAimImprover : BasePlugin
                 continue;
 
             IntPtr pBotPtr;
-            try { pBotPtr = ReadIntPtr(pawn.Handle + OFF_PAWN_M_PBOT); }
+            try { pBotPtr = ReadIntPtr(pawn.Handle + _off.PBot); }
             catch { continue; }
 
             if (pBotPtr == pCCSBot)
