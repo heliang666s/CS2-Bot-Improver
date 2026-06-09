@@ -23,7 +23,7 @@ public static class BotOffsets
 public class BotAI : BasePlugin
 {
     public override string ModuleName        => "Patches - Bot AI";
-    public override string ModuleVersion     => "1.8.1";
+    public override string ModuleVersion     => "1.8.2";
     public override string ModuleAuthor      => "K4ryuu & Austin (updated by ed0ard)";
     public override string ModuleDescription =>
         "Improve and fix bots' behavior comprehensively";
@@ -98,6 +98,16 @@ public class BotAI : BasePlugin
             patchOffset:      0    // VA 0x18031cce6
         ),
 
+        // MoveToState::OnUpdate - DefuseBomb IsVisible gate removal
+        // Source: if (me->IsVisible(*bombPos)) { me->DefuseBomb(); }
+        // Patch: NOP the je that skips DefuseBomb when IsVisible returns false.
+        // The two preceding distance checks (72u 3D + 48u 2D) remain intact.
+        ["DefuseBomb_SkipIsVisibleCheck"] = (
+            signature:        "0F 2F C8 0F 86 ? ? ? ? 45 33 C9 45 33 C0 48 8B D3 48 8B CE E8 ? ? ? ? 84 C0 0F 84 ? ? ? ? 48 8B CE",
+            patch:            "90 90 90 90 90 90",
+            expectedOriginal: "0F 84 D9 00 00 00",
+            patchOffset:      28
+        ),
 
         ["AttackState_SkipFireRateCheck"] = (
             signature:        "0F 2F 8B ? ? 00 00 0F 82",
