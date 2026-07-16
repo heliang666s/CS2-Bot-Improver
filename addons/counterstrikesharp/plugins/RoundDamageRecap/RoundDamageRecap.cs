@@ -17,7 +17,8 @@ public sealed class RoundDamageRecapPlugin : BasePlugin
     public override string ModuleAuthor => "YuGeYu (modified by ed0ard and unicbm)";
     public override string ModuleDescription => "Shows a round-end damage recap and current difficulty in chat.";
 
-    private const string ChatColorGreen = "\u0006";
+    private const string ChatColorGreen = "\u0004";
+    private const string ChatColorLime = "\u0006";
     private const string ChatColorDefault = "\u0001";
 
     private readonly Dictionary<int, Dictionary<int, DamageEntry>> _damageByAttacker = new();
@@ -192,7 +193,7 @@ public sealed class RoundDamageRecapPlugin : BasePlugin
             $"被击中{ChatColorGreen}{taken.HitCount}{ChatColorDefault}次 " +
             $"{ChatColorGreen}{taken.TotalDamage}{ChatColorDefault}伤害 " +
             $"剩{ChatColorGreen}{Math.Max(0, remainingHp)}{ChatColorDefault}HP " +
-            $"{enemyName}{ChatColorDefault}");
+            $"{ChatColorLime}{enemyName}{ChatColorDefault}");
     }
 
     private static bool TryParseDamageStyle(string value, out DamageRecapStyle style)
