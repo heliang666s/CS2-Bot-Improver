@@ -2,9 +2,11 @@ using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes;
 using CounterStrikeSharp.API.Modules.Cvars;
+using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Utils;
 using Common;
+using CompetitiveBotCore;
 using Microsoft.Extensions.Logging;
 using System.Runtime.InteropServices;
 
@@ -32,19 +34,34 @@ public class BotAI : BasePlugin
 
     private readonly List<PatchInfo> _appliedPatches = [];
     private readonly bool _isLinux = RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
+    private BotMatchProfile _profile = BotMatchProfile.Competitive;
+    private IReadOnlyDictionary<string, (string signature, string patch, string expectedOriginal, int patchOffset)> _activePatchDefinitions =
+        new Dictionary<string, (string signature, string patch, string expectedOriginal, int patchOffset)>();
 
 
 
     public override void Load(bool hotReload)
     {
-        Logger.LogInformation("Bot AI Patches loading...");
-        var patchDefinitions = _isLinux ? LinuxPatchDefinitions.All : WindowsPatchDefinitions.All;
+        _profile = ProfilePolicy.Resolve(
+            ProfileConfig.Load(ProfileConfig.DefaultPath(Server.GameDirectory)),
+            IsEntertainmentMode());
+        var allPatchDefinitions = _isLinux ? LinuxPatchDefinitions.All : WindowsPatchDefinitions.All;
+        _activePatchDefinitions = _profile == BotMatchProfile.Competitive
+            ? allPatchDefinitions.Where(pair => IsCompetitivePatchAllowed(pair.Key))
+                .ToDictionary(pair => pair.Key, pair => pair.Value)
+            : allPatchDefinitions;
 
-        foreach (var name in patchDefinitions.Keys)
+        Logger.LogInformation("Bot AI Patches loading with profile {Profile} ({Count}/{Total} patches)",
+            _profile, _activePatchDefinitions.Count, allPatchDefinitions.Count);
+
+        foreach (var name in _activePatchDefinitions.Keys)
         {
             if (ApplyPatch(name, _isLinux)) Logger.LogInformation($"{name}: applied.");
             else Logger.LogError($"{name}: FAILED.");
         }
+
+        AddCommand("bot_improver_profile", "Set the Bot Improver profile (restart/reload required)",
+            (caller, info) => SetProfileCommand(caller, info));
 
         RegisterEventHandler<EventPlayerSpawn>((@event, info) =>
         {
@@ -67,7 +84,7 @@ public class BotAI : BasePlugin
             return HookResult.Continue;
         });
 
-        Logger.LogInformation($"Applied {_appliedPatches.Count}/{patchDefinitions.Count} patches.");
+        Logger.LogInformation($"Applied {_appliedPatches.Count}/{_activePatchDefinitions.Count} patches.");
     }
 
     public override void Unload(bool hotReload)
@@ -84,8 +101,7 @@ public class BotAI : BasePlugin
     {
         try
         {
-            var patchDefinitions = linux ? LinuxPatchDefinitions.All : WindowsPatchDefinitions.All;
-            if (!patchDefinitions.TryGetValue(name, out var def)) return false;
+            if (!_activePatchDefinitions.TryGetValue(name, out var def)) return false;
 
             nint sigAddr = NativeAPI.FindSignature(GameUtils.GetModulePath("server"), def.signature);
             if (sigAddr == 0) { Logger.LogError($"'{name}': signature not found."); return false; }
@@ -113,6 +129,50 @@ public class BotAI : BasePlugin
             return true;
         }
         catch (Exception ex) { Logger.LogError($"'{name}': {ex.Message}"); return false; }
+    }
+
+    private void SetProfileCommand(CCSPlayerController? caller, CommandInfo info)
+    {
+        if (info.ArgCount < 2)
+        {
+            caller?.PrintToConsole($"[BotImprover] profile = {_profile.ToString().ToLowerInvariant()}");
+            return;
+        }
+
+        var value = info.GetArg(1);
+        var profile = ProfilePolicy.Parse(value);
+        var path = ProfileConfig.DefaultPath(Server.GameDirectory);
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, $"// Bot Improver profile\nbot_improver_profile {profile.ToString().ToLowerInvariant()}\n");
+            caller?.PrintToConsole($"[BotImprover] profile saved as {profile}. Restart/reload plugins to apply.");
+            Logger.LogInformation("Bot Improver profile changed to {Profile}; restart/reload required", profile);
+        }
+        catch (Exception ex)
+        {
+            caller?.PrintToConsole($"[BotImprover] failed to save profile: {ex.Message}");
+            Logger.LogError(ex, "Failed to save Bot Improver profile");
+        }
+    }
+
+    private static bool IsCompetitivePatchAllowed(string name)
+        => name is "HasVisitedEnemySpawn"
+            or "GameState_Reset"
+            or "EscapeFromBomb_OnEnter_NoEquipKnife"
+            or "EscapeFromBomb_OnUpdate_NoEquipKnife"
+            or "EscapeFromFlames_OnEnter_NoEquipKnife"
+            or "PlantBombLookAtPriorityLow"
+            or "DefuseBombLookAtPriorityLow"
+            or "TBot_BombsiteSearch_UseKnownPlantedSite";
+
+    private static bool IsEntertainmentMode()
+    {
+        bool teammatesAreEnemies = ConVar.Find("mp_teammates_are_enemies")?.StringValue is "1" or "true";
+        bool noSpread = ConVar.Find("weapon_accuracy_nospread")?.StringValue is "1" or "true";
+        bool unlimitedMoney = ConVar.Find("mp_maxmoney")?.StringValue == "0";
+        return teammatesAreEnemies || noSpread || unlimitedMoney;
     }
 
     private void RestorePatch(PatchInfo p)

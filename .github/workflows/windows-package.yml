@@ -1,0 +1,87 @@
+name: Windows package
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_repository:
+        description: "Runtime package source; keep upstream until your fork publishes CS2BotImprover.zip"
+        required: true
+        default: "ed0ard/CS2-Bot-Improver"
+        type: string
+      base_tag:
+        description: "Base Windows package tag"
+        required: true
+        default: "v1.4.2"
+        type: string
+      package_version:
+        description: "Name suffix for the generated package"
+        required: true
+        default: "manual"
+        type: string
+      publish_release:
+        description: "Publish the generated zip as a GitHub Release"
+        required: true
+        default: false
+        type: boolean
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+    env:
+      BASE_REPOSITORY: ${{ inputs.base_repository || 'ed0ard/CS2-Bot-Improver' }}
+      BASE_TAG: ${{ inputs.base_tag || 'v1.4.2' }}
+      PACKAGE_VERSION: ${{ inputs.package_version || github.ref_name || format('manual-{0}', github.run_number) }}
+      PUBLISH_RELEASE: ${{ github.event_name == 'push' || inputs.publish_release }}
+
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+
+      - name: Install .NET SDKs
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Build and stage Windows package
+        shell: pwsh
+        run: >-
+          ./scripts/package-windows.ps1
+          -BaseRepository "$env:BASE_REPOSITORY"
+          -BaseTag "$env:BASE_TAG"
+          -PackageVersion "$env:PACKAGE_VERSION"
+          -OutputDirectory "$env:GITHUB_WORKSPACE/artifacts"
+
+      - name: Upload Windows package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CS2BotImprover-windows-${{ env.PACKAGE_VERSION }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: ${{ env.PUBLISH_RELEASE == 'true' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $package = Get-ChildItem -LiteralPath artifacts -Filter "*.zip" | Select-Object -First 1
+          $checksum = Get-ChildItem -LiteralPath artifacts -Filter "*.sha256" | Select-Object -First 1
+          if (-not $package -or -not $checksum) {
+            throw "The Windows package or checksum was not produced."
+          }
+
+          $existing = gh release view "$env:PACKAGE_VERSION" --repo "$env:GITHUB_REPOSITORY" 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload "$env:PACKAGE_VERSION" $package.FullName $checksum.FullName --repo "$env:GITHUB_REPOSITORY" --clobber
+          } else {
+            gh release create "$env:PACKAGE_VERSION" $package.FullName $checksum.FullName --repo "$env:GITHUB_REPOSITORY" --title "CS2-Bot-Improver $env:PACKAGE_VERSION" --generate-notes
+          }

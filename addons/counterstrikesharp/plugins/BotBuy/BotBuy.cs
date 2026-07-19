@@ -4,6 +4,7 @@ using CounterStrikeSharp.API.Core.Attributes.Registration;
 using CounterStrikeSharp.API.Modules.Utils;
 using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Modules.Timers;
+using CompetitiveBotCore;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -65,6 +66,13 @@ public sealed class BotBuyPatch : BasePlugin
     {
         // Don't Buy on Aim_Rush
         if (Server.MapName == "aim_rush") return HookResult.Continue;
+
+        if (CurrentProfile() == BotMatchProfile.Competitive
+            && string.IsNullOrEmpty(ConVar.Find("bot_loadout")?.StringValue))
+        {
+            AddTimer(0.4f, ApplyCompetitiveBuy);
+            return HookResult.Continue;
+        }
 
         List<CCSPlayerController> allPlayers = new();
         List<CCSPlayerController> allCT = new();
@@ -562,12 +570,191 @@ public sealed class BotBuyPatch : BasePlugin
         return HookResult.Continue;
     }
 
+    private BotMatchProfile CurrentProfile()
+        => ProfilePolicy.Resolve(
+            ProfileConfig.Load(ProfileConfig.DefaultPath(Server.GameDirectory)),
+            IsEntertainmentMode());
+
+    private static bool IsEntertainmentMode()
+    {
+        bool teammatesAreEnemies = ConVar.Find("mp_teammates_are_enemies")?.StringValue is "1" or "true";
+        bool noSpread = ConVar.Find("weapon_accuracy_nospread")?.StringValue is "1" or "true";
+        bool unlimitedMoney = ConVar.Find("mp_maxmoney")?.StringValue == "0";
+        return teammatesAreEnemies || noSpread || unlimitedMoney;
+    }
+
+    private void ApplyCompetitiveBuy()
+    {
+        var players = Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
+            .Where(p => p.IsValid && p.IsBot && (p.Team == CsTeam.Terrorist || p.Team == CsTeam.CounterTerrorist))
+            .ToList();
+        if (players.Count == 0) return;
+
+        var tBots = players.Where(p => p.Team == CsTeam.Terrorist).ToList();
+        var ctBots = players.Where(p => p.Team == CsTeam.CounterTerrorist).ToList();
+        ApplyCompetitiveTeamBuy(tBots, ctBots, TeamSide.Terrorist);
+        ApplyCompetitiveTeamBuy(ctBots, tBots, TeamSide.CounterTerrorist);
+    }
+
+    private void ApplyCompetitiveTeamBuy(
+        List<CCSPlayerController> teamBots,
+        List<CCSPlayerController> opponentBots,
+        TeamSide side)
+    {
+        if (teamBots.Count == 0) return;
+
+        bool pistolRound = IsFirstRoundOfHalf();
+        bool lastRound = IsLastRoundOfHalf();
+        bool opponentEcoLikely = opponentBots.Count > 0
+            && opponentBots.Count(bot => (bot.InGameMoneyServices?.Account ?? 0) < 1800) >= Math.Max(1, opponentBots.Count - 1);
+        int forceEligible = teamBots.Count(bot => (bot.InGameMoneyServices?.Account ?? 0)
+            >= BuyPlanner.KevlarPrice + 1250);
+        int forceThreshold = Math.Max(1, (int)Math.Ceiling(teamBots.Count * 0.60d));
+        bool forceBuySignal = !pistolRound && !lastRound
+            && (IsSecondToLastRoundOfHalf() || forceEligible >= forceThreshold)
+            && teamBots.Any(bot => (bot.InGameMoneyServices?.Account ?? 0) >= 1900);
+
+        var snapshot = new TeamEconomySnapshot(
+            side,
+            teamBots.Select(bot => bot.InGameMoneyServices?.Account ?? 0).ToArray(),
+            pistolRound,
+            lastRound,
+            forceBuySignal,
+            opponentEcoLikely);
+        var phase = BuyPlanner.Classify(snapshot);
+        Server.PrintToConsole($"[BotBuy] Competitive BuyPlan side={side} phase={phase} bots={teamBots.Count} lastRound={lastRound}");
+
+        // Only one high-money bot per side may become the designated AWP role.
+        var awper = teamBots
+            .OrderByDescending(bot => bot.InGameMoneyServices?.Account ?? 0)
+            .FirstOrDefault(bot => (bot.InGameMoneyServices?.Account ?? 0) >= 5400);
+
+        foreach (var bot in teamBots)
+        {
+            int money = bot.InGameMoneyServices?.Account ?? 0;
+            var plan = BuyPlanner.BuildPlayerPlan(
+                side,
+                phase,
+                money,
+                designatedAwper: awper != null && ReferenceEquals(awper, bot),
+                opponentEcoLikely);
+            ExecuteCompetitiveBuyPlan(bot, side, plan);
+        }
+    }
+
+    private void ExecuteCompetitiveBuyPlan(CCSPlayerController player, TeamSide side, PlayerBuyPlan plan)
+    {
+        var pawn = player.PlayerPawn?.Value;
+        if (pawn == null || !pawn.IsValid || player.InGameMoneyServices == null) return;
+
+        // Do not spend on secondary/utility before the core armor decision.
+        if (plan.BuysArmor && pawn.ArmorValue <= 0)
+            Buy(player, "item_kevlar");
+
+        string? currentPrimary = CurrentPrimary(player);
+        // A carried primary is already paid for. Never delete it merely
+        // because it is outside the competitive whitelist: a failed follow-up
+        // purchase must not leave the bot without a primary or erase its value.
+        if (plan.PrimaryWeapon != null && currentPrimary == null)
+            Buy(player, plan.PrimaryWeapon);
+
+        if (plan.BuysHelmet && pawn.ArmorValue > 0 && !HasHelmet(player))
+            Buy(player, "item_assaultsuit");
+
+        if (plan.BuysDefuser && side == TeamSide.CounterTerrorist && !HasDefuser(player))
+            Buy(player, "item_defuser");
+
+        foreach (var utilityGroup in plan.Utility.GroupBy(utility => utility))
+        {
+            string utility = utilityGroup.Key;
+            string item = utility switch
+            {
+                "smoke" => "weapon_smokegrenade",
+                "flash" => "weapon_flashbang",
+                "he" => "weapon_hegrenade",
+                "molotov" when side == TeamSide.Terrorist => "weapon_molotov",
+                "molotov" => "weapon_incgrenade",
+                _ => string.Empty,
+            };
+            if (item.Length == 0) continue;
+
+            int currentCount = CountWeapon(player, item);
+            for (int i = currentCount; i < utilityGroup.Count(); i++)
+                Buy(player, item);
+        }
+
+        if (plan.Phase == BuyPhase.LastRound)
+            SpendLastRoundRemainder(player, side);
+    }
+
+    private void SpendLastRoundRemainder(CCSPlayerController player, TeamSide side)
+    {
+        if (player.InGameMoneyServices == null) return;
+
+        if (side == TeamSide.CounterTerrorist
+            && player.PlayerPawn?.Value?.ArmorValue > 0
+            && !HasHelmet(player))
+            Buy(player, "item_assaultsuit");
+        if (!HasWeapon(player, "weapon_deagle")) Buy(player, "weapon_deagle");
+        if (!HasWeapon(player, "weapon_taser")) Buy(player, "weapon_taser");
+        if (!HasWeapon(player, "weapon_hegrenade")) Buy(player, "weapon_hegrenade");
+        if (!HasWeapon(player, "weapon_flashbang")) Buy(player, "weapon_flashbang");
+    }
+
+    private string? CurrentPrimary(CCSPlayerController player)
+        => player.PlayerPawn?.Value?.WeaponServices?.MyWeapons
+            .Select(handle => handle.Value?.DesignerName)
+            .FirstOrDefault(name => name != null && IsPrimaryName(name));
+
+    private static bool IsPrimaryName(string name)
+        => name.StartsWith("weapon_ak", StringComparison.Ordinal)
+            || name.StartsWith("weapon_m4", StringComparison.Ordinal)
+            || name is "weapon_galilar" or "weapon_famas" or "weapon_awp"
+            || name is "weapon_aug" or "weapon_sg556" or "weapon_ssg08"
+            || name is "weapon_scar20" or "weapon_g3sg1"
+            || name is "weapon_p90" or "weapon_bizon" or "weapon_negev" or "weapon_m249"
+            || name is "weapon_mp9" or "weapon_mac10" or "weapon_mp7" or "weapon_mp5sd"
+            || name is "weapon_ump45" or "weapon_nova" or "weapon_xm1014"
+            || name is "weapon_sawedoff" or "weapon_mag7";
+
+    private static bool HasWeapon(CCSPlayerController player, string designerName)
+        => player.PlayerPawn?.Value?.WeaponServices?.MyWeapons
+            .Any(handle => handle.Value?.DesignerName == designerName) == true;
+
+    private static int CountWeapon(CCSPlayerController player, string designerName)
+        => player.PlayerPawn?.Value?.WeaponServices?.MyWeapons
+            .Count(handle => handle.Value?.DesignerName == designerName) ?? 0;
+
+    private static bool HasHelmet(CCSPlayerController player)
+    {
+        var pawn = player.PlayerPawn?.Value;
+        if (pawn?.ItemServices == null || pawn.ItemServices.Handle == nint.Zero) return false;
+        return new CCSPlayer_ItemServices(pawn.ItemServices.Handle).HasHelmet;
+    }
+
+    private static bool HasDefuser(CCSPlayerController player)
+    {
+        var pawn = player.PlayerPawn?.Value;
+        if (pawn?.ItemServices == null || pawn.ItemServices.Handle == nint.Zero) return false;
+        return new CCSPlayer_ItemServices(pawn.ItemServices.Handle).HasDefuser;
+    }
+
     [GameEventHandler]
     public HookResult OnRoundFreezeEnd(EventRoundFreezeEnd @event, GameEventInfo info)
     {
         ConVar? botLoadout = ConVar.Find("bot_loadout");
         if (botLoadout != null && !string.IsNullOrEmpty(botLoadout.StringValue))
         {
+            return HookResult.Continue;
+        }
+
+        if (CurrentProfile() == BotMatchProfile.Competitive)
+        {
+            // Prevent the native bot economy cvar from reintroducing the old
+            // per-bot save/force-buy heuristics after our BuyPlan runs.
+            Server.ExecuteCommand(IsLastRoundOfHalf()
+                ? "bot_eco_limit 0"
+                : "bot_eco_limit 2800");
             return HookResult.Continue;
         }
 
@@ -667,6 +854,11 @@ public sealed class BotBuyPatch : BasePlugin
             case "weapon_tec9":              price = 500;  canBuy = isT; break;
             case "weapon_fiveseven":         price = 500;  canBuy = isCT; break;
             case "weapon_deagle":            price = 700;  break;
+            case "weapon_smokegrenade":      price = 300;  break;
+            case "weapon_flashbang":         price = 200;  break;
+            case "weapon_hegrenade":         price = 300;  break;
+            case "weapon_molotov":           price = 400;  canBuy = isT; break;
+            case "weapon_incgrenade":        price = 500;  canBuy = isCT; break;
             case "weapon_cz75a":             price = 500;  break;
             case "weapon_revolver":          price = 600;  break;
 
@@ -903,6 +1095,25 @@ public sealed class BotBuyPatch : BasePlugin
             int half = maxRounds / 2;
 
             return played == half - 2 || played == maxRounds - 2;
+        }
+        catch { return false; }
+    }
+
+    private bool IsLastRoundOfHalf()
+    {
+        try
+        {
+            var gameRules = Utilities
+                .FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules")
+                .FirstOrDefault()?.GameRules;
+
+            if (gameRules == null)
+                return false;
+
+            int played = gameRules.TotalRoundsPlayed;
+            int maxRounds = ConVar.Find("mp_maxrounds")?.GetPrimitiveValue<int>() ?? 24;
+            int overtimeMaxRounds = ConVar.Find("mp_overtime_maxrounds")?.GetPrimitiveValue<int>() ?? 6;
+            return RoundSchedule.IsLastRoundOfHalf(played, maxRounds, overtimeMaxRounds);
         }
         catch { return false; }
     }

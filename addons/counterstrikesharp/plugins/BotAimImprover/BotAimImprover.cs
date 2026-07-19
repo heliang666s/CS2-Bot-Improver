@@ -6,8 +6,10 @@ using CounterStrikeSharp.API.Core.Attributes;
 using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Utils;
 using CounterStrikeSharp.API.Modules.Memory.DynamicFunctions;
+using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Core.Capabilities;
 using RayTraceAPI;
+using CompetitiveBotCore;
 using Microsoft.Extensions.Logging;
 
 
@@ -129,6 +131,8 @@ public class BotAimImprover : BasePlugin
     private Offsets _off;
 
     private MemoryFunctionVoid<IntPtr>? _pickNewAimSpot;
+    private BotMatchProfile _profile = BotMatchProfile.Competitive;
+    private readonly IVisibilityPolicy _visibilityPolicy = new CompetitiveVisibilityPolicy();
     private static readonly PluginCapability<CRayTraceInterface> _rayTraceCapability =
         new("raytrace:craytraceinterface");
 
@@ -159,6 +163,9 @@ public class BotAimImprover : BasePlugin
 
     public override void Load(bool hotReload)
     {
+        _profile = ProfilePolicy.Resolve(
+            ProfileConfig.Load(ProfileConfig.DefaultPath(Server.GameDirectory)),
+            IsEntertainmentMode());
         bool win = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
         _off = win ? WindowsOffsets : LinuxOffsets;
 
@@ -174,6 +181,7 @@ public class BotAimImprover : BasePlugin
 
             Logger.LogInformation("[BotAimImprover] Loaded ({Plat}). PickNewAimSpot=0x{Pna:X16}",
                 win ? "Windows" : "Linux", pnaRuntime);
+            Logger.LogInformation("[BotAimImprover] Active profile: {Profile}; aim override requires native visibility and RayTrace", _profile);
         }
         catch (Exception ex)
         {
@@ -230,6 +238,14 @@ public class BotAimImprover : BasePlugin
         });
     }
 
+    private static bool IsEntertainmentMode()
+    {
+        bool teammatesAreEnemies = ConVar.Find("mp_teammates_are_enemies")?.StringValue is "1" or "true";
+        bool noSpread = ConVar.Find("weapon_accuracy_nospread")?.StringValue is "1" or "true";
+        bool unlimitedMoney = ConVar.Find("mp_maxmoney")?.StringValue == "0";
+        return teammatesAreEnemies || noSpread || unlimitedMoney;
+    }
+
     public override void Unload(bool hotReload)
     {
         try { _pickNewAimSpot?.Unhook(OnPickNewAimSpotPost, HookMode.Post); }
@@ -253,7 +269,13 @@ public class BotAimImprover : BasePlugin
 
             // 1) Gate: enemy must be generally visible before we
             //    spend any raytraces. Otherwise the native used last-known position.
-            if (ReadByte(pCCSBot + _off.IsVisible) == 0)
+            bool nativeVisible = ReadByte(pCCSBot + _off.IsVisible) != 0;
+            if (!_visibilityPolicy.CanOverrideAim(
+                    rayTraceAvailable: _rayTraceCapability.Get() != null,
+                    nativeTargetVisible: nativeVisible,
+                    smokeObscured: false,
+                    infoIsFresh: nativeVisible,
+                    isHistoricalPosition: !nativeVisible))
                 return HookResult.Continue;
 
             // 2) Resolve enemy pawn from m_enemy CHandle.
@@ -414,13 +436,13 @@ public class BotAimImprover : BasePlugin
         try
         {
             var rt = _rayTraceCapability.Get();
-            if (rt == null) return true; // RayTrace not loaded -> don't block
+            if (rt == null) return false;
             var end = new Vector(tx, ty, tz);
             var opts = new TraceOptions(InteractionLayers.MASK_WORLD_ONLY);
             rt.TraceEndShape(eye, end, null, opts, out TraceResult res);
             return res.Fraction >= 0.999f;
         }
-        catch { return true; }
+        catch { return false; }
     }
 
     // ============================================================

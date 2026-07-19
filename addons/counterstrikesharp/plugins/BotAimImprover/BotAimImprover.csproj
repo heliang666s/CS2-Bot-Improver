@@ -18,4 +18,8 @@
     </Reference>
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="../../shared/CompetitiveBotCore/CompetitiveBotCore.csproj" />
+  </ItemGroup>
+
 </Project>

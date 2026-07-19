@@ -11,12 +11,15 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="../../shared/CompetitiveBotCore/CompetitiveBotCore.csproj" />
+    <ProjectReference Include="../../shared/BotControllerApi/BotControllerApi.csproj">
+      <Private>false</Private>
+    </ProjectReference>
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="RayTraceApi">
       <HintPath>libs\RayTraceApi.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="BotControllerApi">
-      <HintPath>libs\BotControllerApi.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>

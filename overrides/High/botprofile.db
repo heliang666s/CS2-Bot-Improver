@@ -17,23 +17,23 @@
 //
 Default
         Skill = 100
-        Aggression = 100
-        ReactionTime = 0
-        AttackDelay = 0
+        Aggression = 75
+        ReactionTime = 0.15
+        AttackDelay = 0.035
         Teamwork = 100
-        AimFocusInitial = 0                    // initial focus spread in degrees (from desired center)
-        AimFocusDecay = 0                             // how much focus shrinks per second (.25 = 25% of size after 1 sec)
-        AimFocusOffsetScale = 0              // controls accuracy when tracking to target (0 == perfect, should always be < 1)
-        AimfocusInterval = 0                  // how often focus is adjusted (smaller intervals means better movement tracking)
+        AimFocusInitial = 0.07                    // initial focus spread in degrees (from desired center)
+        AimFocusDecay = 0.55                      // controlled focus recovery, not instant lock
+        AimFocusOffsetScale = 0.08                // small human-like tracking error
+        AimfocusInterval = 0.04                   // finite aim update interval
         WeaponPreference = none
         Cost = 4
         Difficulty = NORMAL
         VoicePitch = 100
         Skin = 0
-	    LookAngleMaxAccelNormal = 99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999.9.9.9.9
+	    LookAngleMaxAccelNormal = 6000.0
 	    LookAngleStiffnessNormal = 3000.0
 	    LookAngleDampingNormal = 45.0
-	    LookAngleMaxAccelAttacking = 99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999.9.9.9.9
+	    LookAngleMaxAccelAttacking = 7500.0
 	    LookAngleStiffnessAttacking = 3000.0
 	    LookAngleDampingAttacking = 39.95
 End
@@ -88,24 +88,18 @@ End
 Template SniperPro
 		WeaponPreference = awp
 		WeaponPreference = ak47
-		WeaponPreference = aug
 		WeaponPreference = galilar
 		WeaponPreference = deagle
 		WeaponPreference = m4a1
-		WeaponPreference = sg556
 		WeaponPreference = m4a1_silencer
-		WeaponPreference = p90
 		WeaponPreference = mac10
 		WeaponPreference = famas
-		WeaponPreference = ssg08
 		WeaponPreference = tec9
 		WeaponPreference = fiveseven
 End
 
 Template RiflePro
 		WeaponPreference = ak47
-		WeaponPreference = aug
-		WeaponPreference = sg556
 		WeaponPreference = famas
 		WeaponPreference = galilar
 		WeaponPreference = m4a1_silencer
@@ -113,73 +107,48 @@ Template RiflePro
 		WeaponPreference = fiveseven
 		WeaponPreference = tec9
 		WeaponPreference = m4a1
-		WeaponPreference = p90
 		WeaponPreference = mp9
 		WeaponPreference = mac10
-		WeaponPreference = elite
 End
 
 Template Scoper
-		WeaponPreference = sg556
-        WeaponPreference = aug
         WeaponPreference = awp
         WeaponPreference = deagle
         WeaponPreference = tec9
         WeaponPreference = fiveseven
-        WeaponPreference = ssg08
         WeaponPreference = m4a1_silencer
         WeaponPreference = galilar
         WeaponPreference = m4a1
-        WeaponPreference = p90
         WeaponPreference = mac10
         WeaponPreference = mp9
-        WeaponPreference = elite
 End
 
 Template SniperPure
 		WeaponPreference = awp
-        WeaponPreference = ssg08
         WeaponPreference = ak47
         WeaponPreference = deagle
         WeaponPreference = fiveseven
         WeaponPreference = tec9
         WeaponPreference = m4a1
-        WeaponPreference = sg556
         WeaponPreference = m4a1_silencer
-        WeaponPreference = p90
         WeaponPreference = mac10
         WeaponPreference = mp9
-        WeaponPreference = p250
-        WeaponPreference = elite
 End
 
 Template Duelist
 		WeaponPreference = ak47
-		WeaponPreference = aug
-		WeaponPreference = p90
 		WeaponPreference = tec9
 		WeaponPreference = fiveseven
-		WeaponPreference = bizon
-		WeaponPreference = ump45
 		WeaponPreference = mac10
 		WeaponPreference = mp9
-		WeaponPreference = xm1014
 		WeaponPreference = m4a1_silencer
-		WeaponPreference = sg556
 		WeaponPreference = m4a1
-		WeaponPreference = elite
 End
 
 Template Rusher
-		WeaponPreference = p90
     	WeaponPreference = mac10
     	WeaponPreference = mp9
     	WeaponPreference = tec9
-    	WeaponPreference = elite
-    	WeaponPreference = bizon
-    	WeaponPreference = ump45
-    	WeaponPreference = mp5sd
-    	WeaponPreference = mp7
     	WeaponPreference = m4a1_silencer
     	WeaponPreference = ak47
     	WeaponPreference = m4a1
@@ -189,92 +158,76 @@ End
 
 Template Fastshot
 		WeaponPreference = awp
-        WeaponPreference = ssg08
         WeaponPreference = deagle
-        WeaponPreference = xm1014
-        WeaponPreference = nova
         WeaponPreference = m4a1
         WeaponPreference = ak47
         WeaponPreference = m4a1_silencer
-        WeaponPreference = sg556
-        WeaponPreference = mag7
-        WeaponPreference = sawedoff
-        WeaponPreference = p90
         WeaponPreference = fiveseven
         WeaponPreference = tec9
 End
 
 Template Camper    	
-		WeaponPreference = xm1014
-    	WeaponPreference = negev
-		WeaponPreference = mag7
-    	WeaponPreference = sawedoff
-    	WeaponPreference = nova
-    	WeaponPreference = p90
-    	WeaponPreference = bizon
     	WeaponPreference = awp
     	WeaponPreference = ak47
     	WeaponPreference = m4a1_silencer
-    	WeaponPreference = sg556
     	WeaponPreference = fiveseven
 		WeaponPreference = tec9
-    	WeaponPreference = elite		
 End
 
 // skill templates
 
 Template ProTop
     Skill = 100
-	ReactionTime = 0
-	AttackDelay = 0
-	AimFocusInitial = 0
-	AimFocusDecay = 0.0000001
-	AimFocusOffsetScale = 0
-	AimfocusInterval = 0
+	ReactionTime = 0.16
+	AttackDelay = 0.04
+	AimFocusInitial = 0.06
+	AimFocusDecay = 0.55
+	AimFocusOffsetScale = 0.08
+	AimfocusInterval = 0.04
 	Difficulty = EXPERT+HARD+NORMAL+EASY
 End
 
 Template ProFast   // sniper rifler rusher
 	Skill = 100
-	ReactionTime = 0
-	AttackDelay = 0
-	AimFocusInitial = 0
-	AimFocusDecay = 0.001
-	AimFocusOffsetScale = 0
-	AimfocusInterval = 0
+	ReactionTime = 0.14
+	AttackDelay = 0.03
+	AimFocusInitial = 0.08
+	AimFocusDecay = 0.50
+	AimFocusOffsetScale = 0.10
+	AimfocusInterval = 0.035
 	Difficulty = EXPERT+HARD+NORMAL+EASY
 End
 
 Template ProPrecise   // sniper scoper fastshot camper
 	Skill = 100
-	ReactionTime = 0.01
-	AttackDelay = 0
-	AimFocusInitial = 0
-	AimFocusDecay = 0.0000001
-	AimFocusOffsetScale = 0
-	AimfocusInterval = 0
+	ReactionTime = 0.17
+	AttackDelay = 0.05
+	AimFocusInitial = 0.05
+	AimFocusDecay = 0.60
+	AimFocusOffsetScale = 0.07
+	AimfocusInterval = 0.045
 	Difficulty = EXPERT+HARD+NORMAL+EASY
 End
 
 Template ProSlow    // duelist sniper
 	Skill = 100
-    ReactionTime = 0.01
-    AttackDelay = 0
-    AimFocusInitial = 0.00000001
-	AimFocusDecay = 0.00000001
-	AimFocusOffsetScale = 0
-	AimfocusInterval = 0.00000001
+    ReactionTime = 0.22
+    AttackDelay = 0.07
+    AimFocusInitial = 0.12
+	AimFocusDecay = 0.35
+	AimFocusOffsetScale = 0.18
+	AimfocusInterval = 0.07
 	Difficulty = EXPERT+HARD+NORMAL+EASY
 End
 
 Template ProSteady    // rifler
     Skill = 100
-    ReactionTime = 0.0001
-    AttackDelay = 0
-    AimFocusInitial = 0.0001
-	AimFocusDecay = 0.0001
-	AimFocusOffsetScale = 0
-	AimfocusInterval = 0.0001
+    ReactionTime = 0.19
+    AttackDelay = 0.05
+    AimFocusInitial = 0.07
+	AimFocusDecay = 0.55
+	AimFocusOffsetScale = 0.09
+	AimfocusInterval = 0.05
     Difficulty = EXPERT+HARD+NORMAL+EASY
 End
 
@@ -285,7 +238,7 @@ Template RankRifler    // rifler
 	VoicePitch = 85
 	AimFocusInitial = 0.01
 	AimFocusDecay = 1
-	AimFocusOffsetScale = 0
+	AimFocusOffsetScale = 0.18
 	AimfocusInterval = 0.01
 	Difficulty = EXPERT+HARD+NORMAL+EASY
 End
@@ -296,7 +249,7 @@ Template RankDuelist    // duelist rusher
 	AttackDelay = 0
 	AimFocusInitial = 0.25
 	AimFocusDecay = 0.05
-	AimFocusOffsetScale = 0
+	AimFocusOffsetScale = 0.22
 	AimfocusInterval = 0.05
 	Difficulty = EXPERT+HARD+NORMAL+EASY
 End
@@ -307,8 +260,8 @@ Template RankOthers    // sniper scoper rifler
     AttackDelay = 0
     AimFocusInitial = 0.00001
 	AimFocusDecay = 0.0000001
-	AimFocusOffsetScale = 0.0000000000000000000000001
-	AimfocusInterval = 0.0000000000001
+	AimFocusOffsetScale = 0.18
+	AimfocusInterval = 0.06
     Difficulty = EXPERT+HARD+NORMAL+EASY
 End
 

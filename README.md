@@ -12,7 +12,7 @@ Aims to enhance your experience when playing against bots offline or with friend
 3. Improves bots' movement
 4. Fixes most bot stuck issues
 5. Allows bots to buy everything and overhauls their economy management
-6. Refines bot behavior, allowing them to spray, flick, spam smokes and anti-flash
+6. Refines bot behavior with configurable competitive or arcade rules
 7. Assigns each bot their own knife, gloves, weapon skins, agent model, music kit, avatar, and profile
 8. Makes bots smarter, more organized, and more alert to their surroundings
 9. Changes bot names to pro and random players. (the characteristics of each pro player are based on stats from [HLTV](https://www.hltv.org/))
@@ -64,6 +64,17 @@ Aims to enhance your experience when playing against bots offline or with friend
 <img width="130" height="153" alt="snap_3" src="https://github.com/user-attachments/assets/4c775e36-3fc3-4a19-9cb1-4f0c9327838c" /><br>
 <img width="625" height="423" alt="snap_4" src="https://github.com/user-attachments/assets/ac0b0c57-ee67-4e33-96fb-146d14714fc8" />
 
+### Building a Windows package from a fork
+
+The repository includes a Windows GitHub Actions workflow at `.github/workflows/windows-package.yml`.
+
+1. Push this branch to your fork
+2. Open **Actions → Windows package → Run workflow**
+3. Keep `base_repository` as `ed0ard/CS2-Bot-Improver` and `base_tag` as `v1.4.2` unless you maintain your own compatible base package
+4. Download the generated artifact from the workflow run
+
+Pushing a `v*` tag also builds and publishes the package automatically. For a manual release, set `package_version` to the desired release tag and enable `publish_release`.
+
 ## Commands
 
 ### Aim
@@ -96,6 +107,24 @@ Bots have minimal limitations and think less before throwing nades
 
 `bot_nades`  
 Shows the current nade throwing mode
+
+### Behavior profiles
+
+The default profile is `competitive`, stored in `cfg/bot_improver_profile.cfg`:
+
+`bot_improver_profile competitive`  
+Uses team-level economy decisions, finite grenade inventory, normal smoke and
+information boundaries, and conservative CT/T tactical behavior.
+
+`bot_improver_profile arcade`  
+Keeps the enhanced entertainment behavior; `bot_nades more/max` is allowed here.
+
+`bot_improver_profile legacy`  
+Keeps the previous patch-heavy behavior for compatibility.
+
+Changing the profile requires a plugin reload or map restart because native
+memory patches are selected during plugin load. In competitive mode, `more` and
+`max` are automatically downgraded to `normal`.
 
 ### Buy
 

@@ -15,6 +15,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using RayTraceAPI;
+using CompetitiveBotCore;
 
 namespace NadeSystem;
 
@@ -109,6 +110,8 @@ public class NadeSystemPlugin : BasePlugin
     // precache all the nades on this map
     private List<GrenadeData> _mapNades = new();
     private string _botNadesMode = "normal"; // "off" | "normal" | "more" | "max"
+    private BotMatchProfile _profile = BotMatchProfile.Competitive;
+    private readonly IRoundState _roundState = new RoundState();
     // ── State ──────────────────────────────────────────────────
     private List<GrenadeData>     _db                = new();
     private List<CooldownEntry>   _cooldowns         = new();
@@ -117,8 +120,6 @@ public class NadeSystemPlugin : BasePlugin
     private int                   _tick              = 0;
     private bool                  _roundOver         = false;
     private float                 _freezeEndTime     = 0f;
-    private Dictionary<uint, int> _roundSpendPerBot  = new();
-    private HashSet<uint>         _poorBots          = new();
     // Information System
     private Dictionary<string, float> _probFailCooldown = new();
     // flash immunity
@@ -144,13 +145,14 @@ public class NadeSystemPlugin : BasePlugin
     // Normal Mode: post-throw probability window for flash
     // key = botIndex, value = (windowExpiresAt, blindRatio)
     private Dictionary<uint, (float ExpiresAt, float Ratio)> _botFlashRatioWindow = new();
+    private Dictionary<uint, UtilityLedger> _utilityLedgers = new();
     // ── Information system (sound trail + vision) ──────────────
     // Plain value-type coordinate: avoids allocating a CSS Vector (managed wrapper
     // + native memory) per recorded sound point.
-    private readonly record struct SoundPoint(float X, float Y, float Z);
-    // key = controller index, value = list of positions where this player made audible sound.
-    // Only points within 100f of the player's current position are kept each tick.
-    private Dictionary<uint, List<SoundPoint>> _soundPoints = new();
+    private readonly record struct SoundPoint(float X, float Y, float Z, float RecordedAt);
+    // key = (listener controller index, source controller index). A sound is
+    // memory for the bots that could actually hear it, never a team-wide fact.
+    private Dictionary<(uint ListenerId, uint SourceId), List<SoundPoint>> _heardSoundPoints = new();
     // key = controller index, value = last weapon_fire time (global, all players)
     private Dictionary<uint, float> _botLastFireTime = new();
     // Sound trail capture radius (a recorded sound point counts as "info" within this range)
@@ -173,7 +175,7 @@ public class NadeSystemPlugin : BasePlugin
         ["de_inferno_CT"] = 15.5f,
         ["de_mirage_T"] = 21f,
         ["de_mirage_CT"] = 21f,
-        ["de_nuke_T"] = 14f,
+        ["de_nuke_T"]  = 14f,
         ["de_nuke_CT"] = 14f,
         ["de_anubis_T"] = 14f,
         ["de_anubis_CT"] = 14f,
@@ -206,30 +208,6 @@ public class NadeSystemPlugin : BasePlugin
         ["he"]      = 5f,
         ["molotov"] = 10f,
         ["decoy"]   = 600f,  // per-round once
-    };
-
-    // T-side purchase cost
-    private static readonly Dictionary<string, int> CostT =
-        new(StringComparer.OrdinalIgnoreCase)
-    {
-        ["flash"]      = 200,
-        ["smoke"]      = 300,
-        ["he"]         = 300,
-        ["molotov"]    = 400,
-        ["incgrenade"] = 400,
-        ["decoy"]      = 0,
-    };
-
-    // CT-side purchase cost
-    private static readonly Dictionary<string, int> CostCT =
-        new(StringComparer.OrdinalIgnoreCase)
-    {
-        ["flash"]      = 200,
-        ["smoke"]      = 300,
-        ["he"]         = 300,
-        ["molotov"]    = 500,
-        ["incgrenade"] = 500,
-        ["decoy"]      = 0,
     };
 
     // ── Native grenade factory functions ──────────────────────
@@ -273,6 +251,10 @@ public class NadeSystemPlugin : BasePlugin
 
     public override void Load(bool hotReload)
     {
+        _profile = ProfilePolicy.Resolve(
+            ProfileConfig.Load(ProfileConfig.DefaultPath(Server.GameDirectory)),
+            IsEntertainmentMode());
+        _botNadesMode = ProfilePolicy.NormalizeNadeMode(_profile, _botNadesMode);
         Directory.CreateDirectory(DataDir);
         LoadDb();
 
@@ -283,6 +265,7 @@ public class NadeSystemPlugin : BasePlugin
         RegisterListener<Listeners.OnTick>(OnTick);
         RegisterEventHandler<EventBombBegindefuse>(OnBombBeginDefuse);
         RegisterEventHandler<EventBombBeginplant>(OnBombBeginPlant);
+        RegisterEventHandler<EventBombPlanted>(OnBombPlanted);
         RegisterEventHandler<EventPlayerHurt>(OnPlayerHurt);
         RegisterEventHandler<EventPlayerBlind>(OnPlayerBlind);
         RegisterEventHandler<EventWeaponFire>(OnWeaponFire);
@@ -297,11 +280,15 @@ public class NadeSystemPlugin : BasePlugin
             _cooldowns.Clear();
             _roundCountByTeam.Clear();
             _replayBots.Clear();
+            _utilityLedgers.Clear();
         });
         
         AddCommand("bot_nades", "Control bots' nade throw mode (off/normal/more/max)", CmdBotNades);
+
+        if (hotReload)
+            AddTimer(0.1f, SynchronizeRoundPhaseFromGameRules);
         
-        Server.PrintToConsole($"[NadeSystem] Loaded — {_db.Count} grenades in DB.");
+        Server.PrintToConsole($"[NadeSystem] Loaded — profile={_profile}, mode={_botNadesMode}, grenades={_db.Count}, utilityLedger=per-bot");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -363,9 +350,17 @@ public class NadeSystemPlugin : BasePlugin
     private void CheckBotZones()
     {
         var rules = Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault();
-        if (rules?.GameRules?.FreezePeriod == true) return;
+        if (rules?.GameRules?.FreezePeriod == true)
+        {
+            _roundState.SetPhase(RoundPhase.Freeze);
+            return;
+        }
+        if (_roundState.Current.Phase == RoundPhase.Freeze)
+            SynchronizeRoundPhaseFromGameRules();
         // Don't throw nades if the round is over
         if (_roundOver) return;
+        if (_roundState.Current.Phase is RoundPhase.Freeze or RoundPhase.RoundEnd or RoundPhase.Save)
+            return;
 
         var mapNades = _mapNades;
         if (mapNades.Count == 0) return;
@@ -406,6 +401,11 @@ public class NadeSystemPlugin : BasePlugin
                 // DECOY: handled entirely here, bypasses all other checks
                 if (gtype == "decoy")
                 {
+                    // Decoy lineups do not correspond to a purchased combat
+                    // grenade in the competitive inventory model. Keeping the
+                    // old zero-cost branch would reintroduce free repeated
+                    // entities, so it is entertainment-only.
+                    if (ProfilePolicy.IsCompetitive(_profile)) continue;
                     if (IsOnCooldown(g.Id)) continue;
                     if (dx * dx + dy * dy > 200f * 200f) continue;
                     if (MathF.Abs(dz) > 85f) continue;
@@ -588,36 +588,41 @@ public class NadeSystemPlugin : BasePlugin
         var origin = GetActiveLivePawn(player)?.AbsOrigin;
         if (origin == null) return;
 
-        // Only keep this sound point if at least one enemy is close enough to hear it.
+        // Store the point separately for every enemy that could hear it. This
+        // prevents one CT hearing a footstep from becoming shared wallhack info.
         float ox = origin.X, oy = origin.Y, oz = origin.Z;
         float r2 = SoundHearRadius * SoundHearRadius;
         var candidates = allPlayers
             ?? Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller").ToList();
-        bool audibleToEnemy = candidates
-            .Any(e =>
+        foreach (var listener in candidates.Where(e =>
             {
-                if (!e.IsValid || (int)e.TeamNum == player.TeamNum) return false;
+                if (!e.IsValid || e.Index == player.Index || (int)e.TeamNum == player.TeamNum)
+                    return false;
                 var ep = GetActiveLivePawn(e)?.AbsOrigin;
                 if (ep == null) return false;
                 float dx = ep.X - ox, dy = ep.Y - oy, dz = ep.Z - oz;
-                return dx*dx + dy*dy + dz*dz <= r2;
-            });
-        if (!audibleToEnemy) return;
+                return dx * dx + dy * dy + dz * dz <= r2;
+            }))
+        {
+            var key = ((uint)listener.Index, (uint)player.Index);
+            if (!_heardSoundPoints.TryGetValue(key, out var list))
+            {
+                list = new List<SoundPoint>();
+                _heardSoundPoints[key] = list;
+            }
 
-        uint idx = (uint)player.Index;
-        if (!_soundPoints.TryGetValue(idx, out var list))
-        {
-            list = new List<SoundPoint>();
-            _soundPoints[idx] = list;
+            // Dedup repeated ticks at the same location without discarding a
+            // later sound after the short memory window has expired.
+            if (list.Count > 0)
+            {
+                var last = list[^1];
+                float ddx = ox - last.X, ddy = oy - last.Y, ddz = oz - last.Z;
+                if (ddx * ddx + ddy * ddy + ddz * ddz < 1f
+                    && Server.CurrentTime - last.RecordedAt < 0.25f)
+                    continue;
+            }
+            list.Add(new SoundPoint(ox, oy, oz, Server.CurrentTime));
         }
-        // Dedup: skip if within 1u of the last point. Repeated sound made in place
-        if (list.Count > 0)
-        {
-            var last = list[^1];
-            float ddx = ox - last.X, ddy = oy - last.Y, ddz = oz - last.Z;
-            if (ddx * ddx + ddy * ddy + ddz * ddz < 1f) return;
-        }
-        list.Add(new SoundPoint(ox, oy, oz));
     }
 
     private HookResult OnWeaponFire(EventWeaponFire @event, GameEventInfo info)
@@ -654,7 +659,8 @@ public class NadeSystemPlugin : BasePlugin
     }
 
     // Per-tick maintenance of every player's sound trail.
-    // Delete sound points that are now farther than SoundInfoRadius from the player.
+    // Delete sound points that are stale, too far from the source, or no longer
+    // within audible distance of the listener.
     // Add a fresh point if the player is currently making footstep sound (speed > threshold).
     // Pruning + dead-player cleanup run every call; footstep recording is throttled by the caller to every 4 ticks.
     private void UpdateSoundTrails(bool recordFootsteps)
@@ -663,12 +669,13 @@ public class NadeSystemPlugin : BasePlugin
         foreach (var p in allPlayers)
         {
             if (!p.IsValid) continue;
-            uint idx = (uint)p.Index;
+            uint sourceId = (uint)p.Index;
 
             var pawn = GetActiveLivePawn(p);
             if (pawn == null)
             {
-                _soundPoints.Remove(idx);
+                foreach (var key in _heardSoundPoints.Keys.Where(key => key.SourceId == sourceId).ToList())
+                    _heardSoundPoints.Remove(key);
                 continue;
             }
             var origin = pawn.AbsOrigin;
@@ -676,15 +683,25 @@ public class NadeSystemPlugin : BasePlugin
 
             float cx = origin.X, cy = origin.Y, cz = origin.Z;
 
-            // Delete all kinds of sound points outside the info radius (keep only what is "near here").
-            if (_soundPoints.TryGetValue(idx, out var list) && list.Count > 0)
+            foreach (var key in _heardSoundPoints.Keys.Where(key => key.SourceId == sourceId).ToList())
             {
-                float r2 = SoundInfoRadius * SoundInfoRadius;
+                if (!_heardSoundPoints.TryGetValue(key, out var list)) continue;
+                var listener = Utilities.GetEntityFromIndex<CCSPlayerController>((int)key.ListenerId);
+                var listenerOrigin = listener == null ? null : GetActiveLivePawn(listener)?.AbsOrigin;
+                float hearR2 = SoundHearRadius * SoundHearRadius;
+                float infoR2 = SoundInfoRadius * SoundInfoRadius;
                 list.RemoveAll(pt =>
                 {
                     float dx = pt.X - cx, dy = pt.Y - cy, dz = pt.Z - cz;
-                    return dx * dx + dy * dy + dz * dz > r2;
+                    bool stale = Server.CurrentTime - pt.RecordedAt > 3f;
+                    bool sourceMoved = dx * dx + dy * dy + dz * dz > infoR2;
+                    bool listenerMoved = listenerOrigin == null
+                        || ((pt.X - listenerOrigin.X) * (pt.X - listenerOrigin.X)
+                            + (pt.Y - listenerOrigin.Y) * (pt.Y - listenerOrigin.Y)
+                            + (pt.Z - listenerOrigin.Z) * (pt.Z - listenerOrigin.Z) > hearR2);
+                    return stale || sourceMoved || listenerMoved;
                 });
+                if (list.Count == 0) _heardSoundPoints.Remove(key);
             }
 
             // Footstep sound: horizontal speed above threshold.
@@ -701,12 +718,32 @@ public class NadeSystemPlugin : BasePlugin
         }
     }
 
-    // True if this player currently has any retained sound point near them
-    // (Made audible sound here, now or while passing within SoundInfoRadius).
-    private bool PlayerMadeAudibleSound(CCSPlayerController player)
+    // True if this listener has a retained sound point for this particular
+    // target. The observer is part of the key by design.
+    private bool PlayerMadeAudibleSound(CCSPlayerController listener, CCSPlayerController target)
     {
-        if (!player.IsValid) return false;
-        return _soundPoints.TryGetValue((uint)player.Index, out var list) && list.Count > 0;
+        if (!listener.IsValid || !target.IsValid) return false;
+        if (!_heardSoundPoints.TryGetValue(((uint)listener.Index, (uint)target.Index), out var list))
+            return false;
+
+        var listenerOrigin = GetActiveLivePawn(listener)?.AbsOrigin;
+        var targetOrigin = GetActiveLivePawn(target)?.AbsOrigin;
+        if (listenerOrigin == null || targetOrigin == null) return false;
+
+        float hearR2 = SoundHearRadius * SoundHearRadius;
+        float infoR2 = SoundInfoRadius * SoundInfoRadius;
+        return list.Any(point =>
+        {
+            if (Server.CurrentTime - point.RecordedAt > 3f) return false;
+            float sourceDx = point.X - targetOrigin.X;
+            float sourceDy = point.Y - targetOrigin.Y;
+            float sourceDz = point.Z - targetOrigin.Z;
+            float listenerDx = point.X - listenerOrigin.X;
+            float listenerDy = point.Y - listenerOrigin.Y;
+            float listenerDz = point.Z - listenerOrigin.Z;
+            return sourceDx * sourceDx + sourceDy * sourceDy + sourceDz * sourceDz <= infoR2
+                && listenerDx * listenerDx + listenerDy * listenerDy + listenerDz * listenerDz <= hearR2;
+        });
     }
 
     // True if the given enemy currently sees the target via the official spotting system.
@@ -779,7 +816,7 @@ public class NadeSystemPlugin : BasePlugin
     // General-purpose: does `enemy` have information (vision or sound) on `target`?
     private bool HasInformationOn(CCSPlayerController enemy, CCSPlayerController target)
     {
-        if (PlayerMadeAudibleSound(target)) return true;
+        if (PlayerMadeAudibleSound(enemy, target)) return true;
         if (EnemySeesTarget(enemy, target)) return true;
         return false;
     }
@@ -848,31 +885,9 @@ public class NadeSystemPlugin : BasePlugin
             // no limits
         }
 
-        // ── Account check ──────────────────────────────────────────────
-        var money = bot.InGameMoneyServices;
-        if (money == null) return;
-
-        bool isCT     = bot.TeamNum == (int)CsTeam.CounterTerrorist;
-        var costTable = isCT ? CostCT : CostT;
-        if (!costTable.TryGetValue(gtype, out int cost)) return;
-        if (money.Account < cost) return;
-
-        // ── Round spend cap check ──────────────────────────────────────
-        uint botIdx   = (uint)bot.Index;
-        bool isPoor   = _poorBots.Contains((uint)bot.Index);
-        int  spendCap = GetRoundSpendCap(isCT, isPoor);
-        if (!_roundSpendPerBot.TryGetValue(botIdx, out int alreadySpent))
-            alreadySpent = 0;
-        // Expensure Limit
-        bool deductMoney = alreadySpent < spendCap;
-
-        // ── All checks passed — commit ─────────────────────────────────
-        if (deductMoney)
-        {
-            money.Account -= cost;
-            Utilities.SetStateChanged(bot, "CCSPlayerController", "m_pInGameMoneyServices");
-            _roundSpendPerBot[botIdx] = alreadySpent + cost;
-        }
+        // BotBuy owns the cash transaction. NadeSystem only consumes the
+        // utility item that BotBuy placed in the bot's inventory.
+        if (!TryConsumeUtility(bot, gtype, UtilitySource.LineupThrow)) return;
 
         _replayBots.Add((uint)bot.Index);
         RegisterCooldown(g.Id, gtype);
@@ -1190,9 +1205,88 @@ public class NadeSystemPlugin : BasePlugin
             case "flash":   counter.Flash++;   break;
             case "smoke":   counter.Smoke++;   break;
             case "he":      counter.HE++;      break;
-            case "molotov": counter.Molotov++; break;
+            case "molotov":
+            case "incgrenade": counter.Molotov++; break;
         }
         _roundCountByTeam[teamNum] = counter;
+    }
+
+    private bool TryConsumeUtility(
+        CCSPlayerController bot,
+        string grenadeType,
+        UtilitySource source)
+    {
+        if (!TryGetUtilityType(grenadeType, out var type))
+            return true;
+
+        uint botIndex = (uint)bot.Index;
+        if (!_utilityLedgers.TryGetValue(botIndex, out var ledger))
+        {
+            ledger = new UtilityLedger(ReadUtilityInventory(bot));
+            _utilityLedgers[botIndex] = ledger;
+        }
+
+        return ledger.TryConsume(type, source);
+    }
+
+    private void SynchronizeUtilityLedgers()
+    {
+        foreach (var bot in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller"))
+        {
+            if (!bot.IsValid || !bot.IsBot) continue;
+            uint botIndex = (uint)bot.Index;
+            if (!_utilityLedgers.ContainsKey(botIndex))
+                _utilityLedgers[botIndex] = new UtilityLedger(ReadUtilityInventory(bot));
+        }
+    }
+
+    private static UtilityInventory ReadUtilityInventory(CCSPlayerController bot)
+    {
+        int smoke = 0;
+        int flash = 0;
+        int he = 0;
+        int molotov = 0;
+        var weapons = bot.PlayerPawn?.Value?.WeaponServices?.MyWeapons;
+        if (weapons == null)
+            return new UtilityInventory(smoke, flash, he, molotov);
+
+        foreach (var handle in weapons)
+        {
+            string? name = handle.Value?.DesignerName;
+            switch (name)
+            {
+                case "weapon_smokegrenade": smoke++; break;
+                case "weapon_flashbang": flash++; break;
+                case "weapon_hegrenade": he++; break;
+                case "weapon_molotov":
+                case "weapon_incgrenade": molotov++; break;
+            }
+        }
+
+        return new UtilityInventory(smoke, flash, he, molotov);
+    }
+
+    private static bool TryGetUtilityType(string grenadeType, out UtilityType type)
+    {
+        switch (grenadeType.ToLowerInvariant())
+        {
+            case "smoke": type = UtilityType.Smoke; return true;
+            case "flash": type = UtilityType.Flash; return true;
+            case "he": type = UtilityType.He; return true;
+            case "molotov":
+            case "incgrenade": type = UtilityType.Molotov; return true;
+            default:
+                type = default;
+                return false;
+        }
+    }
+
+    private static bool IsEntertainmentMode()
+    {
+        bool teammatesAreEnemies = ConVar.Find("mp_teammates_are_enemies")?.StringValue is "1" or "true";
+        bool noSpread = ConVar.Find("weapon_accuracy_nospread")?.StringValue is "1" or "true";
+        bool unlimitedMoney = ConVar.Find("mp_maxmoney")?.StringValue == "0";
+        return teammatesAreEnemies || noSpread || unlimitedMoney;
     }
 
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
@@ -1200,10 +1294,12 @@ public class NadeSystemPlugin : BasePlugin
         _roundOver  = false;
         _freezeEndTime = 0f;
         _roundCountByTeam.Clear();
+        _roundState.SetBomb(null, planted: false);
+        _roundState.SetPhase(RoundPhase.Freeze);
         _cooldowns.Clear();
         _replayBots.Clear();
         _smokeCooldownBots.Clear();
-        _roundSpendPerBot.Clear();
+        _utilityLedgers.Clear();
         _defuseSmokeUsed  = false;
         _defuseFlashUsed  = false;
         _plantSmokeUsed   = false;
@@ -1215,34 +1311,52 @@ public class NadeSystemPlugin : BasePlugin
         _molotovEscapeSmokeCooldown.Clear();
         _retaliationCooldown.Clear();
         // Information System
-        _soundPoints.Clear();
+        _heardSoundPoints.Clear();
         _botLastFireTime.Clear();
         foreach (var key in _probFailCooldown.Where(kv => kv.Value <= Server.CurrentTime).Select(kv => kv.Key).ToList())
             _probFailCooldown.Remove(key);
-        // Save money for poor bots
-        _poorBots.Clear();
-        if (!IsPistolRound())
-        {
-            foreach (var bot in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller"))
-            {
-                if (!bot.IsValid || !bot.IsBot) continue;
-                // Mark bots with < 2800 as poor
-                if (bot.InGameMoneyServices?.Account < 2800)
-                    _poorBots.Add((uint)bot.Index);
-            }
-        }
         return HookResult.Continue;
     }
 
     private HookResult OnFreezeEnd(EventRoundFreezeEnd @event, GameEventInfo info)
     {
         _freezeEndTime = Server.CurrentTime;
+        _roundState.SetPhase(RoundPhase.Live);
+        AddTimer(0.6f, SynchronizeUtilityLedgers);
         return HookResult.Continue;
+    }
+
+    private void SynchronizeRoundPhaseFromGameRules()
+    {
+        var rules = Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault();
+        var gameRules = rules?.GameRules;
+        if (gameRules == null) return;
+
+        if (_roundOver)
+        {
+            _roundState.SetPhase(RoundPhase.RoundEnd);
+            return;
+        }
+
+        if (gameRules.FreezePeriod)
+        {
+            _roundState.SetPhase(RoundPhase.Freeze);
+            return;
+        }
+
+        bool bombPlanted = Utilities
+            .FindAllEntitiesByDesignerName<CPlantedC4>("planted_c4")
+            .Any(entity => entity.IsValid);
+        if (bombPlanted)
+            _roundState.SetBomb(null, planted: true);
+        else
+            _roundState.SetPhase(RoundPhase.Live);
     }
 
     private HookResult OnRoundEnd(EventRoundEnd @event, GameEventInfo info)
     {
         _roundOver = true;
+        _roundState.SetPhase(RoundPhase.RoundEnd);
         return HookResult.Continue;
     }
 
@@ -1251,44 +1365,16 @@ public class NadeSystemPlugin : BasePlugin
     {
         var player = @event.Userid;
         if (player != null && player.IsValid)
-            _soundPoints.Remove((uint)player.Index);
+        {
+            uint id = (uint)player.Index;
+            foreach (var key in _heardSoundPoints.Keys
+                .Where(key => key.ListenerId == id || key.SourceId == id)
+                .ToList())
+                _heardSoundPoints.Remove(key);
+        }
         return HookResult.Continue;
     }
 
-    private bool IsPistolRound()
-    {
-        try
-        {
-            var gameRules = Utilities
-                .FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules")
-                .FirstOrDefault()?.GameRules;
-            if (gameRules == null) return false;
-
-            int played    = gameRules.TotalRoundsPlayed;
-            int maxRounds = ConVar.Find("mp_maxrounds")?.GetPrimitiveValue<int>() ?? 24;
-            if (maxRounds   <= 0) maxRounds   = 24;
-
-            int half   = maxRounds / 2;
-
-            return played == 0
-                || played == half;
-        }
-        catch { return false; }
-    }
-
-    private int GetRoundSpendCap(bool isCT, bool isPoor)
-    {
-        if (IsPistolRound()) return 800;
-        // Poor bots get a lower spend cap
-        if (isPoor) return 500;
-
-        var costTable = isCT ? CostCT : CostT;
-        int cap = costTable["flash"]
-                + costTable["smoke"]
-                + costTable["he"]
-                + costTable["molotov"];
-        return cap;
-    }
     // Don't blind ourselves and our teammates
     private HookResult OnPlayerBlind(EventPlayerBlind @event, GameEventInfo info)
     {
@@ -1338,7 +1424,7 @@ public class NadeSystemPlugin : BasePlugin
             Server.PrintToConsole("\x0C[NadeSystem]\x01 Usage: bot_nades <off|normal|more|max>");
             return;
         }
-        _botNadesMode = val;
+        _botNadesMode = ProfilePolicy.NormalizeNadeMode(_profile, val);
         Server.PrintToConsole($"[NadeSystem] bot_nades set to {_botNadesMode}");
     }
     // ═══════════════════════════════════════════════════════════
@@ -1679,7 +1765,12 @@ public class NadeSystemPlugin : BasePlugin
     //  Special Nades
     // ═══════════════════════════════════════════════════════════
     // Defuse smoke/flash
-    private void TrySpawnInstantGrenade(CCSPlayerController bot, Vector spawnPos, string gtype, Vector? velocity = null)
+    private void TrySpawnInstantGrenade(
+        CCSPlayerController bot,
+        Vector spawnPos,
+        string gtype,
+        Vector? velocity = null,
+        UtilitySource source = UtilitySource.LineupThrow)
     {
         if (_botNadesMode == "off") return;
         // In case the bot has been taken over
@@ -1692,27 +1783,9 @@ public class NadeSystemPlugin : BasePlugin
                 && (int)p.TeamNum != bot.TeamNum);
         if (!hasLiveEnemy) return;
 
-        var money = bot.InGameMoneyServices;
-        if (money == null) return;
-
-        bool isCT     = bot.TeamNum == (int)CsTeam.CounterTerrorist;
-        var costTable = isCT ? CostCT : CostT;
-        if (!costTable.TryGetValue(gtype, out int cost)) return;
-        if (money.Account < cost) return;
-
-        uint botIdx  = (uint)bot.Index;
-        bool isPoor   = _poorBots.Contains((uint)bot.Index);
-        int  spendCap = GetRoundSpendCap(isCT, isPoor);
-        if (!_roundSpendPerBot.TryGetValue(botIdx, out int alreadySpent))
-            alreadySpent = 0;
-        bool deduct = alreadySpent < spendCap;
-
-        if (deduct)
-        {
-            money.Account -= cost;
-            Utilities.SetStateChanged(bot, "CCSPlayerController", "m_pInGameMoneyServices");
-            _roundSpendPerBot[botIdx] = alreadySpent + cost;
-        }
+        // BotBuy already paid for this item. Special throws consume the same
+        // per-bot inventory as lineups and must not charge the account again.
+        if (!TryConsumeUtility(bot, gtype, source)) return;
 
         var vel = velocity ?? new Vector(0f, 0f, 0f);
         Server.NextFrame(() =>
@@ -1767,6 +1840,7 @@ public class NadeSystemPlugin : BasePlugin
 
     private HookResult OnBombBeginDefuse(EventBombBegindefuse @event, GameEventInfo info)
     {
+        _roundState.SetPhase(RoundPhase.Retake);
         RecordSoundPoint(@event.Userid);
 
         var bot = @event.Userid;
@@ -1794,7 +1868,7 @@ public class NadeSystemPlugin : BasePlugin
             if (hasDefuser || Random.Shared.NextDouble() < 0.33)
             {
                 _defuseSmokeUsed = true;
-                TrySpawnInstantGrenade(bot, spawnPos, "smoke");
+                TrySpawnInstantGrenade(bot, spawnPos, "smoke", source: UtilitySource.DefuseSmoke);
             }
         }
 
@@ -1807,7 +1881,7 @@ public class NadeSystemPlugin : BasePlugin
                 // Don't flash yourself
                 _botFlashImmunityUntil[(uint)bot.Index] = Server.CurrentTime + 2f;
                 var flashVel = new Vector(0f, 0f, -800f);
-                TrySpawnInstantGrenade(bot, spawnPos, "flash", flashVel);
+                TrySpawnInstantGrenade(bot, spawnPos, "flash", flashVel, UtilitySource.FlashSupport);
             }
         }
 
@@ -1835,7 +1909,13 @@ public class NadeSystemPlugin : BasePlugin
         if (pos == null) return HookResult.Continue;
 
         _plantSmokeUsed = true;
-        TrySpawnInstantGrenade(bot, new Vector(pos.X, pos.Y, pos.Z + 5f), "smoke");
+        TrySpawnInstantGrenade(bot, new Vector(pos.X, pos.Y, pos.Z + 5f), "smoke", source: UtilitySource.PlantSmoke);
+        return HookResult.Continue;
+    }
+
+    private HookResult OnBombPlanted(EventBombPlanted @event, GameEventInfo info)
+    {
+        _roundState.SetBomb(null, planted: true);
         return HookResult.Continue;
     }
 
@@ -1887,7 +1967,7 @@ public class NadeSystemPlugin : BasePlugin
 
         var pos = pawn.AbsOrigin;
         if (pos == null) return;
-        TrySpawnInstantGrenade(victim, new Vector(pos.X, pos.Y, pos.Z + 5f), "smoke");
+        TrySpawnInstantGrenade(victim, new Vector(pos.X, pos.Y, pos.Z + 5f), "smoke", source: UtilitySource.MolotovEscape);
     }
     // Revenge grenade
     private void HandleRetaliationHE(EventPlayerHurt @event)
@@ -1967,33 +2047,12 @@ public class NadeSystemPlugin : BasePlugin
                        g.ProjectilePosition.X, g.ProjectilePosition.Y, g.ProjectilePosition.Z))
             .ToList();
 
-        // Loop-invariant purchase context; GetRoundSpendCap walks the entity
-        // table for gamerules, so resolve it once instead of per candidate.
-        var money = victim.InGameMoneyServices;
-        if (money == null) return;
-        bool isCT     = victim.TeamNum == (int)CsTeam.CounterTerrorist;
-        var costTable = isCT ? CostCT : CostT;
-        uint botIdx   = (uint)victim.Index;
-        bool isPoor   = _poorBots.Contains(botIdx);
-        int  spendCap = GetRoundSpendCap(isCT, isPoor);
-
         foreach (var g in candidates)
         {
             if (retaliationSpawned >= retaliationLimit) break;
 
             string gt = g.GrenadeType; // lowercase since LoadDb
-
-            if (!costTable.TryGetValue(gt, out int cost)) continue;
-            if (money.Account < cost) continue;
-
-            if (!_roundSpendPerBot.TryGetValue(botIdx, out int alreadySpent)) alreadySpent = 0;
-            bool deduct = alreadySpent < spendCap;
-            if (deduct)
-            {
-                money.Account -= cost;
-                Utilities.SetStateChanged(victim, "CCSPlayerController", "m_pInGameMoneyServices");
-                _roundSpendPerBot[botIdx] = alreadySpent + cost;
-            }
+            if (!TryConsumeUtility(victim, gt, UtilitySource.Retaliation)) continue;
 
             RegisterCooldown(g.Id, gt);
             SpawnProjectile(victim, g);

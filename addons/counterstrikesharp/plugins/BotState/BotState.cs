@@ -9,6 +9,7 @@ using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Core.Capabilities;
 using RayTraceAPI;
 using BotControllerApi;
+using CompetitiveBotCore;
 using System;
 using System.Runtime.CompilerServices;
 
@@ -21,16 +22,17 @@ public class BotState : BasePlugin
     public override string ModuleAuthor => "ed0ard & XBribo";
     public override string ModuleDescription => "Make bots smarter";
 
-    private const float ExpandedValue = 500f;
-    private const float NormalValue = 50f;
-    private const float RestoreDelay = 1.0f;
     private const int KnifeDefinitionIndex = 9001;
+    private const float ExpandedSmokeLength = 500f;
+    private const float NormalSmokeLength = 50f;
+    private const float SmokeRestoreDelay = 1.0f;
 
-    private bool _isExpanded = false;
-    private ConVar? _smokeConVar;
-    private bool _isBombBeingDefused = false;
-    private bool _isDefuseExpanded = false;
-    private CounterStrikeSharp.API.Modules.Timers.Timer? _defuseExpandTimer = null;
+    private BotMatchProfile _profile = BotMatchProfile.Competitive;
+    private bool _isSmokeExpanded;
+    private bool _isBombBeingDefused;
+    private bool _isDefuseSmokeExpanded;
+    private ConVar? _smokeVisibilityCvar;
+    private CounterStrikeSharp.API.Modules.Timers.Timer? _defuseSmokeTimer;
 
     private readonly Random _random = new Random();
 
@@ -88,7 +90,10 @@ public class BotState : BasePlugin
     // Registers game events and the per-tick bot behavior listener
     public override void Load(bool hotReload)
     {
-        _smokeConVar = ConVar.Find("bot_max_visible_smoke_length");
+        _profile = ProfilePolicy.Resolve(
+            ProfileConfig.Load(ProfileConfig.DefaultPath(Server.GameDirectory)),
+            IsEntertainmentMode());
+        _smokeVisibilityCvar = ConVar.Find("bot_max_visible_smoke_length");
         RegisterEventHandler<EventRoundStart>(OnRoundStart);
         RegisterEventHandler<EventPlayerHurt>(OnPlayerHurt);
         RegisterEventHandler<EventPlayerSpawn>(OnPlayerSpawn);
@@ -155,40 +160,48 @@ public class BotState : BasePlugin
     //---------------------------------------------------------------------------------------
     private HookResult OnPlayerHurt(EventPlayerHurt @event, GameEventInfo _)
     {
+        if (IsCompetitiveProfile()) return HookResult.Continue;
+
         try
         {
             var victim = @event.Userid;
             if (victim == null || !victim.IsValid || !victim.IsBot) return HookResult.Continue;
 
-            if (!_isExpanded)
+            if (!_isSmokeExpanded)
             {
-                _isExpanded = true;
-                SetSmokeLength(ExpandedValue);
-                AddTimer(RestoreDelay, () =>
+                _isSmokeExpanded = true;
+                SetSmokeVisibility(ExpandedSmokeLength);
+                AddTimer(SmokeRestoreDelay, () =>
                 {
-                    SetSmokeLength(NormalValue);
-                    _isExpanded = false;
+                    SetSmokeVisibility(NormalSmokeLength);
+                    _isSmokeExpanded = false;
                 });
             }
         }
-        catch { }
+        catch
+        {
+            // Smoke visibility is an optional arcade/legacy enhancement.
+        }
         return HookResult.Continue;
     }
 
-    private void SetSmokeLength(float value)
+    private bool IsCompetitiveProfile()
+        => ProfilePolicy.IsCompetitive(_profile);
+
+    private static bool IsEntertainmentMode()
     {
-        if (_smokeConVar != null)
-            _smokeConVar.SetValue(value);
-        else
-            Server.ExecuteCommand($"bot_max_visible_smoke_length {value}");
+        bool teammatesAreEnemies = ConVar.Find("mp_teammates_are_enemies")?.StringValue is "1" or "true";
+        bool noSpread = ConVar.Find("weapon_accuracy_nospread")?.StringValue is "1" or "true";
+        bool unlimitedMoney = ConVar.Find("mp_maxmoney")?.StringValue == "0";
+        return teammatesAreEnemies || noSpread || unlimitedMoney;
     }
 
     // Restores plugin-owned state before the plugin unloads
     public override void Unload(bool hotReload)
     {
         ReleaseKnifeLocks();
-        SetSmokeLength(NormalValue);
-        _defuseExpandTimer?.Kill();
+        SetSmokeVisibility(NormalSmokeLength);
+        _defuseSmokeTimer?.Kill();
     }
     // Spam smoke when an enemy is defusing the bomb
     private HookResult OnBombAbortDefuse(EventBombAbortdefuse @event, GameEventInfo info)
@@ -212,34 +225,42 @@ public class BotState : BasePlugin
     private void StopDefuseSmoke()
     {
         _isBombBeingDefused = false;
-        _defuseExpandTimer?.Kill();
-        _defuseExpandTimer = null;
-        if (_isDefuseExpanded)
+        _defuseSmokeTimer?.Kill();
+        _defuseSmokeTimer = null;
+        if (_isDefuseSmokeExpanded)
         {
-            _isDefuseExpanded = false;
-            SetSmokeLength(NormalValue);
+            _isDefuseSmokeExpanded = false;
+            SetSmokeVisibility(NormalSmokeLength);
         }
     }
 
     private void StartDefuseSmokeCycle()
     {
-        if (_defuseExpandTimer != null) return;
+        if (_defuseSmokeTimer != null) return;
 
-        _defuseExpandTimer = AddTimer(3.5f, () =>
+        _defuseSmokeTimer = AddTimer(3.5f, () =>
         {
-            _defuseExpandTimer = null;
-            if (!_isBombBeingDefused) return;
+            _defuseSmokeTimer = null;
+            if (!_isBombBeingDefused || IsCompetitiveProfile()) return;
 
-            _isDefuseExpanded = true;
-            SetSmokeLength(ExpandedValue);
-
+            _isDefuseSmokeExpanded = true;
+            SetSmokeVisibility(ExpandedSmokeLength);
             AddTimer(1.5f, () =>
             {
-                _isDefuseExpanded = false;
-                SetSmokeLength(NormalValue);
-                if (_isBombBeingDefused) StartDefuseSmokeCycle();
+                _isDefuseSmokeExpanded = false;
+                SetSmokeVisibility(NormalSmokeLength);
+                if (_isBombBeingDefused && !IsCompetitiveProfile())
+                    StartDefuseSmokeCycle();
             });
         });
+    }
+
+    private void SetSmokeVisibility(float value)
+    {
+        if (_smokeVisibilityCvar != null)
+            _smokeVisibilityCvar.SetValue(value);
+        else
+            Server.ExecuteCommand($"bot_max_visible_smoke_length {value}");
     }
     //---------------------------------------------------------------------------------------
     private HookResult OnPlayerBlind(EventPlayerBlind @event, GameEventInfo info)
@@ -291,8 +312,9 @@ public class BotState : BasePlugin
         }
         else
         {
-            // Fallback when raytrace is unavailable
-            isImmune = _random.NextDouble() <= 0.6;
+            // Fail closed when raytrace is unavailable. A missing capability
+            // cannot be treated as permission to ignore a flash.
+            isImmune = false;
         }
 
         if (isImmune)
@@ -393,14 +415,20 @@ public class BotState : BasePlugin
             ref bool allowActive = ref bot.AllowActive;
             allowActive = true;
 
-            ref bool isRapidFiring = ref bot.IsRapidFiring;
-            isRapidFiring = true;
+            if (!IsCompetitiveProfile())
+            {
+                ref bool isRapidFiring = ref bot.IsRapidFiring;
+                isRapidFiring = true;
+            }
 
+            if (!IsCompetitiveProfile())
+            {
             ref float peripheralTimestamp = ref bot.PeripheralTimestamp;
             peripheralTimestamp = 0.0f;
 
             ref float fireWeaponTimestamp = ref bot.FireWeaponTimestamp;
             fireWeaponTimestamp = 0.0f;
+
             // Alert
             CountdownTimer alertTimer = bot.AlertTimer;
             ref float alertduration = ref alertTimer.Duration;
@@ -473,6 +501,7 @@ public class BotState : BasePlugin
 
             ref float politeTimerTimescale = ref politeTimer.Timescale;
             politeTimerTimescale = 1.0f;
+            }
 
             // Sniper Peek
             bool curIsAttacking = bot.IsAttacking;
@@ -505,9 +534,9 @@ public class BotState : BasePlugin
                 ref float inhibitLookAroundTimestamp = ref bot.InhibitLookAroundTimestamp;
                 inhibitLookAroundTimestamp = 0f;
             }
-            //Test Alert! Can cause crash when bot_debug 1 !
-            ref bool isAimingAtEnemy = ref bot.IsAimingAtEnemy;
-            if (isAimingAtEnemy && !curIsAttacking)
+            // Test Alert! Can cause a crash when bot_debug 1. It is also an
+            // unfair forced-fire path, so keep it for legacy/arcade only.
+            if (!IsCompetitiveProfile() && bot.IsAimingAtEnemy && !curIsAttacking)
             {
                 bot.IsAttacking = true;
             }
@@ -792,6 +821,8 @@ public class BotState : BasePlugin
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
         ReleaseKnifeLocks();
+        StopDefuseSmoke();
+        _isSmokeExpanded = false;
         _eliminationHandled = false;
         _isFreezeTime = true;
 
@@ -1118,8 +1149,6 @@ public class BotState : BasePlugin
     private HookResult OnBombBeginDefuse(EventBombBegindefuse @event, GameEventInfo info)
     {
         ResetLookAroundForBot(@event.Userid);
-        _isBombBeingDefused = true;
-        StartDefuseSmokeCycle();
 
         var player = @event.Userid;
         if (player == null || !player.IsValid || !player.IsBot) return HookResult.Continue;
@@ -1161,6 +1190,12 @@ public class BotState : BasePlugin
 
                 ResetLookAroundForBot(player);
             }
+        }
+
+        if (!IsCompetitiveProfile())
+        {
+            _isBombBeingDefused = true;
+            StartDefuseSmokeCycle();
         }
 
         return HookResult.Continue;
