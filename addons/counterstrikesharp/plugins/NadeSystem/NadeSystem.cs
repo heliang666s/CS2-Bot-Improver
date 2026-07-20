@@ -128,7 +128,9 @@ public class NadeSystemPlugin : BasePlugin
     private static readonly PluginCapability<CRayTraceInterface> _rayTraceCapability =
         new("raytrace:craytraceinterface");
     // Special Nades
-    private bool _defuseSmokeUsed    = false;
+    // Track the defuser, rather than one global round flag: a prior fake or
+    // aborted defuse must not prevent the actual defuser from using owned smoke.
+    private HashSet<uint> _defuseSmokeUsers = new();
     private bool _defuseFlashUsed    = false;
     private bool _plantSmokeUsed     = false;
     // key = TeamNum (2=T, 3=CT)
@@ -281,6 +283,7 @@ public class NadeSystemPlugin : BasePlugin
             _roundCountByTeam.Clear();
             _replayBots.Clear();
             _utilityLedgers.Clear();
+            _defuseSmokeUsers.Clear();
         });
         
         AddCommand("bot_nades", "Control bots' nade throw mode (off/normal/more/max)", CmdBotNades);
@@ -1211,12 +1214,89 @@ public class NadeSystemPlugin : BasePlugin
         _roundCountByTeam[teamNum] = counter;
     }
 
+    private void DecrementCount(string gtype, int teamNum)
+    {
+        if (!_roundCountByTeam.TryGetValue(teamNum, out var counter))
+            return;
+
+        switch (gtype.ToLowerInvariant())
+        {
+            case "flash":
+                counter.Flash = Math.Max(0, counter.Flash - 1);
+                break;
+            case "smoke":
+                counter.Smoke = Math.Max(0, counter.Smoke - 1);
+                break;
+            case "he":
+                counter.HE = Math.Max(0, counter.HE - 1);
+                break;
+            case "molotov":
+            case "incgrenade":
+                counter.Molotov = Math.Max(0, counter.Molotov - 1);
+                break;
+        }
+
+        _roundCountByTeam[teamNum] = counter;
+    }
+
+    private bool TryReserveNormalRoundBudget(
+        CCSPlayerController bot,
+        string grenadeType)
+    {
+        if (_botNadesMode != "normal")
+            return true;
+
+        string gtype = grenadeType.ToLowerInvariant();
+        int teamNum = bot.TeamNum;
+        int teamSize = Utilities
+            .FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
+            .Count(player => player.IsValid
+                && player.IsBot
+                && !player.HasBeenControlledByPlayerThisRound
+                && player.TeamNum == teamNum);
+        teamSize = Math.Max(1, teamSize);
+
+        if (!_roundCountByTeam.TryGetValue(teamNum, out var teamCount))
+            teamCount = new RoundCounter();
+
+        if (gtype is "flash" or "he" or "molotov" or "incgrenade")
+        {
+            int optionalTotal = teamCount.Flash + teamCount.HE + teamCount.Molotov;
+            if (optionalTotal >= 3 * teamSize)
+                return false;
+        }
+
+        if (gtype == "flash")
+        {
+            var flashLimit = ConVar.Find("ammo_grenade_limit_flashbang");
+            int max = (flashLimit?.GetPrimitiveValue<int>() ?? 2) * teamSize;
+            if (teamCount.Flash >= max)
+                return false;
+        }
+        else if (gtype is "smoke" or "he" or "molotov" or "incgrenade")
+        {
+            int used = gtype switch
+            {
+                "smoke" => teamCount.Smoke,
+                "he" => teamCount.HE,
+                _ => teamCount.Molotov,
+            };
+            if (used >= teamSize)
+                return false;
+        }
+
+        IncrementCount(gtype, teamNum);
+        return true;
+    }
+
     private bool TryConsumeUtility(
         CCSPlayerController bot,
         string grenadeType,
         UtilitySource source)
     {
         if (!TryGetUtilityType(grenadeType, out var type))
+            return true;
+        if (!ProfilePolicy.ShouldEnforceUtilityInventory(_profile))
             return true;
 
         uint botIndex = (uint)bot.Index;
@@ -1227,6 +1307,17 @@ public class NadeSystemPlugin : BasePlugin
         }
 
         return ledger.TryConsume(type, source);
+    }
+
+    private void RefundUtility(
+        CCSPlayerController bot,
+        string grenadeType)
+    {
+        if (!TryGetUtilityType(grenadeType, out var type))
+            return;
+
+        if (_utilityLedgers.TryGetValue((uint)bot.Index, out var ledger))
+            ledger.Refund(type);
     }
 
     private void SynchronizeUtilityLedgers()
@@ -1300,7 +1391,7 @@ public class NadeSystemPlugin : BasePlugin
         _replayBots.Clear();
         _smokeCooldownBots.Clear();
         _utilityLedgers.Clear();
-        _defuseSmokeUsed  = false;
+        _defuseSmokeUsers.Clear();
         _defuseFlashUsed  = false;
         _plantSmokeUsed   = false;
         _botMolotovDmgStart.Clear();
@@ -1765,31 +1856,41 @@ public class NadeSystemPlugin : BasePlugin
     //  Special Nades
     // ═══════════════════════════════════════════════════════════
     // Defuse smoke/flash
-    private void TrySpawnInstantGrenade(
+    private bool TrySpawnInstantGrenade(
         CCSPlayerController bot,
         Vector spawnPos,
         string gtype,
         Vector? velocity = null,
         UtilitySource source = UtilitySource.LineupThrow)
     {
-        if (_botNadesMode == "off") return;
+        if (_botNadesMode == "off") return false;
         // In case the bot has been taken over
         bool isTakenOver = bot.HasBeenControlledByPlayerThisRound;
-        if (isTakenOver) return;
+        if (isTakenOver) return false;
         bool hasLiveEnemy = Utilities
             .FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
             .Any(p => p.IsValid && p.PawnIsAlive
                 && ((int)p.TeamNum == 2 || (int)p.TeamNum == 3)
                 && (int)p.TeamNum != bot.TeamNum);
-        if (!hasLiveEnemy) return;
+        if (!hasLiveEnemy) return false;
 
         // BotBuy already paid for this item. Special throws consume the same
         // per-bot inventory as lineups and must not charge the account again.
-        if (!TryConsumeUtility(bot, gtype, source)) return;
+        if (!TryConsumeUtility(bot, gtype, source)) return false;
+        bool tracksRoundBudget = _botNadesMode == "normal"
+            && TryGetUtilityType(gtype, out _);
+        bool roundBudgetReserved = tracksRoundBudget
+            && TryReserveNormalRoundBudget(bot, gtype);
+        if (tracksRoundBudget && !roundBudgetReserved)
+        {
+            RefundUtility(bot, gtype);
+            return false;
+        }
 
         var vel = velocity ?? new Vector(0f, 0f, 0f);
         Server.NextFrame(() =>
         {
+            bool spawned = false;
             try
             {
                 var botPawn = bot.PlayerPawn?.Value;
@@ -1808,6 +1909,7 @@ public class NadeSystemPlugin : BasePlugin
                     smoke.Thrower.Raw         = botPawn.EntityHandle.Raw;
                     smoke.OriginalThrower.Raw = botPawn.EntityHandle.Raw;
                     smoke.OwnerEntity.Raw     = botPawn.EntityHandle.Raw;
+                    spawned = true;
                 }
                 else if (gtype == "flash")
                 {
@@ -1829,13 +1931,40 @@ public class NadeSystemPlugin : BasePlugin
                     flash.Teleport(spawnPos, ang, vel);
                     flash.DispatchSpawn();
                     flash.Teleport(spawnPos, ang, vel);
+                    spawned = true;
                 }
             }
             catch (Exception ex)
             {
                 Server.PrintToConsole($"[NadeSystem] TrySpawnInstantGrenade error: {ex.Message}");
             }
+            finally
+            {
+                if (!spawned)
+                {
+                    // The ledger is charged before NextFrame because multiple
+                    // events can queue in the same tick. If entity creation
+                    // fails, return the item and allow a later defuse attempt
+                    // to retry.
+                    RefundUtility(bot, gtype);
+                    if (roundBudgetReserved)
+                        DecrementCount(gtype, bot.TeamNum);
+                    switch (source)
+                    {
+                        case UtilitySource.DefuseSmoke:
+                            _defuseSmokeUsers.Remove((uint)bot.Index);
+                            break;
+                        case UtilitySource.FlashSupport:
+                            _defuseFlashUsed = false;
+                            break;
+                        case UtilitySource.PlantSmoke:
+                            _plantSmokeUsed = false;
+                            break;
+                    }
+                }
+            }
         });
+        return true;
     }
 
     private HookResult OnBombBeginDefuse(EventBombBegindefuse @event, GameEventInfo info)
@@ -1855,8 +1984,11 @@ public class NadeSystemPlugin : BasePlugin
         if (pos == null) return HookResult.Continue;
         var spawnPos = new Vector(pos.X, pos.Y, pos.Z + 5f);
 
-        // Defuse smoke
-        if (!_defuseSmokeUsed)
+        // Defuse smoke: each bot can spend at most one owned smoke on a
+        // defuse attempt, but one bot's fake/failed attempt must not block a
+        // different defuser with a real smoke.
+        uint botIndex = (uint)bot.Index;
+        if (!_defuseSmokeUsers.Contains(botIndex))
         {
             bool hasDefuser = false;
             if (pawn.ItemServices != null
@@ -1865,23 +1997,36 @@ public class NadeSystemPlugin : BasePlugin
                 hasDefuser = new CCSPlayer_ItemServices(pawn.ItemServices.Handle).HasDefuser;
             }
 
-            if (hasDefuser || Random.Shared.NextDouble() < 0.33)
+            bool hasSmoke = ReadUtilityInventory(bot).Smoke > 0;
+            if (DefuseDecisionPolicy.ShouldDeployDefuseSmoke(
+                    _profile,
+                    hasSmoke,
+                    hasDefuser,
+                    Random.Shared.NextDouble())
+                && TrySpawnInstantGrenade(
+                    bot,
+                    spawnPos,
+                    "smoke",
+                    source: UtilitySource.DefuseSmoke))
             {
-                _defuseSmokeUsed = true;
-                TrySpawnInstantGrenade(bot, spawnPos, "smoke", source: UtilitySource.DefuseSmoke);
+                _defuseSmokeUsers.Add(botIndex);
             }
         }
 
         // Defuse flash
         if (!_defuseFlashUsed)
         {
-            if (Random.Shared.NextDouble() < 0.20)
+            if (Random.Shared.NextDouble() < 0.20
+                && TrySpawnInstantGrenade(
+                    bot,
+                    spawnPos,
+                    "flash",
+                    new Vector(0f, 0f, -800f),
+                    UtilitySource.FlashSupport))
             {
                 _defuseFlashUsed = true;
                 // Don't flash yourself
                 _botFlashImmunityUntil[(uint)bot.Index] = Server.CurrentTime + 2f;
-                var flashVel = new Vector(0f, 0f, -800f);
-                TrySpawnInstantGrenade(bot, spawnPos, "flash", flashVel, UtilitySource.FlashSupport);
             }
         }
 
@@ -1908,8 +2053,14 @@ public class NadeSystemPlugin : BasePlugin
         var pos = pawn.AbsOrigin;
         if (pos == null) return HookResult.Continue;
 
-        _plantSmokeUsed = true;
-        TrySpawnInstantGrenade(bot, new Vector(pos.X, pos.Y, pos.Z + 5f), "smoke", source: UtilitySource.PlantSmoke);
+        if (TrySpawnInstantGrenade(
+                bot,
+                new Vector(pos.X, pos.Y, pos.Z + 5f),
+                "smoke",
+                source: UtilitySource.PlantSmoke))
+        {
+            _plantSmokeUsed = true;
+        }
         return HookResult.Continue;
     }
 

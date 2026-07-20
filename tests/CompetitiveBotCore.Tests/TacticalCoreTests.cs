@@ -71,4 +71,19 @@ public sealed class TacticalCoreTests
         Assert.False(policy.CanOverrideAim(true, true, false, false, false));
         Assert.False(policy.CanOverrideAim(true, true, false, true, true));
     }
+
+    [Fact]
+    public void SmokeGeometryOnlyBlocksLinesThatCrossTheSmokeVolume()
+    {
+        Assert.True(VisibilityGeometry.SegmentIntersectsSphere(
+            0f, 0f, 0f,
+            1000f, 0f, 0f,
+            500f, 0f, 0f,
+            120f));
+        Assert.False(VisibilityGeometry.SegmentIntersectsSphere(
+            0f, 0f, 0f,
+            1000f, 0f, 0f,
+            500f, 250f, 0f,
+            120f));
+    }
 }

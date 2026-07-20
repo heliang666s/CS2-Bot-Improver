@@ -141,13 +141,17 @@ public class BotAimImprover : BasePlugin
     private readonly ConcurrentDictionary<IntPtr, int> _botToControllerUserId = new();
 
     // Aim mode controlled by the `bot_aim` console command:
-    //   Mixed = priority logic; snipers + spread weapons aim body-first, others head-first
+    //   Mixed = priority logic; competitive pistols aim head-first,
+    //           spread weapons body-first, other weapons jaw-first
     //   Head  = always head-first
     //   Body  = always body-first
     private enum AimMode { MIXED, HEAD, BODY }
     private AimMode _aimMode = AimMode.MIXED;
 
     // Weapons that aim body-first when in Mixed mode (snipers + high-spread / shotguns).
+    // Standard pistols are intentionally not in this list: in competitive mixed
+    // mode they receive a dedicated head-first policy below. The R8 remains here
+    // because its high spread is better handled by the existing body-first rule.
     private static readonly HashSet<string> _bodyFirstWeapons = new()
     {
         "weapon_awp", "weapon_ssg08", "weapon_p90", "weapon_bizon",
@@ -270,12 +274,7 @@ public class BotAimImprover : BasePlugin
             // 1) Gate: enemy must be generally visible before we
             //    spend any raytraces. Otherwise the native used last-known position.
             bool nativeVisible = ReadByte(pCCSBot + _off.IsVisible) != 0;
-            if (!_visibilityPolicy.CanOverrideAim(
-                    rayTraceAvailable: _rayTraceCapability.Get() != null,
-                    nativeTargetVisible: nativeVisible,
-                    smokeObscured: false,
-                    infoIsFresh: nativeVisible,
-                    isHistoricalPosition: !nativeVisible))
+            if (!nativeVisible || _rayTraceCapability.Get() == null)
                 return HookResult.Continue;
 
             // 2) Resolve enemy pawn from m_enemy CHandle.
@@ -296,17 +295,38 @@ public class BotAimImprover : BasePlugin
             if (botController == null || !TryGetBotEyePosition(botController, out var botEye))
                 return HookResult.Continue;
 
+            var enemyOrigin = enemyPawn.AbsOrigin;
+            if (enemyOrigin == null)
+                return HookResult.Continue;
+
+            bool smokeObscured = _profile == BotMatchProfile.Competitive
+                && IsSmokeObscured(
+                    botEye,
+                    new Vector(enemyOrigin.X, enemyOrigin.Y, enemyOrigin.Z + 64f));
+            if (!_visibilityPolicy.CanOverrideAim(
+                    rayTraceAvailable: true,
+                    nativeTargetVisible: true,
+                    smokeObscured: smokeObscured,
+                    infoIsFresh: true,
+                    isHistoricalPosition: false))
+                return HookResult.Continue;
+
             string? wpn = botController.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value?.DesignerName;
 
             // 4) Select the priority order based on aim mode and weapon.
             // head: awp -> others -> Head. body: all weapons -> Body.
-            // mixed: body-first weapons -> Body, others -> Jaw.
+            // mixed: spread weapons -> Body, competitive pistols -> Head,
+            //        other weapons -> Jaw.
             bool isBodyWeapon = wpn != null && _bodyFirstWeapons.Contains(wpn);
+            bool isCompetitivePrecisionPistol =
+                AimWeaponPolicy.ShouldUseHeadFirstInMixed(_profile, wpn);
             int[] order = _aimMode switch
             {
                 AimMode.HEAD => wpn == "weapon_awp" ? _priorityBody : _priorityHead,
                 AimMode.BODY => _priorityBody,
-                _ => isBodyWeapon ? _priorityBody : _priorityJaw, // MIXED
+                _ => isBodyWeapon
+                    ? _priorityBody
+                    : isCompetitivePrecisionPistol ? _priorityHead : _priorityJaw, // MIXED
             };
 
             // 5) Walk the priority order and raytrace each point from the bot's
@@ -396,6 +416,30 @@ public class BotAimImprover : BasePlugin
         float ez = pawn!.ViewOffset?.Z ?? 64.0f;
         eye = new Vector(origin.X, origin.Y, origin.Z + ez);
         return true;
+    }
+
+    private static bool IsSmokeObscured(Vector eye, Vector target)
+    {
+        foreach (var smoke in Utilities
+                     .FindAllEntitiesByDesignerName<CSmokeGrenadeProjectile>(
+                         "smokegrenade_projectile"))
+        {
+            if (!smoke.IsValid || !smoke.DidSmokeEffect)
+                continue;
+
+            var center = smoke.SmokeDetonationPos;
+            if (center is null)
+                continue;
+
+            if (VisibilityGeometry.SegmentIntersectsSphere(
+                    eye.X, eye.Y, eye.Z,
+                    target.X, target.Y, target.Z,
+                    center.X, center.Y, center.Z,
+                    radius: 160f))
+                return true;
+        }
+
+        return false;
     }
 
     // Compute world position of derived point `idx` from the enemy pawn's schema fields.
