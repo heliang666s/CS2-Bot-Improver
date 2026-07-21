@@ -731,7 +731,7 @@ public sealed class BuyPlannerTests
     }
 
     [Fact]
-    public void DifferentCarriedPrimaryIsNotReportedAsPlannedRifle()
+    public void StandardBuyUpgradesAWeakerCarriedPrimaryWhenItFits()
     {
         var plan = BuyPlanner.BuildPlayerPlan(
             TeamSide.Terrorist,
@@ -743,7 +743,7 @@ public sealed class BuyPlannerTests
             currentPrimary: "weapon_mac10",
             currentSecondary: "weapon_glock");
 
-        Assert.Equal("weapon_mac10", plan.PrimaryWeapon);
+        Assert.Equal("weapon_galilar", plan.PrimaryWeapon);
         Assert.NotEqual("weapon_ak47", plan.PrimaryWeapon);
         Assert.True(plan.EstimatedCost <= 3000);
     }
@@ -947,5 +947,22 @@ public sealed class BuyPlannerTests
         Assert.True(RoundSchedule.IsLastRoundOfHalf(23));
         Assert.False(RoundSchedule.IsLastRoundOfHalf(22));
         Assert.True(RoundSchedule.IsSecondToLastRoundOfHalf(22));
+    }
+
+    [Fact]
+    public void OvertimeFirstRoundWithStartingMoneyIsAFullBuy()
+    {
+        var snapshot = new TeamEconomySnapshot(
+            TeamSide.CounterTerrorist,
+            [10000, 10000, 10000, 10000],
+            IsPistolRound: true,
+            IsLastRound: false,
+            ForceBuySignal: false,
+            OpponentEcoLikely: false)
+        {
+            IsOvertimeFirstRound = true,
+        };
+
+        Assert.Equal(BuyPhase.FullBuy, BuyPlanner.Classify(snapshot));
     }
 }

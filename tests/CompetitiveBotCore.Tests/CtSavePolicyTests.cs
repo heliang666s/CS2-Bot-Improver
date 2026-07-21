@@ -5,7 +5,7 @@ namespace CompetitiveBotCore.Tests;
 public sealed class CtSavePolicyTests
 {
     [Fact]
-    public void EcoProbeWithoutContactSavesAValuableWeapon()
+    public void EcoProbeDoesNotSaveAValuableWeaponInAReasonableTwoVsTwo()
     {
         var decision = CtSavePolicy.Evaluate(
             BotMatchProfile.Competitive,
@@ -20,7 +20,7 @@ public sealed class CtSavePolicyTests
             probeCompleted: true,
             liveElapsedSeconds: 20f);
 
-        Assert.Equal(new CtSaveDecision(true, CtSaveReason.EcoNoContact), decision);
+        Assert.Equal(new CtSaveDecision(false, CtSaveReason.None), decision);
     }
 
     [Theory]

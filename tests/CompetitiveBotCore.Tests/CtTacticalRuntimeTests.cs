@@ -53,7 +53,7 @@ public sealed class CtTacticalRuntimeTests
     }
 
     [Fact]
-    public void EcoProbeWithoutContactTransitionsValuableBotsToSave()
+    public void EcoProbeWithoutContactKeepsAFullTeamAvailableForTheRound()
     {
         var runtime = new CompetitiveTacticalRuntime();
         runtime.Reset(CreateContext(BuyPhase.Eco) with
@@ -69,8 +69,8 @@ public sealed class CtTacticalRuntimeTests
         runtime.DecideAll(15f);
         var decisions = runtime.DecideAll(19f);
 
-        Assert.Equal(5, decisions.Count(decision => decision.State == CtTacticalState.Save));
-        Assert.DoesNotContain(decisions, decision => decision.IsActive);
+        Assert.DoesNotContain(decisions, decision => decision.State == CtTacticalState.Save);
+        Assert.InRange(decisions.Count(decision => decision.State == CtTacticalState.Hold), 4, 5);
     }
 
     [Fact]
@@ -249,9 +249,23 @@ public sealed class CtTacticalRuntimeTests
         Assert.DoesNotContain(decisions, decision => decision.IsActive);
 
         var laterDecisions = runtime.DecideAll(16f);
-        Assert.Equal(0, runtime.Context.ActiveProbeCount);
-        Assert.All(laterDecisions, decision =>
-            Assert.Equal(CtTacticalState.Withdraw, decision.State));
+        Assert.Equal(1, runtime.Context.ActiveProbeCount);
+        Assert.Equal(1, laterDecisions.Count(decision =>
+            decision.State == CtTacticalState.Information && decision.IsActive));
+        Assert.Equal(4, laterDecisions.Count(decision => decision.State == CtTacticalState.Hold));
+    }
+
+    [Fact]
+    public void EconomicGambleStillAllowsOneInformationProbeWithoutContact()
+    {
+        var runtime = CreateRuntime(BuyPhase.Eco);
+        runtime.SetCtGambleSite(CtGambleSite.B);
+
+        var decisions = runtime.DecideAll(16f);
+
+        Assert.Equal(1, decisions.Count(decision =>
+            decision.State == CtTacticalState.Information && decision.IsActive));
+        Assert.Equal(1, runtime.Context.ActiveProbeCount);
     }
 
     [Fact]
@@ -280,7 +294,7 @@ public sealed class CtTacticalRuntimeTests
     }
 
     [Fact]
-    public void NoContactMovesTheGambleTeamToRetreatThenSave()
+    public void NoContactDoesNotMoveTheGambleTeamToRetreatOnAClockThreshold()
     {
         var runtime = CreateRuntime(BuyPhase.Eco);
         runtime.SetCtGambleSite(CtGambleSite.A);
@@ -289,16 +303,16 @@ public sealed class CtTacticalRuntimeTests
             HasValuableWeapon = true,
         }).ToArray());
 
-        var withdrawing = runtime.DecideAll(13f);
-        Assert.Equal(5, withdrawing.Count(decision => decision.ShouldMoveToRetreat));
+        var withholding = runtime.DecideAll(13f);
+        Assert.Equal(0, withholding.Count(decision => decision.ShouldMoveToRetreat));
 
         var saving = runtime.DecideAll(18f);
-        Assert.Equal(5, saving.Count(decision =>
+        Assert.Equal(0, saving.Count(decision =>
             decision.State == CtTacticalState.Save && decision.ShouldMoveToRetreat));
     }
 
     [Fact]
-    public void WithdrawAndSaveNeverAllowNativeActiveSearch()
+    public void AClockOnlyDecisionKeepsNativeActiveSearchEnabled()
     {
         var runtime = CreateRuntime(BuyPhase.Eco);
         runtime.SetCtGambleSite(CtGambleSite.A);
@@ -310,7 +324,7 @@ public sealed class CtTacticalRuntimeTests
         var decisions = runtime.DecideAll(13f);
 
         Assert.All(decisions, decision =>
-            Assert.False(CtTacticalExecutionPolicy.ShouldAllowNativeActive(decision)));
+            Assert.True(CtTacticalExecutionPolicy.ShouldAllowNativeActive(decision)));
     }
 
     [Fact]

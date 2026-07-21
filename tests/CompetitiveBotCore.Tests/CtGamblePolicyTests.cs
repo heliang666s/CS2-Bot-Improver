@@ -68,7 +68,7 @@ public sealed class CtGamblePolicyTests
     }
 
     [Fact]
-    public void NoContactStartsRetreatAfterTwelveSeconds()
+    public void NoContactDoesNotWithdrawJustBecauseTwelveSecondsPassed()
     {
         var decision = CtGamblePolicy.Evaluate(
             BotMatchProfile.Competitive,
@@ -81,13 +81,14 @@ public sealed class CtGamblePolicyTests
             hasValuableWeapon: true,
             aliveCt: 5);
 
-        Assert.Equal(CtGambleStage.Withdraw, decision.Stage);
-        Assert.True(decision.ShouldMoveToRetreat);
-        Assert.True(decision.PreserveWeapon);
+        Assert.Equal(CtGambleStage.Stack, decision.Stage);
+        Assert.True(decision.ShouldMoveToSite);
+        Assert.False(decision.ShouldMoveToRetreat);
+        Assert.False(decision.PreserveWeapon);
     }
 
     [Fact]
-    public void NoContactAtEighteenSecondsEntersSave()
+    public void NoContactDoesNotSaveJustBecauseEighteenSecondsPassed()
     {
         var decision = CtGamblePolicy.Evaluate(
             BotMatchProfile.Competitive,
@@ -100,9 +101,10 @@ public sealed class CtGamblePolicyTests
             hasValuableWeapon: true,
             aliveCt: 5);
 
-        Assert.Equal(CtGambleStage.Save, decision.Stage);
-        Assert.True(decision.ShouldMoveToRetreat);
-        Assert.True(decision.PreserveWeapon);
+        Assert.Equal(CtGambleStage.Stack, decision.Stage);
+        Assert.True(decision.ShouldMoveToSite);
+        Assert.False(decision.ShouldMoveToRetreat);
+        Assert.False(decision.PreserveWeapon);
     }
 
     [Theory]

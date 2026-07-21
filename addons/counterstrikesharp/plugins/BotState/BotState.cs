@@ -94,7 +94,15 @@ public class BotState : BasePlugin
     private readonly Dictionary<int, CtTacticalDecision> _lastTacticalDecisions = new();
     private readonly Dictionary<int, float> _lastTacticalRepath = new();
     private readonly Dictionary<int, float> _lastTacticalGoalWrite = new();
+    private readonly Dictionary<int, Vector> _lastTacticalPosition = new();
+    private readonly Dictionary<int, float> _tacticalStuckSince = new();
     private readonly Dictionary<CtGambleSite, Vector> _ctGambleTargets = new();
+    private readonly Dictionary<int, Vector> _tPostPlantTargets = new();
+    private readonly Dictionary<int, Vector> _tPostPlantRetreatTargets = new();
+    private bool _tPostPlantActive;
+    private CtGambleSite _tPostPlantSite;
+    private TPostPlantAction? _lastTPostPlantAction;
+    private string? _lastTPostPlantReason;
     private Vector? _ctRetreatTarget;
     private bool _ctGambleFallbackLogged;
     private readonly HashSet<int> _saveModeSlots = new();
@@ -104,6 +112,8 @@ public class BotState : BasePlugin
     private int _tacticalRoundNumber;
     private int _tacticalRoundKey = -1;
     private readonly TacticalEconomyPhaseCache _tacticalEconomy = new();
+    private int _terroristScore;
+    private int _counterTerroristScore;
 
     private sealed record TacticalEconomyCheckpoint(
         int RoundKey,
@@ -124,6 +134,16 @@ public class BotState : BasePlugin
             ProfileConfig.Load(ProfileConfig.DefaultPath(Server.GameDirectory)),
             IsEntertainmentMode());
         _smokeVisibilityCvar = ConVar.Find("bot_max_visible_smoke_length");
+        RegisterListener<Listeners.OnMapStart>(_ =>
+        {
+            _terroristScore = 0;
+            _counterTerroristScore = 0;
+            _tacticalRoundNumber = 0;
+            _tacticalRoundKey = -1;
+            _tacticalRolesInitialized = false;
+            _lastTacticalEconomyCheckpoint = null;
+            _tacticalLiveStartedAt = null;
+        });
         RegisterEventHandler<EventRoundStart>(OnRoundStart);
         RegisterEventHandler<EventPlayerHurt>(OnPlayerHurt);
         RegisterEventHandler<EventPlayerSpawn>(OnPlayerSpawn);
@@ -203,7 +223,10 @@ public class BotState : BasePlugin
 
         cmd.ReplyToCommand($"[Smarter-Bot] tactical debug = {_tacticalDebug}, profile = {_profile}");
         if (_tacticalDebug)
+        {
             PrintTacticalSnapshot();
+            PrintBotProfileSnapshot();
+        }
     }
 
     // Server stdout + every connected human's console. Use only for debug-gated lines
@@ -215,6 +238,29 @@ public class BotState : BasePlugin
         {
             if (p == null || !p.IsValid || p.IsBot || p.IsHLTV) continue;
             p.PrintToConsole(msg);
+        }
+    }
+
+    private void PrintBotProfileSnapshot()
+    {
+        if (_botController == null)
+        {
+            BroadcastDebug("[Smarter-Bot/Profile] BotController unavailable");
+            return;
+        }
+
+        foreach (var player in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
+                     .Where(player => player.IsValid && player.IsBot
+                         && (player.Team == CsTeam.Terrorist || player.Team == CsTeam.CounterTerrorist)))
+        {
+            if (!BotControllerBridge.TryGetProfile(_botController, player.Slot, out var profile))
+                continue;
+
+            BroadcastDebug(
+                $"[Smarter-Bot/Profile] slot={player.Slot} side={player.Team} "
+                + $"skill={profile.Skill:F2} aggression={profile.Aggression:F2} "
+                + $"reaction={profile.ReactionTime:F3} teamwork={profile.Teamwork:F2} "
+                + $"attackDelay={profile.AttackDelay:F3}");
         }
     }
     //---------------------------------------------------------------------------------------
@@ -545,6 +591,7 @@ public class BotState : BasePlugin
     //---------------------------------------------------------------------------------------
     private void OnTick()
     {
+        ProcessWeaponSwitchRequests();
         ProcessFlashbangAvoidance();
 
         if (IsCompetitiveProfile())
@@ -992,6 +1039,184 @@ public class BotState : BasePlugin
         }
     }
 
+    private void ProcessWeaponSwitchRequests()
+    {
+        foreach (var request in BotWeaponSwitchQueue.Drain())
+        {
+            if (_botController == null)
+            {
+                Console.WriteLine(
+                    $"[Smarter-Bot/Weapon] switch-deferred slot={request.Slot} weapon={request.Weapon} reason=BotController-unavailable");
+                BotWeaponSwitchQueue.Requeue(request);
+                continue;
+            }
+
+            int defIndex = request.Weapon switch
+            {
+                "weapon_ak47" => 7,
+                "weapon_m4a1" => 16,
+                "weapon_m4a1_silencer" => 60,
+                "weapon_famas" => 10,
+                "weapon_galilar" => 13,
+                "weapon_awp" => 9,
+                "weapon_mp9" => 34,
+                "weapon_mac10" => 17,
+                _ => 0,
+            };
+            if (defIndex == 0)
+                continue;
+
+            bool switched = false;
+            try
+            {
+                switched = BotControllerBridge.SwitchBotWeapon(
+                    _botController,
+                    request.Slot,
+                    defIndex);
+            }
+            catch (Exception exception)
+            {
+                Console.WriteLine(
+                    $"[Smarter-Bot/Weapon] switch-error slot={request.Slot} weapon={request.Weapon} error={exception.Message}");
+            }
+
+            if (!switched)
+            {
+                if (BotWeaponSwitchQueue.TryRequeueFailed(request))
+                {
+                    Console.WriteLine(
+                        $"[Smarter-Bot/Weapon] switch-failed slot={request.Slot} weapon={request.Weapon} def={defIndex} "
+                        + $"attempt={request.Attempt + 1}/3; retry queued, original inventory preserved");
+                }
+                else
+                {
+                    Console.WriteLine(
+                        $"[Smarter-Bot/Weapon] switch-failed slot={request.Slot} weapon={request.Weapon} def={defIndex} "
+                        + $"attempt={request.Attempt}/3; retry limit reached, original inventory preserved");
+                }
+                continue;
+            }
+
+            if (string.IsNullOrEmpty(request.ReplaceWeapon))
+                continue;
+
+            int oldDefIndex = request.ReplaceWeapon switch
+            {
+                "weapon_ak47" => 7,
+                "weapon_m4a1" => 16,
+                "weapon_m4a1_silencer" => 60,
+                "weapon_famas" => 10,
+                "weapon_galilar" => 13,
+                "weapon_awp" => 9,
+                "weapon_mp9" => 34,
+                "weapon_mac10" => 17,
+                _ => 0,
+            };
+            var player = Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
+                .FirstOrDefault(candidate => candidate.IsValid && candidate.Slot == request.Slot);
+            if (oldDefIndex == 0 || player == null)
+            {
+                if (player != null)
+                    RollbackReplacementWeapon(player, request);
+                continue;
+            }
+
+            bool oldSelected = false;
+            try
+            {
+                oldSelected = BotControllerBridge.SwitchBotWeapon(
+                    _botController,
+                    request.Slot,
+                    oldDefIndex);
+            }
+            catch
+            {
+                oldSelected = false;
+            }
+
+            if (!oldSelected)
+            {
+                var settlement = WeaponSwitchSettlementPolicy.Evaluate(
+                    newWeaponSelected: switched,
+                    oldWeaponSelected: false,
+                    replacementReselected: false);
+                if (settlement.ShouldRollbackReplacement)
+                    RollbackReplacementWeapon(player, request);
+                Console.WriteLine(
+                    $"[Smarter-Bot/Weapon] old-switch-failed slot={request.Slot} old={request.ReplaceWeapon} "
+                    + $"reason={settlement.Reason}; original weapon retained and replacement rolled back");
+                continue;
+            }
+
+            player.DropActiveWeapon();
+            bool restoredNew = false;
+            try
+            {
+                restoredNew = BotControllerBridge.SwitchBotWeapon(
+                    _botController,
+                    request.Slot,
+                    defIndex);
+            }
+            catch
+            {
+                restoredNew = false;
+            }
+
+            if (!restoredNew)
+            {
+                var settlement = WeaponSwitchSettlementPolicy.Evaluate(
+                    newWeaponSelected: switched,
+                    oldWeaponSelected: oldSelected,
+                    replacementReselected: false);
+                if (settlement.ShouldRollbackReplacement)
+                    RollbackReplacementWeapon(player, request);
+                if (settlement.ShouldRestoreOriginal)
+                {
+                    // The old weapon was already confirmed before the drop.
+                    // Give it back without charging the bot if the final
+                    // switch fails.
+                    player.GiveNamedItem(request.ReplaceWeapon);
+                    BotControllerBridge.SwitchBotWeapon(_botController, request.Slot, oldDefIndex);
+                }
+                Console.WriteLine(
+                    $"[Smarter-Bot/Weapon] replacement-rollback slot={request.Slot} old={request.ReplaceWeapon} "
+                    + $"new={request.Weapon} reason={settlement.Reason}");
+            }
+        }
+    }
+
+    private static void RollbackReplacementWeapon(
+        CCSPlayerController player,
+        WeaponSwitchRequest request)
+    {
+        if (!player.IsValid)
+            return;
+
+        bool hasReplacement = player.PlayerPawn?.Value?.WeaponServices?.MyWeapons
+            .Any(handle => handle.Value?.DesignerName == request.Weapon) == true;
+        if (!hasReplacement)
+            return;
+
+        try
+        {
+            player.RemoveItemByDesignerName(request.Weapon);
+        }
+        catch
+        {
+            return;
+        }
+
+        int price = BuyPlanner.GetWeaponCost(request.Weapon);
+        if (price <= 0 || player.InGameMoneyServices == null)
+            return;
+
+        int maxMoney = ConVar.Find("mp_maxmoney")?.GetPrimitiveValue<int>() ?? 16000;
+        player.InGameMoneyServices.Account = Math.Min(
+            maxMoney,
+            player.InGameMoneyServices.Account + price);
+        Utilities.SetStateChanged(player, "CCSPlayerController", "m_pInGameMoneyServices");
+    }
+
     private void SynchronizeTacticalAfterReload()
     {
         if (!IsCompetitiveProfile()) return;
@@ -1001,6 +1226,14 @@ public class BotState : BasePlugin
         _ctRetreatTarget = null;
         _ctGambleFallbackLogged = false;
         _lastTacticalGoalWrite.Clear();
+        _lastTacticalPosition.Clear();
+        _tacticalStuckSince.Clear();
+        _tPostPlantTargets.Clear();
+        _tPostPlantRetreatTargets.Clear();
+        _tPostPlantActive = false;
+        _tPostPlantSite = CtGambleSite.None;
+        _lastTPostPlantAction = null;
+        _lastTPostPlantReason = null;
         var phase = ResolveTacticalRoundPhaseFromGameState();
         _tacticalRoundKey = ResolveTacticalRoundKey();
         _isFreezeTime = phase == RoundPhase.Freeze;
@@ -1219,8 +1452,56 @@ public class BotState : BasePlugin
             _ctGambleTargets.TryGetValue(decision.TargetSite, out target);
         }
 
+        if (target == null)
+        {
+            _ctGambleTargets.Clear();
+            _ctRetreatTarget = null;
+            ResolveCtTacticalAnchors();
+            target = decision.ShouldMoveToRetreat
+                ? _ctRetreatTarget
+                : decision.TargetSite != CtGambleSite.None
+                    && _ctGambleTargets.TryGetValue(decision.TargetSite, out var reparsedTarget)
+                    ? reparsedTarget
+                    : null;
+            Console.WriteLine(
+                $"[Smarter-Bot/Tactical] goal-reparse slot={decision.Slot} state={decision.State} "
+                + $"target={decision.TargetSite} success={target != null}");
+        }
+
         if (target == null || bot.Handle == nint.Zero)
             return false;
+
+        if (pawn.AbsOrigin is { } origin)
+        {
+            if (_lastTacticalPosition.TryGetValue(decision.Slot, out var previous))
+            {
+                float dx = origin.X - previous.X;
+                float dy = origin.Y - previous.Y;
+                float dz = origin.Z - previous.Z;
+                if (dx * dx + dy * dy + dz * dz < 24f * 24f)
+                {
+                    float stuckSince = _tacticalStuckSince.GetValueOrDefault(decision.Slot, now);
+                    _tacticalStuckSince[decision.Slot] = stuckSince;
+                    if (now - stuckSince >= 2.0f)
+                    {
+                        _lastTacticalGoalWrite.Remove(decision.Slot);
+                        _tacticalStuckSince[decision.Slot] = now;
+                        _ctGambleTargets.Clear();
+                        _ctRetreatTarget = null;
+                        ResolveCtTacticalAnchors();
+                        Console.WriteLine(
+                            $"[Smarter-Bot/Tactical] goal-stuck slot={decision.Slot} state={decision.State} "
+                            + $"target={decision.TargetSite}; target reparsed, native fallback and repath");
+                        return false;
+                    }
+                }
+                else
+                {
+                    _tacticalStuckSince.Remove(decision.Slot);
+                }
+            }
+            _lastTacticalPosition[decision.Slot] = new Vector(origin.X, origin.Y, origin.Z);
+        }
 
         ref bool isRunning = ref bot.IsRunning;
         isRunning = true;
@@ -1253,9 +1534,265 @@ public class BotState : BasePlugin
         return dx * dx + dy * dy + dz * dz <= 180f * 180f;
     }
 
+    private void InitializeTPostPlantTargets(CtGambleSite site)
+    {
+        _tPostPlantTargets.Clear();
+        var bomb = Utilities.FindAllEntitiesByDesignerName<CPlantedC4>("planted_c4")
+            .FirstOrDefault(entity => entity.IsValid && entity.AbsOrigin != null);
+        if (bomb?.AbsOrigin is not { } origin)
+            return;
+
+        var terrorists = Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
+            .Where(player => player.IsValid && player.IsBot && player.Team == CsTeam.Terrorist)
+            .OrderBy(player => player.Slot)
+            .ToArray();
+        foreach (var player in terrorists)
+        {
+            int role = Math.Abs(player.Slot) % 3;
+            Vector offset = role switch
+            {
+                0 => new Vector(0f, 140f, 0f),
+                1 => new Vector(140f, 0f, 0f),
+                _ => new Vector(-140f, -100f, 0f),
+            };
+            Vector desired = new(origin.X + offset.X, origin.Y + offset.Y, origin.Z + offset.Z);
+            var navArea = CCSNavArea.GetClosestNavArea(desired, 1200f)
+                ?? CCSNavArea.GetClosestNavArea(origin, 1200f);
+            if (navArea != null)
+            {
+                _tPostPlantTargets[player.Slot] = new Vector(
+                    navArea.Center.X,
+                    navArea.Center.Y,
+                    navArea.Center.Z);
+            }
+        }
+    }
+
+    private void InitializeTPostPlantRetreatTargets()
+    {
+        _tPostPlantRetreatTargets.Clear();
+        var bomb = Utilities.FindAllEntitiesByDesignerName<CPlantedC4>("planted_c4")
+            .FirstOrDefault(entity => entity.IsValid && entity.AbsOrigin != null);
+        if (bomb?.AbsOrigin is not { } origin)
+            return;
+
+        var candidatePositions = Utilities
+            .FindAllEntitiesByDesignerName<CBaseEntity>("info_player_terrorist")
+            .Where(entity => entity.IsValid && entity.AbsOrigin != null)
+            .Select(entity => entity.AbsOrigin!)
+            .ToList();
+
+        // Spawn points are the most reliable map-specific safe anchors. Keep
+        // geometric candidates as a fallback for maps/custom modes that do
+        // not expose the usual T spawn entities.
+        for (int index = 0; index < 8; index++)
+        {
+            float angle = index * MathF.PI / 4f;
+            candidatePositions.Add(new Vector(
+                origin.X + MathF.Cos(angle) * 1400f,
+                origin.Y + MathF.Sin(angle) * 1400f,
+                origin.Z));
+        }
+
+        var candidates = candidatePositions
+            .Select(position => CCSNavArea.GetClosestNavArea(position, 1800f))
+            .Where(area => area != null)
+            .Select(area => new Vector(area!.Center.X, area.Center.Y, area.Center.Z))
+            .DistinctBy(position => (
+                MathF.Round(position.X),
+                MathF.Round(position.Y),
+                MathF.Round(position.Z)))
+            .OrderByDescending(position => DistanceSquared(position, origin))
+            .ToArray();
+        if (candidates.Length == 0)
+            return;
+
+        var terrorists = Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
+            .Where(player => player.IsValid
+                && player.IsBot
+                && player.PawnIsAlive
+                && player.Team == CsTeam.Terrorist)
+            .ToArray();
+        var participants = new List<TPostPlantRetreatParticipant>();
+        foreach (var player in terrorists)
+        {
+            var pawn = player.PlayerPawn?.Value;
+            if (pawn?.AbsOrigin is { } playerOrigin)
+            {
+                participants.Add(new TPostPlantRetreatParticipant(
+                    player.Slot,
+                    new RetreatPosition(playerOrigin.X, playerOrigin.Y, playerOrigin.Z),
+                    pawn.Health));
+            }
+        }
+
+        var assignments = TPostPlantRetreatPlanner.AssignTargets(
+            participants,
+            candidates
+                .Select(position => new RetreatPosition(position.X, position.Y, position.Z))
+                .ToArray(),
+            new RetreatPosition(origin.X, origin.Y, origin.Z));
+        foreach (var assignment in assignments)
+        {
+            var target = assignment.Value;
+            _tPostPlantRetreatTargets[assignment.Key] = new Vector(target.X, target.Y, target.Z);
+        }
+    }
+
+    private bool ResolveCtPostPlantPathViable()
+    {
+        if (_ctGambleTargets.Count == 0)
+            ResolveCtTacticalAnchors();
+
+        return _tPostPlantSite == CtGambleSite.None
+            ? _ctGambleTargets.Count > 0
+            : _ctGambleTargets.ContainsKey(_tPostPlantSite);
+    }
+
+    private void RunCompetitiveTPostPlantTick(float now)
+    {
+        var bomb = Utilities.FindAllEntitiesByDesignerName<CPlantedC4>("planted_c4")
+            .FirstOrDefault(entity => entity.IsValid);
+        if (bomb == null)
+        {
+            _tPostPlantActive = false;
+            _tPostPlantTargets.Clear();
+            _tPostPlantRetreatTargets.Clear();
+            _lastTPostPlantAction = null;
+            _lastTPostPlantReason = null;
+            return;
+        }
+
+        _tPostPlantActive = true;
+        if (_tPostPlantTargets.Count == 0)
+            InitializeTPostPlantTargets(_tPostPlantSite);
+        var aliveTerroristBots = Utilities
+            .FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
+            .Where(player => player.IsValid
+                && player.IsBot
+                && player.PawnIsAlive
+                && player.Team == CsTeam.Terrorist)
+            .ToArray();
+        if (_tPostPlantRetreatTargets.Count == 0
+            || aliveTerroristBots.Any(player => !_tPostPlantRetreatTargets.ContainsKey(player.Slot)))
+            InitializeTPostPlantRetreatTargets();
+
+        var players = Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
+            .Where(player => player.IsValid && player.Team is CsTeam.Terrorist or CsTeam.CounterTerrorist)
+            .ToArray();
+        int aliveT = players.Count(player => player.Team == CsTeam.Terrorist && player.PawnIsAlive);
+        int aliveCt = players.Count(player => player.Team == CsTeam.CounterTerrorist && player.PawnIsAlive);
+        var ctPlayers = players.Where(player => player.Team == CsTeam.CounterTerrorist);
+        int bombSeconds = ResolveBombSecondsRemaining(out bool bombTimerKnown);
+        var decision = TPostPlantPolicy.Evaluate(new TPostPlantContext(
+            BombPlanted: true,
+            bombSeconds,
+            aliveT,
+            aliveCt,
+            PathViable: _tPostPlantTargets.Count > 0,
+            CtDefusers: ctPlayers.Count(player => player.PawnIsAlive && HasDefuser(player)),
+            CtRetakePathViable: ResolveCtPostPlantPathViable(),
+            RetreatPathViable: _tPostPlantRetreatTargets.Count > 0,
+            BombTimerKnown: bombTimerKnown));
+
+        // Refresh the ordering when the team first commits to leaving. A Bot
+        // may have taken damage while holding the post-plant, so the health
+        // snapshot captured immediately after planting can be stale.
+        if (decision.Action == TPostPlantAction.RetreatFromBomb
+            && _lastTPostPlantAction != TPostPlantAction.RetreatFromBomb)
+        {
+            InitializeTPostPlantRetreatTargets();
+        }
+
+        if (_lastTPostPlantAction != decision.Action
+            || _lastTPostPlantReason != decision.Reason)
+        {
+            if (_tacticalDebug)
+            {
+                BroadcastDebug(
+                    $"[Smarter-Bot/Tactical] t-postplant action={decision.Action} "
+                    + $"reason={decision.Reason} bomb={bombSeconds} "
+                    + $"timer-known={bombTimerKnown} alive={aliveT}v{aliveCt} "
+                    + $"site-targets={_tPostPlantTargets.Count} "
+                    + $"retreat-targets={_tPostPlantRetreatTargets.Count}");
+            }
+
+            _lastTPostPlantAction = decision.Action;
+            _lastTPostPlantReason = decision.Reason;
+        }
+
+        foreach (var player in players.Where(player => player.Team == CsTeam.Terrorist && player.IsBot))
+        {
+            var pawn = player.PlayerPawn?.Value;
+            var bot = pawn?.IsValid == true ? pawn.Bot : null;
+            if (bot == null || player.HasBeenControlledByPlayerThisRound)
+                continue;
+
+            if (decision.Action == TPostPlantAction.Hold)
+            {
+                ref bool holdActive = ref bot.AllowActive;
+                holdActive = true;
+                continue;
+            }
+
+            var targetKind = TPostPlantExecutionPolicy.TargetKind(decision.Action);
+            if (targetKind == TPostPlantTargetKind.None)
+            {
+                // Repath/Hold must not reuse a stale site or retreat target.
+                // Restore native control and force its next route evaluation.
+                _lastTacticalGoalWrite.Remove(player.Slot);
+                ref bool recoveryActive = ref bot.AllowActive;
+                recoveryActive = true;
+                ref bool recoveryRunning = ref bot.IsRunning;
+                recoveryRunning = true;
+                CountdownTimer recoveryRepath = bot.RepathTimer;
+                ref float recoveryDuration = ref recoveryRepath.Duration;
+                recoveryDuration = 0f;
+                ref float recoveryTimestamp = ref recoveryRepath.Timestamp;
+                recoveryTimestamp = now;
+                ref float recoveryTimescale = ref recoveryRepath.Timescale;
+                recoveryTimescale = 1f;
+                continue;
+            }
+
+            var targetMap = targetKind == TPostPlantTargetKind.Retreat
+                ? _tPostPlantRetreatTargets
+                : _tPostPlantTargets;
+            if (!targetMap.TryGetValue(player.Slot, out var target)
+                || bot.Handle == nint.Zero)
+            {
+                // A missing/invalid Nav target must never stop the native bot.
+                ref bool fallbackActive = ref bot.AllowActive;
+                fallbackActive = true;
+                ref bool fallbackRunning = ref bot.IsRunning;
+                fallbackRunning = true;
+                continue;
+            }
+
+            ref bool isRunning = ref bot.IsRunning;
+            isRunning = true;
+            ref bool allowActive = ref bot.AllowActive;
+            allowActive = true;
+            float lastWrite = _lastTacticalGoalWrite.GetValueOrDefault(player.Slot, -999f);
+            if (now - lastWrite >= 0.35f)
+            {
+                Schema.SetSchemaValue(bot.Handle, "CCSBot", "m_goalPosition", target);
+                _lastTacticalGoalWrite[player.Slot] = now;
+                CountdownTimer repath = bot.RepathTimer;
+                ref float duration = ref repath.Duration;
+                duration = 0f;
+                ref float timestamp = ref repath.Timestamp;
+                timestamp = now;
+                ref float timescale = ref repath.Timescale;
+                timescale = 1f;
+            }
+        }
+    }
+
     private void RunCompetitiveTacticalTick(float now)
     {
         if (!IsCompetitiveProfile()) return;
+        RunCompetitiveTPostPlantTick(now);
         if (!_tacticalRolesInitialized)
         {
             if (!_isFreezeTime) InitializeTacticalRoles();
@@ -1312,18 +1849,37 @@ public class BotState : BasePlugin
             {
                 bool hasGoal = TryApplyTacticalGoal(pawn, bot, decision, now);
                 ref bool goalAllowActive = ref bot.AllowActive;
-                goalAllowActive = CtTacticalExecutionPolicy.ShouldAllowNativeActive(decision);
+                goalAllowActive = hasGoal
+                    ? CtTacticalExecutionPolicy.ShouldAllowNativeActive(decision)
+                    : true;
+
+                if (!hasGoal)
+                {
+                    ref bool recoveredRunning = ref bot.IsRunning;
+                    recoveredRunning = true;
+                    _saveModeSlots.Remove(decision.Slot);
+                    Console.WriteLine(
+                        $"[Smarter-Bot/Tactical] goal-recovery slot={decision.Slot} state={decision.State} reason={decision.Reason}");
+                    continue;
+                }
 
                 if (decision.State == CtTacticalState.Save)
                 {
                     _saveModeSlots.Add(decision.Slot);
                     ref bool saveAllowActive = ref bot.AllowActive;
-                    saveAllowActive = !hasGoal || !HasReachedRetreatTarget(pawn);
-                    if (!saveAllowActive)
-                    {
-                        ref bool saveIsRunning = ref bot.IsRunning;
-                        saveIsRunning = false;
-                    }
+                    saveAllowActive = true;
+                    ref bool saveIsRunning = ref bot.IsRunning;
+                    saveIsRunning = true;
+                }
+
+                if (decision.State == CtTacticalState.Withdraw
+                    && HasReachedRetreatTarget(pawn))
+                {
+                    ref bool withdrawAllowActive = ref bot.AllowActive;
+                    withdrawAllowActive = true;
+                    ref bool withdrawRunning = ref bot.IsRunning;
+                    withdrawRunning = true;
+                    _saveModeSlots.Remove(decision.Slot);
                 }
 
                 if (decision.State == CtTacticalState.Save && hasGoal)
@@ -1336,14 +1892,11 @@ public class BotState : BasePlugin
 
             if (decision.State == CtTacticalState.Save)
             {
-                // If the map has no usable Nav target, fail closed to the old
-                // save behavior instead of trying to move through an invalid
-                // coordinate.
                 _saveModeSlots.Add(decision.Slot);
                 ref bool allowActive = ref bot.AllowActive;
-                allowActive = false;
+                allowActive = true;
                 ref bool saveIsRunning = ref bot.IsRunning;
-                saveIsRunning = false;
+                saveIsRunning = true;
                 continue;
             }
 
@@ -1424,6 +1977,8 @@ public class BotState : BasePlugin
     {
         if (!IsCompetitiveProfile()) return;
 
+        SynchronizeCompetitiveScore();
+
         var players = Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
             .Where(player => player.IsValid
                 && (player.Team == CsTeam.CounterTerrorist || player.Team == CsTeam.Terrorist))
@@ -1478,6 +2033,30 @@ public class BotState : BasePlugin
         _tacticalRuntime.SetEconomy(ctPhase, tPhase, ctAlive, tAlive);
         _tacticalRuntime.SetTeamDefuser(
             ct.Where(player => player.PawnIsAlive).Any(HasDefuser));
+        int roundsPlayed = CurrentRoundsPlayed();
+        int maxRounds = ReadMaxRounds();
+        bool pathViable = _ctGambleTargets.Count >= 2 || ResolveCtTacticalAnchors();
+        // CCSNavArea gives us a usable anchor, but this repository has no
+        // native route-query API to prove connectivity from each living CT to
+        // that anchor. Keep that uncertainty explicit so the retake policy
+        // does not turn an unverified anchor into an impossible path.
+        bool pathKnown = _ctGambleTargets.Count == 0;
+        int bombSeconds = ResolveBombSecondsRemaining(out bool bombTimerKnown);
+        _tacticalRuntime.SetRetakeInfo(
+            bombSeconds,
+            AverageWeaponTier(ct),
+            AverageWeaponTier(terrorists),
+            CountTeamUtility(ct),
+            CountTeamUtility(terrorists),
+            pathViable,
+            RoundSchedule.IsMatchPoint(
+                _counterTerroristScore,
+                _terroristScore,
+                roundsPlayed,
+                maxRounds,
+                ReadOvertimeMaxRounds()),
+            bombTimerKnown,
+            pathKnown);
     }
 
     private bool IsTacticalPistolRound()
@@ -1504,19 +2083,160 @@ public class BotState : BasePlugin
         }
     }
 
+    private int CurrentRoundsPlayed()
+    {
+        try
+        {
+            var gameRules = Utilities
+                .FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules")
+                .FirstOrDefault()?.GameRules;
+            return Math.Max(0, gameRules?.TotalRoundsPlayed ?? Math.Max(0, _tacticalRoundNumber - 1));
+        }
+        catch
+        {
+            return Math.Max(0, _tacticalRoundNumber - 1);
+        }
+    }
+
+    private int ReadMaxRounds()
+    {
+        try
+        {
+            int maxRounds = ConVar.Find("mp_maxrounds")?.GetPrimitiveValue<int>() ?? 24;
+            return maxRounds > 0 ? maxRounds : 24;
+        }
+        catch
+        {
+            return 24;
+        }
+    }
+
+    private int ReadOvertimeMaxRounds()
+    {
+        try
+        {
+            int overtimeMaxRounds = ConVar.Find("mp_overtime_maxrounds")?.GetPrimitiveValue<int>() ?? 6;
+            return overtimeMaxRounds > 0 ? overtimeMaxRounds : 6;
+        }
+        catch
+        {
+            return 6;
+        }
+    }
+
+    private void SynchronizeCompetitiveScore()
+    {
+        try
+        {
+            var gameRules = Utilities
+                .FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules")
+                .FirstOrDefault()?.GameRules;
+            if (RoundScoreReader.TryRead(gameRules, out var score))
+            {
+                _terroristScore = score.Terrorist;
+                _counterTerroristScore = score.CounterTerrorist;
+            }
+        }
+        catch
+        {
+            // Keep event-based counters as a fallback for CSS builds that do
+            // not expose team score fields through GameRules.
+        }
+    }
+
+    private static int AverageWeaponTier(IEnumerable<CCSPlayerController> players)
+    {
+        var tiers = players
+            .Where(player => player.PawnIsAlive)
+            .Select(player => CurrentWeaponTier(player))
+            .ToArray();
+        return tiers.Length == 0 ? 0 : (int)Math.Round(tiers.Average());
+    }
+
+    private static int CurrentWeaponTier(CCSPlayerController player)
+    {
+        string? primary = player.PlayerPawn?.Value?.WeaponServices?.MyWeapons
+            .Select(handle => handle.Value?.DesignerName)
+            .FirstOrDefault(BuyPlanner.IsPrimaryWeapon);
+        return BuyPlanner.GetTier(ArmorLevel.Full, primary, null);
+    }
+
+    private static int CountTeamUtility(IEnumerable<CCSPlayerController> players)
+        => players.Where(player => player.PawnIsAlive).Sum(player =>
+            CountWeapon(player, "weapon_smokegrenade")
+            + CountWeapon(player, "weapon_flashbang")
+            + CountWeapon(player, "weapon_hegrenade")
+            + CountWeapon(player, "weapon_molotov")
+            + CountWeapon(player, "weapon_incgrenade"));
+
+    private static int CountWeapon(CCSPlayerController player, string designerName)
+        => player.PlayerPawn?.Value?.WeaponServices?.MyWeapons
+            .Count(handle => handle.Value?.DesignerName == designerName) ?? 0;
+
+    private int ResolveBombSecondsRemaining()
+        => ResolveBombSecondsRemaining(out _);
+
+    private int ResolveBombSecondsRemaining(out bool timerKnown)
+    {
+        timerKnown = false;
+        try
+        {
+            var bomb = Utilities.FindAllEntitiesByDesignerName<CPlantedC4>("planted_c4")
+                .FirstOrDefault(entity => entity.IsValid);
+            if (bomb == null)
+            {
+                timerKnown = true;
+                return 40;
+            }
+
+            if (BombTimerPolicy.TryResolveSeconds(bomb, Server.CurrentTime, out int seconds))
+            {
+                timerKnown = true;
+                return seconds;
+            }
+        }
+        catch
+        {
+            // Timer schema differs across server builds. An unknown timer is
+            // kept as an explicit unknown signal; TPostPlantPolicy will still
+            // pressure the site without falsely claiming the bomb is already
+            // close to exploding.
+        }
+
+        return 0;
+    }
+
     private RoundContext CreateTacticalRoundContext(RoundPhase phase)
-        => new(
+    {
+        SynchronizeCompetitiveScore();
+        int roundsPlayed = CurrentRoundsPlayed();
+        int maxRounds = ReadMaxRounds();
+        bool matchPoint = RoundSchedule.IsMatchPoint(
+            _counterTerroristScore,
+            _terroristScore,
+            roundsPlayed,
+            maxRounds,
+            ReadOvertimeMaxRounds());
+        return new(
             RoundNumber: _tacticalRoundNumber,
-            Half: 1,
-            TeamScore: 0,
-            OpponentScore: 0,
-            IsLastRound: false,
+            Half: roundsPlayed < maxRounds / 2 ? 1 : roundsPlayed < maxRounds ? 2 : 3,
+            TeamScore: _counterTerroristScore,
+            OpponentScore: _terroristScore,
+            IsLastRound: RoundSchedule.IsLastRegulationRound(
+                _counterTerroristScore,
+                _terroristScore,
+                roundsPlayed,
+                maxRounds),
             ConsecutiveLosses: 0,
             BombPlanted: phase is RoundPhase.BombPlanted or RoundPhase.Retake,
             KnownBombsite: null,
             AliveTeam: 5,
             AliveOpponent: 5,
-            Phase: phase);
+            Phase: phase)
+        {
+            IsMatchPoint = matchPoint,
+        };
+    }
 
     private void PrintTacticalSnapshot()
     {
@@ -1559,6 +2279,14 @@ public class BotState : BasePlugin
         _nextTacticalTick = 0f;
         _lastTacticalDecisions.Clear();
         _lastTacticalRepath.Clear();
+        _lastTacticalPosition.Clear();
+        _tacticalStuckSince.Clear();
+        _tPostPlantTargets.Clear();
+        _tPostPlantRetreatTargets.Clear();
+        _tPostPlantActive = false;
+        _tPostPlantSite = CtGambleSite.None;
+        _lastTPostPlantAction = null;
+        _lastTPostPlantReason = null;
         _tacticalEconomy.Reset();
         if (IsCompetitiveProfile())
         {
@@ -1601,15 +2329,47 @@ public class BotState : BasePlugin
     {
         if (IsCompetitiveProfile())
         {
+            TeamSide? winner = ResolveRoundWinner(@event);
+            if (winner == TeamSide.Terrorist)
+                _terroristScore++;
+            else if (winner == TeamSide.CounterTerrorist)
+                _counterTerroristScore++;
+
             _tacticalRuntime.SetPhase(RoundPhase.RoundEnd);
             _tacticalRolesInitialized = false;
             _ctGambleTargets.Clear();
             _ctRetreatTarget = null;
             _ctGambleFallbackLogged = false;
             _lastTacticalGoalWrite.Clear();
+            _lastTacticalPosition.Clear();
+            _tacticalStuckSince.Clear();
+            _tPostPlantTargets.Clear();
+            _tPostPlantRetreatTargets.Clear();
+            _tPostPlantActive = false;
+            _tPostPlantSite = CtGambleSite.None;
+            _lastTPostPlantAction = null;
+            _lastTPostPlantReason = null;
         }
 
         return HookResult.Continue;
+    }
+
+    private static TeamSide? ResolveRoundWinner(EventRoundEnd @event)
+    {
+        try
+        {
+            int winner = Convert.ToInt32(((dynamic)@event).Winner);
+            return winner switch
+            {
+                (int)CsTeam.Terrorist => TeamSide.Terrorist,
+                (int)CsTeam.CounterTerrorist => TeamSide.CounterTerrorist,
+                _ => null,
+            };
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     // Detects elimination while explicitly excluding the current death victim
@@ -1905,14 +2665,22 @@ public class BotState : BasePlugin
                 .FirstOrDefault(target => target.IsValid && target.BombPlantedHere);
             if (plantedTarget != null)
             {
+                _tPostPlantSite = plantedTarget.IsBombSiteB ? CtGambleSite.B : CtGambleSite.A;
+                InitializeTPostPlantTargets(_tPostPlantSite);
+                InitializeTPostPlantRetreatTargets();
                 _tacticalRuntime.SetBomb(
-                    plantedTarget.IsBombSiteB ? CtGambleSite.B : CtGambleSite.A,
+                    _tPostPlantSite,
                     planted: true);
             }
             else
             {
+                _tPostPlantSite = CtGambleSite.None;
+                InitializeTPostPlantTargets(CtGambleSite.None);
+                InitializeTPostPlantRetreatTargets();
                 _tacticalRuntime.SetBomb(planted: true);
             }
+
+            _tPostPlantActive = true;
 
             return HookResult.Continue;
         }
@@ -2061,13 +2829,12 @@ public class BotState : BasePlugin
     }
 
     private static bool HasValuableWeapon(CCSPlayerController player)
-        => player.PlayerPawn?.Value?.WeaponServices?.MyWeapons
-            ?.Any(handle => handle.Value?.DesignerName is
-                "weapon_awp" or "weapon_ak47" or "weapon_m4a1" or "weapon_m4a1_silencer"
-                or "weapon_sg556" or "weapon_aug" or "weapon_galilar" or "weapon_famas"
-                or "weapon_ssg08" or "weapon_scar20" or "weapon_g3sg1"
-                or "weapon_mp9" or "weapon_mac10" or "weapon_mp5sd" or "weapon_ump45"
-                or "weapon_p90") == true;
+    {
+        string? primary = player.PlayerPawn?.Value?.WeaponServices?.MyWeapons
+            ?.Select(handle => handle.Value?.DesignerName)
+            .FirstOrDefault(BuyPlanner.IsPrimaryWeapon);
+        return WeaponValuePolicy.IsHighValue(primary);
+    }
 
     private static bool HasDefuser(CCSPlayerController player)
     {
