@@ -1210,6 +1210,9 @@ public class NadeSystemPlugin : BasePlugin
         });
     }
 
+    private void RemoveCooldown(string id)
+        => _cooldowns.RemoveAll(c => c.GrenadeId == id);
+
     private void PruneCooldowns()
     {
         float now = Server.CurrentTime;
