@@ -34,16 +34,16 @@ public sealed class CompetitiveProfileTests
     }
 
     [Theory]
-    [InlineData(BotMatchProfile.Competitive, "weapon_glock", true)]
-    [InlineData(BotMatchProfile.Competitive, "weapon_usp_silencer", true)]
-    [InlineData(BotMatchProfile.Competitive, "weapon_hkp2000", true)]
-    [InlineData(BotMatchProfile.Competitive, "weapon_p250", true)]
-    [InlineData(BotMatchProfile.Competitive, "weapon_fiveseven", true)]
-    [InlineData(BotMatchProfile.Competitive, "weapon_tec9", true)]
-    [InlineData(BotMatchProfile.Competitive, "weapon_cz75a", true)]
-    [InlineData(BotMatchProfile.Competitive, "weapon_deagle", true)]
+    [InlineData(BotMatchProfile.Competitive, "weapon_glock", false)]
+    [InlineData(BotMatchProfile.Competitive, "weapon_usp_silencer", false)]
+    [InlineData(BotMatchProfile.Competitive, "weapon_hkp2000", false)]
+    [InlineData(BotMatchProfile.Competitive, "weapon_p250", false)]
+    [InlineData(BotMatchProfile.Competitive, "weapon_fiveseven", false)]
+    [InlineData(BotMatchProfile.Competitive, "weapon_tec9", false)]
+    [InlineData(BotMatchProfile.Competitive, "weapon_cz75a", false)]
+    [InlineData(BotMatchProfile.Competitive, "weapon_deagle", false)]
     [InlineData(BotMatchProfile.Competitive, "weapon_revolver", false)]
-    [InlineData(BotMatchProfile.Competitive, "weapon_elite", true)]
+    [InlineData(BotMatchProfile.Competitive, "weapon_elite", false)]
     [InlineData(BotMatchProfile.Competitive, "weapon_ak47", false)]
     [InlineData(BotMatchProfile.Competitive, "weapon_m4a1", false)]
     [InlineData(BotMatchProfile.Competitive, "weapon_mp9", false)]
@@ -58,5 +58,32 @@ public sealed class CompetitiveProfileTests
     {
         Assert.Equal(expected,
             AimWeaponPolicy.ShouldUseHeadFirstInMixed(profile, weaponName));
+    }
+
+    [Fact]
+    public void OvertimeOpeningIsNotACompetitivePistolRound()
+    {
+        Assert.False(AimWeaponPolicy.IsCompetitivePistolRound(
+            roundsPlayed: 24,
+            maxRounds: 24,
+            overtimeMaxRounds: 6));
+        Assert.True(AimWeaponPolicy.IsCompetitivePistolRound(
+            roundsPlayed: 12,
+            maxRounds: 24,
+            overtimeMaxRounds: 6));
+    }
+
+    [Fact]
+    public void PistolAimAdjustmentAddsBoundedHumanization()
+    {
+        var adjustment = AimWeaponPolicy.GetPistolAimAdjustment(
+            BotMatchProfile.Competitive,
+            BuyPhase.Pistol,
+            botSlot: 1,
+            targetId: 2,
+            now: 10f);
+
+        Assert.InRange(adjustment.ReactionDelaySeconds, 0.03f, 0.12f);
+        Assert.InRange(adjustment.TargetJitterUnits, 1.5f, 6f);
     }
 }

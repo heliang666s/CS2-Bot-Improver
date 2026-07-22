@@ -94,6 +94,14 @@ public class BotAimImprover : BasePlugin
         12, 13, 14, 15,  // L_THIGH, R_THIGH, L_SHIN, R_SHIN
         16               // FEET
     };
+
+    private static readonly int[] _priorityPistol =
+    {
+        2, 3, 4, 5,         // jaw/chest/gut/pelvis
+        6, 7, 10, 11,       // center-mass side points
+        1, 0,               // neck/head only after body
+        8, 9, 12, 13, 14, 15, 16,
+    };
     // ============================================================
     // Platform-specific memory layout (PickNewAimSpot hook + CCSBot fields).
     //   Linux  libserver.so 2026-05-28
@@ -132,6 +140,7 @@ public class BotAimImprover : BasePlugin
 
     private MemoryFunctionVoid<IntPtr>? _pickNewAimSpot;
     private BotMatchProfile _profile = BotMatchProfile.Competitive;
+    private bool _isPistolRound;
     private readonly IVisibilityPolicy _visibilityPolicy = new CompetitiveVisibilityPolicy();
     private static readonly PluginCapability<CRayTraceInterface> _rayTraceCapability =
         new("raytrace:craytraceinterface");
@@ -139,9 +148,10 @@ public class BotAimImprover : BasePlugin
     // Cache: CCSBot* -> bot's UserId .
     // Cleared on round_start and per-bot on disconnect.
     private readonly ConcurrentDictionary<IntPtr, int> _botToControllerUserId = new();
+    private readonly ConcurrentDictionary<(int BotSlot, int TargetId), float> _pistolAimReadyAt = new();
 
     // Aim mode controlled by the `bot_aim` console command:
-    //   Mixed = priority logic; competitive pistols aim head-first,
+    //   Mixed = priority logic; competitive pistol rounds use chest/jaw first,
     //           spread weapons body-first, other weapons jaw-first
     //   Head  = always head-first
     //   Body  = always body-first
@@ -196,6 +206,8 @@ public class BotAimImprover : BasePlugin
         RegisterEventHandler<EventRoundStart>((_, _) =>
         {
             _botToControllerUserId.Clear();
+            _pistolAimReadyAt.Clear();
+            _isPistolRound = ResolvePistolRound();
             return HookResult.Continue;
         });
 
@@ -313,20 +325,46 @@ public class BotAimImprover : BasePlugin
 
             string? wpn = botController.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value?.DesignerName;
 
+            bool competitivePistolRound = _isPistolRound
+                && _profile == BotMatchProfile.Competitive
+                && AimWeaponPolicy.IsPistol(wpn);
+            var pistolAimAdjustment = AimWeaponPolicy.GetPistolAimAdjustment(
+                _profile,
+                competitivePistolRound ? BuyPhase.Pistol : BuyPhase.FullBuy,
+                (int)botController.Index,
+                enemyIdx,
+                Server.CurrentTime);
+            if (competitivePistolRound)
+            {
+                if (!pistolAimAdjustment.ApplyOverride)
+                    return HookResult.Continue;
+
+                var readyKey = ((int)botController.Index, enemyIdx);
+                if (!_pistolAimReadyAt.TryGetValue(readyKey, out float readyAt))
+                {
+                    _pistolAimReadyAt[readyKey] = Server.CurrentTime
+                        + pistolAimAdjustment.ReactionDelaySeconds;
+                    return HookResult.Continue;
+                }
+                if (Server.CurrentTime < readyAt)
+                    return HookResult.Continue;
+                _pistolAimReadyAt.TryRemove(readyKey, out _);
+            }
+
             // 4) Select the priority order based on aim mode and weapon.
             // head: awp -> others -> Head. body: all weapons -> Body.
-            // mixed: spread weapons -> Body, competitive pistols -> Head,
+            // mixed: pistol rounds -> chest/jaw, spread weapons -> Body,
             //        other weapons -> Jaw.
             bool isBodyWeapon = wpn != null && _bodyFirstWeapons.Contains(wpn);
-            bool isCompetitivePrecisionPistol =
-                AimWeaponPolicy.ShouldUseHeadFirstInMixed(_profile, wpn);
             int[] order = _aimMode switch
             {
                 AimMode.HEAD => wpn == "weapon_awp" ? _priorityBody : _priorityHead,
                 AimMode.BODY => _priorityBody,
-                _ => isBodyWeapon
+                _ => competitivePistolRound
+                    ? _priorityPistol
+                    : isBodyWeapon
                     ? _priorityBody
-                    : isCompetitivePrecisionPistol ? _priorityHead : _priorityJaw, // MIXED
+                    : _priorityJaw, // MIXED
             };
 
             // 5) Walk the priority order and raytrace each point from the bot's
@@ -345,6 +383,22 @@ public class BotAimImprover : BasePlugin
             }
             if (chosenIdx < 0)
                 return HookResult.Continue;
+
+            if (competitivePistolRound && pistolAimAdjustment.TargetJitterUnits > 0f)
+            {
+                float dx = rx - enemyOrigin.X;
+                float dy = ry - enemyOrigin.Y;
+                float length = MathF.Sqrt(dx * dx + dy * dy);
+                if (length > 0.1f)
+                {
+                    float direction = (pistolAimAdjustment.JitterSeed & 1) == 0 ? 1f : -1f;
+                    float jitter = pistolAimAdjustment.TargetJitterUnits * direction;
+                    rx += -dy / length * jitter;
+                    ry += dx / length * jitter;
+                    rz += ((pistolAimAdjustment.JitterSeed % 3) - 1)
+                        * pistolAimAdjustment.TargetJitterUnits * 0.35f;
+                }
+            }
 
             // 6) Overwrite only m_targetSpot.xyz.
             unsafe
@@ -440,6 +494,27 @@ public class BotAimImprover : BasePlugin
         }
 
         return false;
+    }
+
+    private static bool ResolvePistolRound()
+    {
+        try
+        {
+            var rules = Utilities
+                .FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules")
+                .FirstOrDefault()?.GameRules;
+            int roundsPlayed = Math.Max(0, rules?.TotalRoundsPlayed ?? 0);
+            int maxRounds = ConVar.Find("mp_maxrounds")?.GetPrimitiveValue<int>() ?? 24;
+            int overtimeMaxRounds = ConVar.Find("mp_overtime_maxrounds")?.GetPrimitiveValue<int>() ?? 6;
+            return AimWeaponPolicy.IsCompetitivePistolRound(
+                roundsPlayed,
+                maxRounds,
+                overtimeMaxRounds);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     // Compute world position of derived point `idx` from the enemy pawn's schema fields.

@@ -43,10 +43,64 @@ public static class ProfilePolicy
 
 public static class AimWeaponPolicy
 {
+    public readonly record struct PistolAimAdjustment(
+        bool ApplyOverride,
+        float ReactionDelaySeconds,
+        float TargetJitterUnits,
+        int JitterSeed);
+
+    public static bool IsCompetitivePistolRound(
+        int roundsPlayed,
+        int maxRounds,
+        int overtimeMaxRounds)
+        => !RoundSchedule.IsOvertimeRound(roundsPlayed, maxRounds)
+            && RoundSchedule.IsFirstRoundOfHalf(
+                roundsPlayed,
+                maxRounds,
+                overtimeMaxRounds);
+
+    public static bool IsCompetitivePistolRound(BotMatchProfile profile, BuyPhase phase)
+        => profile == BotMatchProfile.Competitive && phase == BuyPhase.Pistol;
+
+    public static PistolAimAdjustment GetPistolAimAdjustment(
+        BotMatchProfile profile,
+        BuyPhase phase,
+        int botSlot,
+        int targetId,
+        float now)
+    {
+        if (!IsCompetitivePistolRound(profile, phase))
+            return new(true, 0f, 0f, 0);
+
+        int seed = HashCode.Combine(botSlot, targetId, (int)(now * 10f));
+        int bucket = Math.Abs(seed) % 20;
+        return new(
+            ApplyOverride: bucket >= 3,
+            ReactionDelaySeconds: 0.04f + (bucket % 5) * 0.015f,
+            TargetJitterUnits: 2f + (bucket % 3) * 1.5f,
+            JitterSeed: seed);
+    }
+
+    public static bool ShouldApplyPistolOverride(
+        BotMatchProfile profile,
+        BuyPhase phase,
+        int botSlot,
+        int targetId,
+        float now)
+    {
+        if (!IsCompetitivePistolRound(profile, phase))
+            return true;
+
+        // Keep a bounded amount of native variance in pistol rounds. The
+        // inputs are deterministic, so bots remain reproducible in tests and
+        // do not synchronize on one shared RNG.
+        return GetPistolAimAdjustment(profile, phase, botSlot, targetId, now).ApplyOverride;
+    }
+
     public static bool ShouldUseHeadFirstInMixed(
         BotMatchProfile profile,
         string? weaponName)
-        => profile == BotMatchProfile.Competitive && IsPistol(weaponName);
+        => false;
 
     public static bool IsPistol(string? weaponName)
         => weaponName?.Trim().ToLowerInvariant() switch
@@ -112,201 +166,11 @@ public static class CompetitiveTacticalPolicy
             && ShouldTrackCtBot(isCounterTerroristBot, takenOver);
 }
 
-public enum CtSaveReason
-{
-    None,
-    EcoNoContact,
-    PostPlantOutnumbered,
-    LateManDisadvantage,
-}
-
-public readonly record struct CtSaveDecision(
-    bool ShouldSave,
-    CtSaveReason Reason);
-
-public static class CtSavePolicy
-{
-    public static CtSaveDecision Evaluate(
-        BotMatchProfile profile,
-        BuyPhase buyPhase,
-        RoundPhase roundPhase,
-        bool bombPlanted,
-        int aliveCt,
-        int aliveT,
-        bool hasValuableWeapon,
-        bool teamHasDefuser,
-        bool hasReliableEnemyContact,
-        bool probeCompleted,
-        float liveElapsedSeconds,
-        RetakeContext? retakeContext = null)
-    {
-        if (profile != BotMatchProfile.Competitive || !hasValuableWeapon)
-            return NoSave();
-
-        aliveCt = Math.Max(0, aliveCt);
-        aliveT = Math.Max(0, aliveT);
-        if (aliveCt == 0)
-            return NoSave();
-
-        if (bombPlanted || roundPhase is RoundPhase.BombPlanted or RoundPhase.Retake)
-        {
-            var decision = RetakeDecisionPolicy.Evaluate(retakeContext ?? new RetakeContext(
-                aliveCt,
-                aliveT,
-                BombPlanted: true,
-                BombSecondsRemaining: 999,
-                CtDefusers: teamHasDefuser ? 1 : 0,
-                CtWeaponTier: hasValuableWeapon ? 8 : 4,
-                TWeaponTier: 6,
-                CtUtility: 0,
-                TUtility: 0,
-                TeamScore: 0,
-                OpponentScore: 0,
-                IsMatchPoint: false,
-                PathViable: true,
-                BotWeaponValue: hasValuableWeapon ? 10 : 0));
-            bool badlyOutnumbered = aliveCt == 1 && aliveT >= 2
-                || aliveCt == 2 && aliveT >= 4;
-            if (!decision.ShouldRetake && badlyOutnumbered && !teamHasDefuser)
-                return new CtSaveDecision(true, CtSaveReason.PostPlantOutnumbered);
-
-            return NoSave();
-        }
-
-        if (buyPhase == BuyPhase.Eco
-            && probeCompleted
-            && !hasReliableEnemyContact
-            && aliveCt == 1
-            && aliveT >= 2)
-        {
-            return new CtSaveDecision(true, CtSaveReason.EcoNoContact);
-        }
-
-        bool lateManDisadvantage = buyPhase is BuyPhase.Eco or BuyPhase.HalfBuy
-            && aliveCt <= 2
-            && aliveT >= aliveCt + 2
-            && !hasReliableEnemyContact;
-        return lateManDisadvantage
-            ? new CtSaveDecision(true, CtSaveReason.LateManDisadvantage)
-            : NoSave();
-    }
-
-    private static CtSaveDecision NoSave()
-        => new(false, CtSaveReason.None);
-}
-
 public enum CtGambleSite
 {
     None,
     A,
     B,
-}
-
-public enum CtGambleStage
-{
-    None,
-    Stack,
-    Hold,
-    Rotate,
-    Withdraw,
-    Save,
-}
-
-public readonly record struct CtGambleDecision(
-    bool Enabled,
-    CtGambleSite Site,
-    CtGambleStage Stage,
-    int StackCount,
-    int RotationBudget,
-    bool ShouldMoveToSite,
-    bool ShouldMoveToRetreat,
-    bool PreserveWeapon,
-    string Reason);
-
-public static class CtGamblePolicy
-{
-    public static CtGambleSite SelectSite(int roundNumber, int entropy = 0)
-        => ((roundNumber ^ entropy) & 1) == 0
-            ? CtGambleSite.A
-            : CtGambleSite.B;
-
-    public static CtGambleDecision Evaluate(
-        BotMatchProfile profile,
-        BuyPhase buyPhase,
-        RoundPhase roundPhase,
-        CtGambleSite selectedSite,
-        CtGambleSite contactSite,
-        bool hasReliableContact,
-        float liveElapsedSeconds,
-        bool hasValuableWeapon,
-        int aliveCt,
-        RetakeContext? retakeContext = null)
-    {
-        if (profile != BotMatchProfile.Competitive
-            || selectedSite == CtGambleSite.None
-            || roundPhase is not RoundPhase.Live
-            || buyPhase is not (BuyPhase.Pistol or BuyPhase.Eco or BuyPhase.HalfBuy or BuyPhase.ForceBuy))
-        {
-            return Disabled();
-        }
-
-        aliveCt = Math.Max(0, aliveCt);
-        if (aliveCt == 0)
-            return Disabled();
-
-        if (hasReliableContact && contactSite == selectedSite)
-        {
-            return new CtGambleDecision(
-                Enabled: true,
-                selectedSite,
-                CtGambleStage.Hold,
-                StackCount: Math.Min(4, aliveCt),
-                RotationBudget: 0,
-                ShouldMoveToSite: false,
-                ShouldMoveToRetreat: false,
-                PreserveWeapon: false,
-                Reason: "gambled-site-contact");
-        }
-
-        if (hasReliableContact
-            && contactSite != CtGambleSite.None
-            && contactSite != selectedSite)
-        {
-            return new CtGambleDecision(
-                Enabled: true,
-                selectedSite,
-                CtGambleStage.Rotate,
-                StackCount: Math.Min(4, aliveCt),
-                RotationBudget: Math.Clamp(aliveCt >= 4 ? 2 : 1, 1, 2),
-                ShouldMoveToSite: false,
-                ShouldMoveToRetreat: false,
-                PreserveWeapon: false,
-                Reason: "other-site-contact");
-        }
-
-        return new CtGambleDecision(
-            Enabled: true,
-            selectedSite,
-            CtGambleStage.Stack,
-            StackCount: Math.Min(4, aliveCt),
-            RotationBudget: 0,
-            ShouldMoveToSite: true,
-            ShouldMoveToRetreat: false,
-            PreserveWeapon: false,
-            Reason: "gambled-site-awaiting-information");
-    }
-
-    private static CtGambleDecision Disabled()
-        => new(
-            Enabled: false,
-            Site: CtGambleSite.None,
-            Stage: CtGambleStage.None,
-            StackCount: 0,
-            RotationBudget: 0,
-            ShouldMoveToSite: false,
-            ShouldMoveToRetreat: false,
-            PreserveWeapon: false,
-            Reason: "gamble-disabled");
 }
 
 public static class CtTacticalExecutionPolicy
@@ -374,6 +238,32 @@ public enum PurchaseIntent
     LastRound,
 }
 
+public enum PistolBuyRole
+{
+    Auto,
+    ArmorEntry,
+    Firepower,
+    UtilitySupport,
+    DefuserSupport,
+}
+
+public static class PistolBuyRolePolicy
+{
+    public static PistolBuyRole ForBotOrdinal(
+        TeamSide side,
+        int ordinal,
+        int botCount)
+    {
+        if (ordinal == 0)
+            return PistolBuyRole.ArmorEntry;
+        if (ordinal == 1 || (side == TeamSide.Terrorist && ordinal == 2))
+            return PistolBuyRole.Firepower;
+        if (side == TeamSide.CounterTerrorist && ordinal == botCount - 1)
+            return PistolBuyRole.DefuserSupport;
+        return PistolBuyRole.UtilitySupport;
+    }
+}
+
 public sealed record WeaponSwitchRequest(
     int Slot,
     string Weapon,
@@ -433,58 +323,6 @@ public static class BotWeaponSwitchQueue
         while (Requests.TryDequeue(out var request))
             requests.Add(request);
         return requests;
-    }
-}
-
-public sealed record PurchaseIntentContext(
-    BuyPhase Phase,
-    int TeamScore,
-    int OpponentScore,
-    int RoundsPlayed,
-    int MaxRounds,
-    int CurrentTeamPower,
-    int NextRoundTeamPower)
-{
-    public bool HasFeasibleTeamTransfer { get; init; }
-    public bool IsMatchPoint { get; init; }
-    public bool IsLastRegulationRound { get; init; }
-    public bool IsLastRoundOfHalf { get; init; }
-    public bool IsNextRoundLastRoundOfHalf { get; init; }
-    public bool IsOvertimeFirstRound { get; init; }
-}
-
-public static class PurchaseIntentPolicy
-{
-    public static PurchaseIntent Evaluate(PurchaseIntentContext context)
-    {
-        if (context.IsOvertimeFirstRound)
-            return context.IsMatchPoint ? PurchaseIntent.AllIn : PurchaseIntent.Standard;
-
-        if (context.Phase == BuyPhase.Pistol)
-            return PurchaseIntent.Pistol;
-
-        if (context.Phase == BuyPhase.LastRound
-            || context.IsLastRegulationRound
-            || context.IsLastRoundOfHalf)
-            return PurchaseIntent.LastRound;
-
-        if (context.IsMatchPoint
-            || context.TeamScore + 2 <= context.OpponentScore
-            || context.CurrentTeamPower > context.NextRoundTeamPower + 2)
-            return PurchaseIntent.AllIn;
-
-        if (context.HasFeasibleTeamTransfer)
-            return PurchaseIntent.Standard;
-
-        if (context.IsNextRoundLastRoundOfHalf
-            && context.Phase is BuyPhase.Eco or BuyPhase.Save)
-            return PurchaseIntent.Save;
-
-        return context.Phase == BuyPhase.Save
-            || (context.Phase == BuyPhase.Eco
-                && context.NextRoundTeamPower > context.CurrentTeamPower + 2)
-            ? PurchaseIntent.Save
-            : PurchaseIntent.Standard;
     }
 }
 
@@ -552,13 +390,19 @@ public sealed record PlayerBuyPlan(
     public bool HasCoreWeapon => PrimaryWeapon is not null;
     public int Tier { get; init; }
     public PurchaseIntent Intent { get; init; } = PurchaseIntent.Standard;
-}
 
-public sealed record TeamBuyMember(
-    int Slot,
-    bool IsBot,
-    bool IsAwper,
-    IReadOnlyList<PlayerBuyPlan> Candidates);
+    // A team plan may deliberately leave the primary slot empty while the
+    // bounded planner looks for a donor. This is not an executable armor-only
+    // rifle plan: the transfer planner must either fill it or select another
+    // candidate that the bot can afford itself.
+    public bool AcceptsTeamPrimary { get; init; }
+    public string? RequestedPrimaryWeapon { get; init; }
+
+    // Carried weapons are replaced only through the main-thread settlement
+    // queue. Keeping the old weapon on the immutable plan prevents a direct
+    // GiveNamedItem path from silently dropping it.
+    public string? ReplacePrimaryWeapon { get; init; }
+}
 
 public sealed record TeamBuyPlan(
     IReadOnlyDictionary<int, PlayerBuyPlan> BotPlans,
@@ -568,70 +412,12 @@ public sealed record TeamBuyPlan(
 {
     public bool IsBalanced => MaxTier - MinTier <= 1;
     public int TotalCost => BotPlans.Values.Sum(plan => plan.EstimatedCost);
+    public TeamBuyMode BuyMode { get; init; } = TeamBuyMode.Full;
     public IReadOnlyList<TransferPlan> Transfers { get; init; } = Array.Empty<TransferPlan>();
     public IReadOnlyList<NextRoundScenarioPrediction> Forecasts { get; init; } = Array.Empty<NextRoundScenarioPrediction>();
     public int HumanTierPenalty { get; init; }
     public string Reason { get; init; } = string.Empty;
     public PurchaseIntent Intent { get; init; } = PurchaseIntent.Standard;
-}
-
-public static class TeamTierPlanner
-{
-    public static TeamBuyPlan Balance(IReadOnlyList<TeamBuyMember> members)
-    {
-        var humanObservations = members
-            .Where(member => !member.IsBot && member.Candidates.Count > 0)
-            .ToDictionary(member => member.Slot, member => member.Candidates[0]);
-
-        var botMembers = members
-            .Where(member => member.IsBot && member.Candidates.Count > 0)
-            .ToArray();
-        var ordinaryBots = botMembers.Where(member => !member.IsAwper).ToArray();
-
-        int floor = FindHighestBalancedFloor(ordinaryBots);
-        var botPlans = new Dictionary<int, PlayerBuyPlan>();
-        foreach (var member in botMembers)
-        {
-            PlayerBuyPlan selected = member.IsAwper
-                ? member.Candidates.OrderByDescending(plan => plan.Tier).ThenByDescending(plan => plan.EstimatedCost).First()
-                : member.Candidates
-                    .Where(plan => plan.Tier >= floor && plan.Tier <= floor + 1)
-                    .OrderByDescending(plan => plan.Tier)
-                    .ThenByDescending(plan => plan.EstimatedCost)
-                    .FirstOrDefault()
-                    ?? member.Candidates.OrderBy(plan => plan.Tier).ThenBy(plan => plan.EstimatedCost).First();
-            botPlans[member.Slot] = selected;
-        }
-
-        int minTier = ordinaryBots.Length == 0
-            ? botPlans.Values.Select(plan => plan.Tier).DefaultIfEmpty(0).Min()
-            : botPlans
-                .Where(entry => ordinaryBots.Any(member => member.Slot == entry.Key))
-                .Select(entry => entry.Value.Tier)
-                .DefaultIfEmpty(0)
-                .Min();
-        int maxTier = ordinaryBots.Length == 0
-            ? botPlans.Values.Select(plan => plan.Tier).DefaultIfEmpty(0).Max()
-            : botPlans
-                .Where(entry => ordinaryBots.Any(member => member.Slot == entry.Key))
-                .Select(entry => entry.Value.Tier)
-                .DefaultIfEmpty(0)
-                .Max();
-
-        return new TeamBuyPlan(botPlans, humanObservations, minTier, maxTier);
-    }
-
-    private static int FindHighestBalancedFloor(IReadOnlyList<TeamBuyMember> ordinaryBots)
-    {
-        if (ordinaryBots.Count == 0)
-            return 0;
-
-        return Enumerable.Range(0, 10)
-            .Where(floor => ordinaryBots.All(member => member.Candidates.Any(plan =>
-                plan.Tier >= floor && plan.Tier <= floor + 1)))
-            .DefaultIfEmpty(0)
-            .Max();
-    }
 }
 
 public sealed record TransferParticipant(
@@ -681,43 +467,78 @@ public static class TeamTransferPlanner
         foreach (var recipient in participants
                      .Where(participant => participant.IsBot
                          && participant.CurrentPrimary is null
-                         && participant.Plan.PrimaryWeapon is not null)
+                         && participant.Plan.ArmorLevel != ArmorLevel.None
+                         && (participant.Plan.PrimaryWeapon is not null
+                             || participant.Plan.AcceptsTeamPrimary))
                      .OrderByDescending(participant => participant.Plan.Tier)
                      .ThenBy(participant => participant.Slot))
         {
             if (donorSpent[recipient.Slot] > 0 || recipients.Contains(recipient.Slot))
                 continue;
 
-            int cost = BuyPlanner.GetWeaponCost(recipient.Plan.PrimaryWeapon);
+            string? requestedWeapon = recipient.Plan.PrimaryWeapon
+                ?? recipient.Plan.RequestedPrimaryWeapon;
+            int cost = BuyPlanner.GetWeaponCost(requestedWeapon);
             if (cost <= 0)
                 continue;
 
+            // A donated primary is only valid when the recipient can still
+            // buy the armor selected by its plan. Without this preflight the
+            // executor could commit armor-only and leave the bot waiting for
+            // a weapon that was never legally deliverable.
+            int recipientArmorCost = recipient.Plan.AcceptsTeamPrimary
+                ? recipient.Plan.EstimatedCost
+                : BuyPlanner.GetArmorUpgradeCost(
+                    ArmorLevel.None,
+                    recipient.Plan.ArmorLevel);
+            if (recipient.Money < recipientArmorCost)
+                continue;
+
             var donor = participants
-                .Where(candidate => candidate.IsBot && candidate.Slot != recipient.Slot)
+                .Where(candidate => candidate.IsBot
+                    && candidate.Slot != recipient.Slot
+                    && candidate.CurrentPrimary is null
+                    && candidate.Plan.PrimaryWeapon is not null)
                 .Where(candidate => !recipients.Contains(candidate.Slot))
                 .Select(candidate => new
                 {
                     Candidate = candidate,
-                    Surplus = candidate.Money
-                        - OwnPurchaseCost(candidate)
-                        - donorSpent[candidate.Slot],
+                    Item = SelectGiftWeapon(
+                        candidate.Plan.PrimaryWeapon!,
+                        requestedWeapon!),
                 })
-                .Where(candidate => candidate.Surplus >= cost
+                .Where(candidate => candidate.Item is not null)
+                .Select(candidate => new
+                {
+                    candidate.Candidate,
+                    candidate.Item,
+                    Cost = BuyPlanner.GetWeaponCost(candidate.Item!),
+                })
+                .Select(candidate => new
+                {
+                    candidate.Candidate,
+                    candidate.Item,
+                    candidate.Cost,
+                    Surplus = candidate.Candidate.Money
+                        - OwnPurchaseCost(candidate.Candidate)
+                        - donorSpent[candidate.Candidate.Slot],
+                })
+                .Where(candidate => candidate.Surplus >= candidate.Cost
                     && candidate.Candidate.Plan.Tier >= recipient.Plan.Tier - 1)
-                .OrderByDescending(candidate => candidate.Surplus)
+                .OrderByDescending(candidate => candidate.Surplus - candidate.Cost)
                 .ThenBy(candidate => candidate.Candidate.Slot)
                 .FirstOrDefault();
 
             if (donor is null)
                 continue;
 
-            donorSpent[donor.Candidate.Slot] += cost;
+            donorSpent[donor.Candidate.Slot] += donor.Cost;
             recipients.Add(recipient.Slot);
             transfers.Add(new TransferPlan(
                 donor.Candidate.Slot,
                 recipient.Slot,
-                recipient.Plan.PrimaryWeapon!,
-                cost,
+                donor.Item!,
+                donor.Cost,
                 "donor-surplus-within-tier"));
         }
 
@@ -726,6 +547,20 @@ public static class TeamTransferPlanner
 
     private static int OwnPurchaseCost(TransferParticipant participant)
         => Math.Max(0, participant.Plan.EstimatedCost);
+
+    private static string? SelectGiftWeapon(string donorWeapon, string recipientWeapon)
+    {
+        if (IsPreferredRifle(donorWeapon)
+            && !IsPreferredRifle(recipientWeapon))
+            return donorWeapon;
+
+        return recipientWeapon;
+    }
+
+    private static bool IsPreferredRifle(string? weapon)
+        => weapon is "weapon_ak47"
+            or "weapon_m4a1"
+            or "weapon_m4a1_silencer";
 }
 
 public sealed record EconomyPlayerSeed(int Slot, TeamSide Side, bool IsBot);
@@ -986,7 +821,7 @@ public static class NextRoundEconomyPolicy
         => prediction.MinTier >= Math.Max(0, currentMinTier - 1);
 }
 
-public sealed record TeamDpMember(
+public sealed record TeamPlanningMember(
     int Slot,
     bool IsBot,
     bool IsAwper,
@@ -997,313 +832,6 @@ public sealed record TeamDpMember(
     int Kills = 0,
     bool IsPlanter = false,
     bool IsDefuser = false);
-
-public static class TeamDpPlanner
-{
-    private sealed record DpSelection(
-        IReadOnlyDictionary<int, PlayerBuyPlan> Plans,
-        IReadOnlyList<TransferPlan> Transfers,
-        IReadOnlyList<NextRoundScenarioPrediction> Forecasts,
-        int CurrentPower,
-        int WorstMinTier,
-        int WorstCombatPower,
-        int AllScenarioCombatPower,
-        int UnusedCash,
-        bool MeetsFloor,
-        bool IsBalanced,
-        int TierGap,
-        int HumanTierPenalty,
-        int CommittedCost);
-
-    public static TeamBuyPlan Optimize(
-        TeamSide side,
-        BuyPhase phase,
-        IReadOnlyList<TeamDpMember> members,
-        int currentMinTier,
-        EconomyRewardRules rewards,
-        int consecutiveLosses,
-        int opponentPlayerCount = 0,
-        PurchaseIntent purchaseIntent = PurchaseIntent.Standard,
-        PurchaseIntentContext? purchaseContext = null)
-    {
-        bool prioritizeNextRoundBoundary = purchaseContext?.IsNextRoundLastRoundOfHalf == true;
-        bool aggressiveIntent = purchaseIntent is PurchaseIntent.AllIn or PurchaseIntent.LastRound;
-        var humanObservations = members
-            .Where(member => !member.IsBot && member.Candidates.Count > 0)
-            .ToDictionary(member => member.Slot, member => member.Candidates[0]);
-        var bots = members
-            .Where(member => member.IsBot && member.Candidates.Count > 0)
-            .OrderBy(member => member.Slot)
-            .ToArray();
-        if (bots.Length == 0)
-        {
-            return new TeamBuyPlan(
-                new Dictionary<int, PlayerBuyPlan>(),
-                humanObservations,
-                0,
-                0)
-            {
-                Reason = "no-bot-candidates",
-            };
-        }
-
-        int teamBudget = bots.Sum(member => Math.Max(0, member.Money));
-        var suffixMinimumCost = new int[bots.Length + 1];
-        for (int i = bots.Length - 1; i >= 0; i--)
-        {
-            int minimum = bots[i].Candidates
-                .Select(candidate => EffectivePurchaseCost(bots[i], candidate))
-                .DefaultIfEmpty(0)
-                .Min();
-            suffixMinimumCost[i] = suffixMinimumCost[i + 1] + minimum;
-        }
-
-        DpSelection? best = null;
-        DpSelection? relaxed = null;
-        var selected = new Dictionary<int, PlayerBuyPlan>();
-
-        void Search(
-            int index,
-            int totalCost,
-            int awpCount,
-            int ordinaryMin,
-            int ordinaryMax,
-            bool allowUnbalanced)
-        {
-            // Transfers only redistribute the cost between bots; they cannot
-            // reduce the team's total committed cost. Prune impossible
-            // branches before reaching the expensive forecast calculation.
-            if (totalCost > teamBudget
-                || totalCost > teamBudget - suffixMinimumCost[index])
-                return;
-
-            if (awpCount > 1)
-                return;
-            if (!allowUnbalanced
-                && ordinaryMin != int.MaxValue
-                && ordinaryMax - ordinaryMin > 1)
-                return;
-
-            if (index == bots.Length)
-            {
-                var transferParticipants = bots
-                    .Select(member => new TransferParticipant(
-                        member.Slot,
-                        IsBot: true,
-                        member.Money,
-                        selected[member.Slot],
-                        member.CurrentPrimary))
-                    .ToArray();
-                var transfers = TeamTransferPlanner.BuildTransfers(transferParticipants);
-                var purchaseCosts = BuildPurchaseCosts(bots, selected, transfers);
-                if (purchaseCosts.Values.Any(cost => cost < 0)
-                    || purchaseCosts.Any(entry => entry.Value > bots.First(member => member.Slot == entry.Key).Money))
-                    return;
-                int committedCost = purchaseCosts.Values.Sum();
-                if (committedCost > teamBudget)
-                    return;
-                var scenarioParticipants = bots
-                    .Select(member =>
-                    {
-                        var plan = selected[member.Slot];
-                        return new ScenarioParticipant(
-                            member.Slot,
-                            side,
-                            Math.Max(0, member.Money - purchaseCosts[member.Slot]),
-                            plan,
-                            member.Kills,
-                            member.IsPlanter,
-                            member.IsDefuser,
-                            Math.Max(member.SavedTier, plan.Tier));
-                    })
-                    .ToArray();
-                var forecasts = NextRoundPredictor.Predict(
-                    scenarioParticipants,
-                    rewards,
-                    consecutiveLosses,
-                    teamPlayerCount: members.Count,
-                    opponentPlayerCount);
-                var worst = forecasts.First(forecast =>
-                    forecast.Scenario == NextRoundScenario.LossNoPlantNoKillsAllDead);
-                bool meetsFloor = NextRoundEconomyPolicy.MeetsWorstCaseFloor(worst, currentMinTier);
-                int tierGap = ordinaryMin == int.MaxValue ? 0 : ordinaryMax - ordinaryMin;
-                bool isBalanced = tierGap <= 1;
-                int humanTierPenalty = ComputeHumanTierPenalty(selected, humanObservations);
-                var choice = new DpSelection(
-                    new Dictionary<int, PlayerBuyPlan>(selected),
-                    transfers,
-                    forecasts,
-                    selected.Values.Sum(plan => plan.Tier),
-                    worst.MinTier,
-                    worst.CombatPower,
-                    forecasts.Sum(forecast => forecast.CombatPower),
-                    teamBudget - totalCost,
-                    meetsFloor,
-                    isBalanced,
-                    tierGap,
-                    humanTierPenalty,
-                    committedCost);
-
-                if (aggressiveIntent)
-                {
-                    if (relaxed is null || IsBetterAggressive(choice, relaxed))
-                        relaxed = choice;
-                }
-                else if (meetsFloor && isBalanced)
-                {
-                    if (best is null || IsBetter(choice, best, prioritizeNextRoundBoundary))
-                        best = choice;
-                }
-                else if (relaxed is null || IsBetterFallback(choice, relaxed))
-                {
-                    relaxed = choice;
-                }
-                return;
-            }
-
-            var member = bots[index];
-            foreach (var candidate in member.Candidates
-                         .OrderByDescending(plan => plan.Tier)
-                         .ThenByDescending(plan => plan.EstimatedCost))
-            {
-                selected[member.Slot] = candidate;
-                int nextMin = ordinaryMin;
-                int nextMax = ordinaryMax;
-                if (!member.IsAwper)
-                {
-                    nextMin = Math.Min(nextMin, candidate.Tier);
-                    nextMax = Math.Max(nextMax, candidate.Tier);
-                }
-
-                Search(
-                    index + 1,
-                    totalCost + EffectivePurchaseCost(member, candidate),
-                    awpCount + (candidate.PrimaryWeapon == "weapon_awp" ? 1 : 0),
-                    nextMin,
-                    nextMax,
-                    allowUnbalanced);
-            }
-            selected.Remove(member.Slot);
-        }
-
-        Search(0, 0, 0, int.MaxValue, int.MinValue, allowUnbalanced: aggressiveIntent);
-        if (relaxed is null)
-            Search(0, 0, 0, int.MaxValue, int.MinValue, allowUnbalanced: true);
-
-        if (best is null && relaxed is null)
-        {
-            return new TeamBuyPlan(
-                new Dictionary<int, PlayerBuyPlan>(),
-                humanObservations,
-                0,
-                0)
-            {
-                Intent = purchaseIntent,
-                Reason = "no-affordable-team-plan",
-            };
-        }
-
-        var chosen = aggressiveIntent
-            ? relaxed!
-            : best ?? relaxed!;
-        var ordinaryTiers = bots
-            .Where(member => !member.IsAwper)
-            .Select(member => chosen.Plans[member.Slot].Tier)
-            .ToArray();
-        return new TeamBuyPlan(
-            chosen.Plans,
-            humanObservations,
-            ordinaryTiers.DefaultIfEmpty(0).Min(),
-            ordinaryTiers.DefaultIfEmpty(0).Max())
-        {
-            Transfers = chosen.Transfers,
-            Forecasts = chosen.Forecasts,
-            HumanTierPenalty = chosen.HumanTierPenalty,
-            Intent = purchaseIntent,
-            Reason = purchaseIntent == PurchaseIntent.AllIn
-                ? "all-in-current-round-power"
-                : purchaseIntent == PurchaseIntent.LastRound
-                ? "last-round-current-round-power"
-                : chosen.MeetsFloor && chosen.IsBalanced
-                ? "robust-team-dp"
-                : chosen.IsBalanced
-                    ? "balanced-floor-unmet-fallback"
-                    : "unavoidable-tier-gap-fallback",
-        };
-    }
-
-    private static int EffectivePurchaseCost(TeamDpMember member, PlayerBuyPlan plan)
-        => Math.Max(0, plan.EstimatedCost);
-
-    private static Dictionary<int, int> BuildPurchaseCosts(
-        IReadOnlyList<TeamDpMember> members,
-        IReadOnlyDictionary<int, PlayerBuyPlan> plans,
-        IReadOnlyList<TransferPlan> transfers)
-    {
-        var costs = members.ToDictionary(
-            member => member.Slot,
-            member => EffectivePurchaseCost(member, plans[member.Slot]));
-
-        foreach (var transfer in transfers)
-        {
-            costs[transfer.Donor] += transfer.Cost;
-            costs[transfer.Recipient] = Math.Max(0, costs[transfer.Recipient] - transfer.Cost);
-        }
-
-        return costs;
-    }
-
-    private static int ComputeHumanTierPenalty(
-        IReadOnlyDictionary<int, PlayerBuyPlan> botPlans,
-        IReadOnlyDictionary<int, PlayerBuyPlan> humanObservations)
-    {
-        if (humanObservations.Count == 0)
-            return 0;
-
-        return botPlans.Values
-            .Select(botPlan => humanObservations.Values
-                .Select(humanPlan => Math.Max(0, Math.Abs(botPlan.Tier - humanPlan.Tier) - 1))
-                .DefaultIfEmpty(0)
-                .Min())
-            .Sum();
-    }
-
-    private static bool IsBetter(
-        DpSelection candidate,
-        DpSelection current,
-        bool prioritizeNextRoundBoundary = false)
-        => candidate.HumanTierPenalty != current.HumanTierPenalty
-            ? candidate.HumanTierPenalty < current.HumanTierPenalty
-            : prioritizeNextRoundBoundary && candidate.WorstCombatPower != current.WorstCombatPower
-            ? candidate.WorstCombatPower > current.WorstCombatPower
-            : candidate.CurrentPower != current.CurrentPower
-            ? candidate.CurrentPower > current.CurrentPower
-            : candidate.WorstMinTier != current.WorstMinTier
-                ? candidate.WorstMinTier > current.WorstMinTier
-                : candidate.WorstCombatPower != current.WorstCombatPower
-                    ? candidate.WorstCombatPower > current.WorstCombatPower
-                    : candidate.AllScenarioCombatPower != current.AllScenarioCombatPower
-                        ? candidate.AllScenarioCombatPower > current.AllScenarioCombatPower
-                        : candidate.UnusedCash < current.UnusedCash;
-
-    private static bool IsBetterAggressive(DpSelection candidate, DpSelection current)
-        => candidate.CurrentPower != current.CurrentPower
-            ? candidate.CurrentPower > current.CurrentPower
-            : candidate.AllScenarioCombatPower != current.AllScenarioCombatPower
-                ? candidate.AllScenarioCombatPower > current.AllScenarioCombatPower
-                : candidate.WorstCombatPower != current.WorstCombatPower
-                    ? candidate.WorstCombatPower > current.WorstCombatPower
-                    : candidate.UnusedCash < current.UnusedCash;
-
-    private static bool IsBetterFallback(DpSelection candidate, DpSelection current)
-        => candidate.IsBalanced != current.IsBalanced
-            ? candidate.IsBalanced
-            : candidate.TierGap != current.TierGap
-                ? candidate.TierGap < current.TierGap
-                : candidate.MeetsFloor != current.MeetsFloor
-                    ? candidate.MeetsFloor
-                    : IsBetter(candidate, current);
-}
 
 public static class BuyPlanner
 {
@@ -1316,6 +844,7 @@ public static class BuyPlanner
     public const int MolotovPrice = 400;
     public const int IncendiaryPrice = 500;
     public const int DeaglePrice = 700;
+    public const int P250Price = 300;
     public const int Tec9Price = 500;
     public const int FiveSevenPrice = 500;
 
@@ -1330,6 +859,16 @@ public static class BuyPlanner
                 or "weapon_mp9" or "weapon_mac10" or "weapon_mp7" or "weapon_mp5sd"
                 or "weapon_ump45" or "weapon_nova" or "weapon_xm1014"
                 or "weapon_sawedoff" or "weapon_mag7");
+
+    public static bool IsCombatLegal(PlayerBuyPlan plan)
+    {
+        if (plan.PrimaryWeapon is null || !IsPrimaryWeapon(plan.PrimaryWeapon))
+        {
+            return true;
+        }
+
+        return plan.PrimaryWeapon == "weapon_awp" || plan.ArmorLevel != ArmorLevel.None;
+    }
 
     private const int AkPrice = 2700;
     private const int GalilPrice = 1800;
@@ -1348,6 +887,7 @@ public static class BuyPlanner
             "weapon_mac10" => 1050,
             "weapon_mp9" => 1250,
             "weapon_deagle" => DeaglePrice,
+            "weapon_p250" => P250Price,
             "weapon_tec9" => Tec9Price,
             "weapon_fiveseven" => FiveSevenPrice,
             _ => 0,
@@ -1388,7 +928,8 @@ public static class BuyPlanner
         bool currentHasHelmet = false,
         bool currentHasDefuser = false,
         IReadOnlyDictionary<string, int>? currentUtility = null,
-        PurchaseIntent? purchaseIntent = null)
+        PurchaseIntent? purchaseIntent = null,
+        PistolBuyRole pistolRole = PistolBuyRole.Auto)
     {
         money = Math.Max(0, money);
         var intent = purchaseIntent ?? DefaultIntentForPhase(phase);
@@ -1404,8 +945,61 @@ public static class BuyPlanner
                 currentHasHelmet,
                 currentHasDefuser,
                 currentUtility,
-                intent)
+                intent,
+                pistolRole)
             .First();
+    }
+
+    public static PlayerBuyPlan BuildTeamPrimaryRecipientPlan(
+        TeamSide side,
+        BuyPhase phase,
+        int money,
+        string preferredPrimary,
+        ArmorLevel currentArmor = ArmorLevel.None,
+        bool currentHasHelmet = false)
+    {
+        money = Math.Max(0, money);
+        currentArmor = currentArmor switch
+        {
+            ArmorLevel.None or ArmorLevel.Half or ArmorLevel.Full => currentArmor,
+            _ => ArmorLevel.None,
+        };
+
+        int fullArmorCost = GetArmorUpgradeCost(currentArmor, ArmorLevel.Full);
+        bool canCompleteArmor = currentArmor == ArmorLevel.Full
+            || money >= fullArmorCost;
+        ArmorLevel armor = canCompleteArmor
+            ? ArmorLevel.Full
+            : currentArmor != ArmorLevel.None
+                ? currentArmor
+                : money >= KevlarPrice
+                    ? ArmorLevel.Half
+                    : ArmorLevel.None;
+        int cost = GetArmorUpgradeCost(currentArmor, armor);
+        bool buysHelmet = armor == ArmorLevel.Full && !currentHasHelmet;
+        if (buysHelmet && currentArmor == ArmorLevel.Full)
+            cost += HelmetUpgradePrice;
+
+        bool canReceivePrimary = armor != ArmorLevel.None;
+        return new PlayerBuyPlan(
+            phase,
+            armor,
+            PrimaryWeapon: null,
+            SecondaryWeapon: null,
+            BuysHelmet: buysHelmet,
+            BuysDefuser: false,
+            Utility: Array.Empty<string>(),
+            EstimatedCost: cost)
+        {
+            // Never score a naked pending rifle as a real rifle plan. The
+            // transfer stage must not create an illegal unarmored AK/M4.
+            Tier = canReceivePrimary ? GetTier(armor, preferredPrimary, null) : 0,
+            Intent = phase == BuyPhase.LastRound
+                ? PurchaseIntent.LastRound
+                : PurchaseIntent.Standard,
+            AcceptsTeamPrimary = canReceivePrimary,
+            RequestedPrimaryWeapon = canReceivePrimary ? preferredPrimary : null,
+        };
     }
 
     public static IReadOnlyList<PlayerBuyPlan> BuildCandidatePlans(
@@ -1420,7 +1014,8 @@ public static class BuyPlanner
         bool currentHasHelmet = false,
         bool currentHasDefuser = false,
         IReadOnlyDictionary<string, int>? currentUtility = null,
-        PurchaseIntent? purchaseIntent = null)
+        PurchaseIntent? purchaseIntent = null,
+        PistolBuyRole pistolRole = PistolBuyRole.Auto)
     {
         money = Math.Max(0, money);
         var intent = purchaseIntent ?? DefaultIntentForPhase(phase);
@@ -1434,7 +1029,8 @@ public static class BuyPlanner
                 currentHasHelmet,
                 currentHasDefuser,
                 currentUtility,
-                intent);
+                intent,
+                pistolRole);
 
         if (phase is BuyPhase.Eco or BuyPhase.Save && intent == PurchaseIntent.Save)
             return [BuildLowBuyPlan(
@@ -1447,7 +1043,7 @@ public static class BuyPlanner
                 currentHasDefuser,
                 intent)];
 
-        return SelectPackages(side, phase, money, designatedAwper, opponentEcoLikely)
+        return DistinctPlans(SelectPackages(side, phase, money, designatedAwper, opponentEcoLikely)
             .Select(package => BuildPlanFromPackage(
                 side,
                 phase,
@@ -1463,8 +1059,7 @@ public static class BuyPlanner
                 intent))
             .Where(plan => ((intent is PurchaseIntent.Standard or PurchaseIntent.AllIn)
                     && (phase is BuyPhase.Eco or BuyPhase.Save))
-                || plan.EstimatedCost <= money)
-            .ToArray();
+                || plan.EstimatedCost <= money));
     }
 
     private static PlayerBuyPlan BuildPlanFromPackage(
@@ -1581,18 +1176,22 @@ public static class BuyPlanner
         bool currentHasHelmet,
         bool currentHasDefuser,
         IReadOnlyDictionary<string, int>? currentUtility,
-        PurchaseIntent purchaseIntent)
+        PurchaseIntent purchaseIntent,
+        PistolBuyRole pistolRole)
     {
         var options = side == TeamSide.Terrorist
             ? new[]
             {
                 new PistolOption(ArmorLevel.Full, "weapon_deagle", KevlarPrice + HelmetUpgradePrice + DeaglePrice, 90),
+                new PistolOption(ArmorLevel.Full, "weapon_p250", KevlarPrice + HelmetUpgradePrice + P250Price, 88),
                 new PistolOption(ArmorLevel.Full, "weapon_tec9", KevlarPrice + HelmetUpgradePrice + Tec9Price, 89),
                 new PistolOption(ArmorLevel.Full, null, KevlarPrice + HelmetUpgradePrice, 80),
                 new PistolOption(ArmorLevel.Half, "weapon_deagle", KevlarPrice + DeaglePrice, 70),
+                new PistolOption(ArmorLevel.Half, "weapon_p250", KevlarPrice + P250Price, 68),
                 new PistolOption(ArmorLevel.Half, "weapon_tec9", KevlarPrice + Tec9Price, 69),
                 new PistolOption(ArmorLevel.Half, null, KevlarPrice, 60),
                 new PistolOption(ArmorLevel.None, "weapon_deagle", DeaglePrice, 50),
+                new PistolOption(ArmorLevel.None, "weapon_p250", P250Price, 48),
                 new PistolOption(ArmorLevel.None, "weapon_tec9", Tec9Price, 49),
                 new PistolOption(ArmorLevel.None, null, 0, 0),
             }
@@ -1600,16 +1199,19 @@ public static class BuyPlanner
             {
                 new PistolOption(ArmorLevel.Full, "weapon_deagle", KevlarPrice + HelmetUpgradePrice + DeaglePrice, 90),
                 new PistolOption(ArmorLevel.Full, "weapon_fiveseven", KevlarPrice + HelmetUpgradePrice + FiveSevenPrice, 89),
+                new PistolOption(ArmorLevel.Full, "weapon_p250", KevlarPrice + HelmetUpgradePrice + P250Price, 88),
                 new PistolOption(ArmorLevel.Full, null, KevlarPrice + HelmetUpgradePrice, 80),
                 new PistolOption(ArmorLevel.Half, "weapon_deagle", KevlarPrice + DeaglePrice, 70),
                 new PistolOption(ArmorLevel.Half, "weapon_fiveseven", KevlarPrice + FiveSevenPrice, 69),
+                new PistolOption(ArmorLevel.Half, "weapon_p250", KevlarPrice + P250Price, 68),
                 new PistolOption(ArmorLevel.Half, null, KevlarPrice, 60),
                 new PistolOption(ArmorLevel.None, "weapon_deagle", DeaglePrice, 50),
                 new PistolOption(ArmorLevel.None, "weapon_fiveseven", FiveSevenPrice, 49),
+                new PistolOption(ArmorLevel.None, "weapon_p250", P250Price, 48),
                 new PistolOption(ArmorLevel.None, null, 0, 0),
             };
 
-        return options
+        var candidates = options
             .OrderByDescending(option => option.Score)
             .ThenByDescending(option => option.Cost)
             .Select(option => BuildPlanFromTargets(
@@ -1629,6 +1231,172 @@ public static class BuyPlanner
                 currentUtility))
             .Where(plan => plan.EstimatedCost <= money)
             .ToArray();
+        return ApplyPistolRole(
+            side,
+            money,
+            currentArmor,
+            currentSecondary,
+            currentHasHelmet,
+            currentHasDefuser,
+            currentUtility,
+            purchaseIntent,
+            pistolRole,
+            candidates);
+    }
+
+    private static IReadOnlyList<PlayerBuyPlan> DistinctPlans(
+        IEnumerable<PlayerBuyPlan> plans)
+        => plans
+            .GroupBy(plan => (
+                plan.Phase,
+                plan.ArmorLevel,
+                plan.PrimaryWeapon,
+                plan.SecondaryWeapon,
+                plan.BuysHelmet,
+                plan.BuysDefuser,
+                Utility: string.Join('|', plan.Utility),
+                plan.EstimatedCost,
+                plan.Tier,
+                plan.Intent))
+            .Select(group => group.First())
+            .ToArray();
+
+    private static IReadOnlyList<PlayerBuyPlan> ApplyPistolRole(
+        TeamSide side,
+        int money,
+        ArmorLevel currentArmor,
+        string? currentSecondary,
+        bool currentHasHelmet,
+        bool currentHasDefuser,
+        IReadOnlyDictionary<string, int>? currentUtility,
+        PurchaseIntent intent,
+        PistolBuyRole role,
+        IReadOnlyList<PlayerBuyPlan> candidates)
+    {
+        if (role == PistolBuyRole.Auto)
+            return candidates;
+
+        var rolePlans = new List<PlayerBuyPlan>(candidates.Count);
+        foreach (var candidate in candidates)
+        {
+            PlayerBuyPlan plan = candidate;
+            switch (role)
+            {
+                case PistolBuyRole.ArmorEntry:
+                    int armorEntryCost = candidate.SecondaryWeapon is { } armorEntryWeapon
+                        ? BuyPlanner.GetWeaponCost(armorEntryWeapon)
+                        : 0;
+                    plan = EnsurePistolArmor(candidate with
+                    {
+                        SecondaryWeapon = null,
+                        Utility = Array.Empty<string>(),
+                        BuysDefuser = false,
+                        EstimatedCost = Math.Max(0, candidate.EstimatedCost - armorEntryCost),
+                    }, currentArmor, ArmorLevel.Half);
+                    break;
+                case PistolBuyRole.Firepower:
+                    if (candidate.SecondaryWeapon is null)
+                        continue;
+                    plan = EnsurePistolArmor(candidate with
+                    {
+                        Utility = Array.Empty<string>(),
+                        BuysDefuser = false,
+                    }, currentArmor, ArmorLevel.Half);
+                    break;
+                case PistolBuyRole.UtilitySupport:
+                    plan = AddPistolUtility(
+                        candidate with
+                        {
+                            SecondaryWeapon = null,
+                            EstimatedCost = Math.Max(0, candidate.EstimatedCost
+                                - (candidate.SecondaryWeapon is { } supportWeapon
+                                    ? BuyPlanner.GetWeaponCost(supportWeapon)
+                                    : 0)),
+                        },
+                        money,
+                        currentUtility,
+                        smoke: true,
+                        flash: true);
+                    break;
+                case PistolBuyRole.DefuserSupport:
+                    plan = AddPistolUtility(
+                        candidate with
+                        {
+                            SecondaryWeapon = null,
+                            EstimatedCost = Math.Max(0, candidate.EstimatedCost
+                                - (candidate.SecondaryWeapon is { } defuserWeapon
+                                    ? BuyPlanner.GetWeaponCost(defuserWeapon)
+                                    : 0)),
+                        },
+                        money,
+                        currentUtility,
+                        smoke: true,
+                        flash: false);
+                    if (side == TeamSide.CounterTerrorist
+                        && !currentHasDefuser
+                        && money - plan.EstimatedCost >= DefuserPrice)
+                    {
+                        plan = plan with
+                        {
+                            BuysDefuser = true,
+                            EstimatedCost = plan.EstimatedCost + DefuserPrice,
+                        };
+                    }
+                    break;
+            }
+
+            if (plan.EstimatedCost <= money && BuyPlanner.IsCombatLegal(plan))
+                rolePlans.Add(plan);
+        }
+
+        return rolePlans.Count > 0
+            ? DistinctPlans(rolePlans)
+            : candidates;
+    }
+
+    private static PlayerBuyPlan AddPistolUtility(
+        PlayerBuyPlan plan,
+        int money,
+        IReadOnlyDictionary<string, int>? currentUtility,
+        bool smoke,
+        bool flash)
+    {
+        var utility = new List<string>(plan.Utility);
+        int cost = plan.EstimatedCost;
+        void Add(string name, int price)
+        {
+            if ((currentUtility?.GetValueOrDefault(name) ?? 0) > 0
+                || money - cost < price)
+                return;
+            utility.Add(name);
+            cost += price;
+        }
+
+        if (smoke) Add("smoke", SmokePrice);
+        if (flash) Add("flash", FlashPrice);
+        return plan with
+        {
+            Utility = utility,
+            EstimatedCost = cost,
+            Tier = GetTier(plan.ArmorLevel, plan.PrimaryWeapon, plan.SecondaryWeapon),
+        };
+    }
+
+    private static PlayerBuyPlan EnsurePistolArmor(
+        PlayerBuyPlan plan,
+        ArmorLevel currentArmor,
+        ArmorLevel minimumArmor)
+    {
+        ArmorLevel targetArmor = (ArmorLevel)Math.Max(
+            (int)currentArmor,
+            Math.Max((int)plan.ArmorLevel, (int)minimumArmor));
+        int armorDelta = GetArmorUpgradeCost(plan.ArmorLevel, targetArmor);
+        return plan with
+        {
+            ArmorLevel = targetArmor,
+            EstimatedCost = plan.EstimatedCost + armorDelta,
+            Tier = GetTier(targetArmor, plan.PrimaryWeapon, plan.SecondaryWeapon),
+        };
     }
 
     private readonly record struct PistolOption(
@@ -1654,17 +1422,28 @@ public static class BuyPlanner
         IReadOnlyDictionary<string, int>? currentUtility,
         PurchaseIntent purchaseIntent = PurchaseIntent.Standard)
     {
-        ArmorLevel armor = (ArmorLevel)Math.Max((int)currentArmor, (int)targetArmor);
+        ArmorLevel requestedArmor = (ArmorLevel)Math.Max(
+            (int)currentArmor,
+            (int)targetArmor);
         int remaining = money;
         int cost = 0;
 
-        bool buysHelmet = ShouldBuyHelmet(
+        bool requestsHelmet = ShouldBuyHelmet(
             side,
             phase,
             requireHelmet,
             opponentEcoLikely,
             currentHasHelmet)
-            && armor == ArmorLevel.Full;
+            && requestedArmor == ArmorLevel.Full;
+        // ArmorLevel.Full means full armor in the executable plan, not a
+        // discounted full-buy package. CT rifle rounds may intentionally skip
+        // the helmet against rifles, in which case the actual loadout is Half.
+        ArmorLevel armor = requestedArmor == ArmorLevel.Full
+            && !currentHasHelmet
+            && !requestsHelmet
+            ? ArmorLevel.Half
+            : requestedArmor;
+        bool buysHelmet = requestsHelmet && armor == ArmorLevel.Full;
         ArmorLevel bodyArmor = armor == ArmorLevel.Full ? ArmorLevel.Half : armor;
         cost += GetArmorUpgradeCost(currentArmor, bodyArmor);
         if (buysHelmet)
@@ -1717,6 +1496,9 @@ public static class BuyPlanner
         {
             Tier = GetTier(armor, primary, secondary),
             Intent = purchaseIntent,
+            ReplacePrimaryWeapon = shouldReplacePrimary && currentPrimary is not null
+                ? currentPrimary
+                : null,
         };
 
         void AddUtility(string name, int price, int targetCount)
@@ -1862,49 +1644,19 @@ public static class RoundSchedule
         return roundsPlayed >= maxRounds;
     }
 
-    public static bool IsMatchPoint(
-        int teamScore,
-        int opponentScore,
-        int roundsPlayed,
-        int maxRounds = 24,
-        int overtimeMaxRounds = 6)
-    {
-        if (teamScore <= opponentScore || roundsPlayed < 0)
-            return false;
-
-        maxRounds = maxRounds > 0 ? maxRounds : 24;
-        overtimeMaxRounds = overtimeMaxRounds > 0 ? overtimeMaxRounds : 6;
-        int regulationTarget = Math.Max(1, maxRounds / 2);
-        int regulationWinScore = regulationTarget + 1;
-
-        if (roundsPlayed < maxRounds)
-        {
-            // A team one round short of the regulation win target can close
-            // the match in the next round. This is score-driven, not tied to
-            // the 23rd round or a 12-12 boundary.
-            return teamScore == regulationWinScore - 1;
-        }
-
-        int overtimeHalf = Math.Max(1, overtimeMaxRounds / 2);
-        int overtimeBlock = (roundsPlayed - maxRounds) / overtimeMaxRounds;
-        int blockBaseScore = regulationTarget + overtimeBlock * overtimeHalf;
-        int teamOvertimeWins = teamScore - blockBaseScore;
-        int opponentOvertimeWins = opponentScore - blockBaseScore;
-        int overtimeWinScore = overtimeHalf + 1;
-
-        // One OT round lead is not enough to be match point. In a standard
-        // 6-round OT, 15-12 or 15-14 is match point; 13-12 is not.
-        return teamOvertimeWins == overtimeWinScore - 1
-            && opponentOvertimeWins < overtimeWinScore;
-    }
-
     public static bool IsLastRegulationRound(
         int teamScore,
         int opponentScore,
         int roundsPlayed,
         int maxRounds = 24)
         => roundsPlayed == Math.Max(0, maxRounds - 1)
-            && IsMatchPoint(teamScore, opponentScore, roundsPlayed, maxRounds);
+            && MatchPressurePolicy.Evaluate(
+                teamScore,
+                opponentScore,
+                roundsPlayed,
+                new MatchFormatSnapshot(maxRounds, true, 6),
+                economySwing: false)
+                .IsMustWin;
 
     public static bool IsFirstRoundOfHalf(
         int roundsPlayed,
@@ -2166,7 +1918,8 @@ public sealed record RoundContext(
     public bool RetakePathViable { get; init; } = true;
     public bool RetakePathKnown { get; init; } = true;
     public bool BombTimerKnown { get; init; } = true;
-    public bool IsMatchPoint { get; init; }
+    public MatchPressure Pressure { get; init; } = MatchPressure.Normal;
+    public CtThreatEvaluation Threat { get; init; }
 }
 
 public sealed record RetakeContext(
@@ -2181,7 +1934,7 @@ public sealed record RetakeContext(
     int TUtility,
     int TeamScore,
     int OpponentScore,
-    bool IsMatchPoint,
+    MatchPressure Pressure,
     bool PathViable,
     int BotWeaponValue)
 {
@@ -2220,7 +1973,8 @@ public static class RetakeDecisionPolicy
             ? -8
             : context.PathViable ? 18 : -55;
 
-        if (context.IsMatchPoint || context.TeamScore < context.OpponentScore)
+        bool mustWin = context.Pressure is MatchPressure.Clinch or MatchPressure.Elimination;
+        if (mustWin || context.TeamScore < context.OpponentScore)
             current += 18;
 
         int nextRound = Math.Clamp(context.BotWeaponValue, 0, 12) * 7;
@@ -2233,7 +1987,7 @@ public static class RetakeDecisionPolicy
                 && context.CtDefusers == 0)
             || (context.AliveCt == 1 && context.AliveT >= 3);
         bool shouldRetake = !impossible
-            && (current >= 50 || current + 5 >= nextRound || context.IsMatchPoint);
+            && (current >= 50 || current + 5 >= nextRound || mustWin);
         string reason = shouldRetake
             ? $"retake-score-{current}-vs-save-{nextRound}"
             : impossible
@@ -2264,6 +2018,7 @@ public static class TPostPlantExecutionPolicy
     public static TPostPlantTargetKind TargetKind(TPostPlantAction action)
         => action switch
         {
+            TPostPlantAction.Hold => TPostPlantTargetKind.Site,
             TPostPlantAction.MoveToSite => TPostPlantTargetKind.Site,
             TPostPlantAction.RetreatFromBomb => TPostPlantTargetKind.Retreat,
             _ => TPostPlantTargetKind.None,
@@ -2450,7 +2205,8 @@ public sealed record CtContact(
 public sealed record CtDeathEvent(
     int VictimSlot,
     CtRole VictimRole,
-    float RecordedAt);
+    float RecordedAt,
+    CtGambleSite Site = CtGambleSite.None);
 
 public sealed record CtTacticalDecision(
     int Slot,
@@ -2475,13 +2231,13 @@ public sealed class CompetitiveTacticalRuntime
     private const float ContactLifetime = 4f;
     private const float SameGroupDeathWindow = 3.5f;
 
-    private readonly CompetitiveTacticalDirector _director = new();
     private readonly Dictionary<int, CtRole> _roles = new();
     private readonly Dictionary<int, CtBotSnapshot> _bots = new();
     private readonly Dictionary<int, float> _probeStartedAt = new();
     private readonly Dictionary<int, float> _probeEndedAt = new();
     private readonly Dictionary<int, CtContact> _contactsByBot = new();
     private readonly List<CtDeathEvent> _recentDeaths = new();
+    private CtEcoPlan? _ecoPlan;
     private float _liveStartedAt;
     private RoundContext _context = new(
         0, 1, 0, 0, false, 0, false, null, 5, 5, RoundPhase.Freeze);
@@ -2499,6 +2255,7 @@ public sealed class CompetitiveTacticalRuntime
         _probeEndedAt.Clear();
         _contactsByBot.Clear();
         _recentDeaths.Clear();
+        _ecoPlan = null;
         _lastContact = context.LastContact;
         _liveStartedAt = 0f;
     }
@@ -2590,6 +2347,9 @@ public sealed class CompetitiveTacticalRuntime
         _context = _context with { CtTeamHasDefuser = hasDefuser };
     }
 
+    public void SetThreat(CtThreatEvaluation threat)
+        => _context = _context with { Threat = threat };
+
     public void SetRetakeInfo(
         int bombSecondsRemaining,
         int ctWeaponTier,
@@ -2597,7 +2357,7 @@ public sealed class CompetitiveTacticalRuntime
         int ctUtilityCount,
         int opponentUtilityCount,
         bool pathViable,
-        bool isMatchPoint,
+        MatchPressure pressure,
         bool bombTimerKnown = true,
         bool pathKnown = true)
     {
@@ -2611,7 +2371,7 @@ public sealed class CompetitiveTacticalRuntime
             RetakePathViable = pathViable,
             BombTimerKnown = bombTimerKnown,
             RetakePathKnown = pathKnown,
-            IsMatchPoint = isMatchPoint,
+            Pressure = pressure,
         };
     }
 
@@ -2623,6 +2383,33 @@ public sealed class CompetitiveTacticalRuntime
             return;
 
         _context = _context with { SelectedGambleSite = site };
+        if (_ecoPlan is null && _bots.Count > 0)
+        {
+            // A plan submitted by the new coordinator always wins. This
+            // small in-memory plan only keeps direct Core/runtime callers
+            // deterministic before the first background result arrives.
+            _ecoPlan = new CtEcoPlan(
+                CtEcoTactic.FourPlusOneGamble,
+                site,
+                _bots.Values
+                    .OrderBy(bot => bot.Slot)
+                    .Select(bot => new CtEcoAssignment(
+                        bot.Slot,
+                        CtEcoRole.Crossfire,
+                        site,
+                        Math.Abs(bot.Slot) % 4,
+                        IsEntry: false,
+                        KeepBackdoor: bot.Slot == _bots.Keys.Max()))
+                    .ToArray(),
+                "runtime-site-anchor");
+        }
+    }
+
+    public void SetEcoPlan(CtEcoPlan? plan)
+    {
+        _ecoPlan = plan;
+        if (plan is not null)
+            _context = _context with { SelectedGambleSite = plan.Site };
     }
 
     public void SetPhase(RoundPhase phase, float liveStartedAt = -1f)
@@ -2681,12 +2468,15 @@ public sealed class CompetitiveTacticalRuntime
         }
     }
 
-    public void RecordCtDeath(int victimSlot, float now)
+    public void RecordCtDeath(
+        int victimSlot,
+        float now,
+        CtGambleSite site = CtGambleSite.None)
     {
         if (!_roles.TryGetValue(victimSlot, out var role))
             return;
 
-        _recentDeaths.Add(new CtDeathEvent(victimSlot, role, now));
+        _recentDeaths.Add(new CtDeathEvent(victimSlot, role, now, site));
         _context = _context with
         {
             AliveTeam = Math.Max(0, _context.AliveTeam - 1),
@@ -2711,66 +2501,44 @@ public sealed class CompetitiveTacticalRuntime
         _context = _context with { ActiveProbeCount = _probeStartedAt.Count };
     }
 
-    public IReadOnlyList<CtTacticalDecision> DecideAll(float now)
+    public CtTacticalContext CreatePlanningSnapshot(float now)
     {
         Prune(now);
         EnsureOpeningProbe(now);
 
-        var effectiveContacts = _contactsByBot
+        var contacts = _contactsByBot
             .Select(entry => (entry.Key, Contact: EffectiveContact(entry.Value, now)))
             .Where(entry => entry.Contact is not null)
             .ToDictionary(entry => entry.Key, entry => entry.Contact!);
-        var effectiveContact = effectiveContacts.Values
+        var effectiveContact = contacts.Values
             .OrderByDescending(contact => contact.RecordedAt)
             .FirstOrDefault();
-        _context = _context with
+        var round = _context with
         {
             LastContact = effectiveContact,
             ActiveProbeCount = _probeStartedAt.Count,
             LiveElapsedSeconds = Math.Max(0f, now - _liveStartedAt),
         };
 
-        var tacticalContext = new CtTacticalContext(
-            _context,
+        // The worker receives only immutable snapshots. Every collection is
+        // copied here so event handlers can continue updating runtime state on
+        // the game thread without racing the planner.
+        return new CtTacticalContext(
+            round,
             _bots.Values.ToArray(),
-            _roles,
+            new Dictionary<int, CtRole>(_roles),
             _recentDeaths.ToArray(),
-            effectiveContacts,
-            _probeStartedAt,
-            _probeEndedAt,
-            now);
-
-        var decisions = _bots.Values
-            .Select(bot => _director.DecideCt(bot, tacticalContext))
-            .ToList();
-
-        int budget = decisions.Count == 0
-            ? 0
-            : decisions.Max(decision => decision.ActiveBudget);
-        var active = decisions
-            .Where(decision => decision.IsActive)
-            .OrderByDescending(decision => DecisionPriority(decision.State))
-            .ThenByDescending(decision => _bots[decision.Slot].Aggression)
-            .ThenBy(decision => decision.Slot)
-            .ToList();
-
-        if (active.Count > budget)
-        {
-            var allowed = active.Take(budget).Select(decision => decision.Slot).ToHashSet();
-            for (int i = 0; i < decisions.Count; i++)
-            {
-                if (decisions[i].IsActive && !allowed.Contains(decisions[i].Slot))
-                    decisions[i] = decisions[i] with { IsActive = false };
-            }
-        }
-
-        return decisions;
+            contacts,
+            new Dictionary<int, float>(_probeStartedAt),
+            new Dictionary<int, float>(_probeEndedAt),
+            now,
+            _ecoPlan);
     }
 
     private void EnsureOpeningProbe(float now)
     {
         if (_context.Phase != RoundPhase.Live
-            || ActiveBudget() <= 0
+            || !HasOpeningProbeBudget()
             || _probeStartedAt.Count > 0
             || now - _liveStartedAt < 15f)
             return;
@@ -2782,6 +2550,11 @@ public sealed class CompetitiveTacticalRuntime
         if (candidate >= 0)
             StartInformationProbe(candidate, now);
     }
+
+    private bool HasOpeningProbeBudget()
+        => _context.CtBuyPhase is not BuyPhase.Save
+            && _context.Phase is not RoundPhase.Save
+            && _context.AliveTeam > 0;
 
     private void Prune(float now)
     {
@@ -2824,18 +2597,55 @@ public sealed class CompetitiveTacticalRuntime
         };
     }
 
-    private int ActiveBudget()
-        => _context.Phase switch
+}
+
+public sealed record CtTacticalContext(
+    RoundContext Round,
+    IReadOnlyList<CtBotSnapshot> Bots,
+    IReadOnlyDictionary<int, CtRole> Roles,
+    IReadOnlyList<CtDeathEvent> RecentCtDeaths,
+    IReadOnlyDictionary<int, CtContact> ContactsByBot,
+    IReadOnlyDictionary<int, float> ProbeStartedAt,
+    IReadOnlyDictionary<int, float> ProbeEndedAt,
+    float Now,
+    CtEcoPlan? EcoPlan = null)
+{
+    public CtContact? ContactFor(int botSlot)
+        => ContactsByBot.TryGetValue(botSlot, out var contact) ? contact : null;
+}
+
+public static class CtTacticalDecisionPlanner
+{
+    public static IReadOnlyList<CtTacticalDecision> Plan(CtTacticalContext context)
+    {
+        var director = new CompetitiveTacticalDirector();
+        var decisions = context.Bots
+            .Select(bot => director.DecideCt(bot, context))
+            .ToList();
+
+        int budget = decisions.Count == 0
+            ? 0
+            : decisions.Max(decision => decision.ActiveBudget);
+        var active = decisions
+            .Where(decision => decision.IsActive)
+            .OrderByDescending(decision => DecisionPriority(decision.State))
+            .ThenByDescending(decision => context.Bots
+                .First(bot => bot.Slot == decision.Slot).Aggression)
+            .ThenBy(decision => decision.Slot)
+            .ToList();
+
+        if (active.Count <= budget)
+            return decisions;
+
+        var allowed = active.Take(budget).Select(decision => decision.Slot).ToHashSet();
+        for (int index = 0; index < decisions.Count; index++)
         {
-            RoundPhase.Save => 0,
-            RoundPhase.BombPlanted or RoundPhase.Retake => _bots.Count,
-            _ => _context.CtBuyPhase switch
-            {
-                BuyPhase.Save => 0,
-                BuyPhase.HalfBuy or BuyPhase.ForceBuy or BuyPhase.Eco => 2,
-                _ => 1,
-            },
-        };
+            if (decisions[index].IsActive && !allowed.Contains(decisions[index].Slot))
+                decisions[index] = decisions[index] with { IsActive = false };
+        }
+
+        return decisions;
+    }
 
     private static int DecisionPriority(CtTacticalState state)
         => state switch
@@ -2847,20 +2657,6 @@ public sealed class CompetitiveTacticalRuntime
             CtTacticalState.Withdraw => 20,
             _ => 0,
         };
-}
-
-public sealed record CtTacticalContext(
-    RoundContext Round,
-    IReadOnlyList<CtBotSnapshot> Bots,
-    IReadOnlyDictionary<int, CtRole> Roles,
-    IReadOnlyList<CtDeathEvent> RecentCtDeaths,
-    IReadOnlyDictionary<int, CtContact> ContactsByBot,
-    IReadOnlyDictionary<int, float> ProbeStartedAt,
-    IReadOnlyDictionary<int, float> ProbeEndedAt,
-    float Now)
-{
-    public CtContact? ContactFor(int botSlot)
-        => ContactsByBot.TryGetValue(botSlot, out var contact) ? contact : null;
 }
 
 public enum BotInfoSource
@@ -3034,7 +2830,6 @@ public sealed class CompetitiveTacticalDirector : ITacticalDirector
         var contact = context.ContactFor(bot.Slot);
         bool reliableContact = contact != null
             && contact.Confidence is ContactConfidence.Medium or ContactConfidence.High;
-        bool probeCompleted = context.ProbeEndedAt.Count > 0;
 
         if (context.Round.BombPlanted
             || context.Round.Phase is RoundPhase.BombPlanted or RoundPhase.Retake)
@@ -3051,7 +2846,7 @@ public sealed class CompetitiveTacticalDirector : ITacticalDirector
                 context.Round.OpponentUtilityCount,
                 context.Round.TeamScore,
                 context.Round.OpponentScore,
-                context.Round.IsMatchPoint,
+                context.Round.Pressure,
                 context.Round.RetakePathViable,
                 bot.HasValuableWeapon ? 10 : 4)
             {
@@ -3079,10 +2874,28 @@ public sealed class CompetitiveTacticalDirector : ITacticalDirector
         }
 
         bool responderRole = role is CtRole.Rotator or CtRole.Information or CtRole.Playmaker;
+        bool hasLowThreat = context.Round.Threat.SiteA >= CtThreatLevel.Low
+            || context.Round.Threat.SiteB >= CtThreatLevel.Low
+            || context.Round.Threat.Mid >= CtThreatLevel.Low;
+        if (hasLowThreat && responderRole)
+        {
+            return Decision(bot, role, CtTacticalState.Rotate, activeBudget,
+                isActive: true, shouldRepath: true, shouldRun: true,
+                context.Round.Threat.Mid >= CtThreatLevel.Low
+                    ? "mid-threat-pre-rotate"
+                    : "site-threat-pre-rotate") with
+            {
+                TargetSite = ResolveThreatSite(context, contact),
+            };
+        }
+
         if (context.RecentCtDeaths.Count > 0 && responderRole)
         {
             return Decision(bot, role, CtTacticalState.Rotate, activeBudget,
-                isActive: true, shouldRepath: true, shouldRun: true, "ct-death");
+                isActive: true, shouldRepath: true, shouldRun: true, "ct-death") with
+            {
+                TargetSite = ResolveThreatSite(context, contact),
+            };
         }
 
         bool isProbe = context.ProbeStartedAt.TryGetValue(bot.Slot, out float probeStartedAt);
@@ -3099,92 +2912,61 @@ public sealed class CompetitiveTacticalDirector : ITacticalDirector
                 isActive: false, shouldRepath: false, shouldRun: false, "probe-timeout");
         }
 
-        var gambleDecision = CtGamblePolicy.Evaluate(
-            BotMatchProfile.Competitive,
-            context.Round.CtBuyPhase,
-            context.Round.Phase,
-            context.Round.SelectedGambleSite,
-            contact?.Site ?? CtGambleSite.None,
-            reliableContact,
-            context.Round.LiveElapsedSeconds,
-            bot.HasValuableWeapon,
-            context.Round.AliveTeam);
-        if (gambleDecision.Enabled)
+        var ecoAssignment = context.EcoPlan?.Assignments
+            .FirstOrDefault(assignment => assignment.Slot == bot.Slot);
+        if (ecoAssignment is not null
+            && context.Round.Phase == RoundPhase.Live
+            && context.Round.CtBuyPhase is BuyPhase.Pistol or BuyPhase.Eco or BuyPhase.HalfBuy or BuyPhase.ForceBuy)
         {
-            if (gambleDecision.Stage == CtGambleStage.Save)
+            bool otherSiteContact = reliableContact
+                && contact?.Site is CtGambleSite.A or CtGambleSite.B
+                && contact.Site != ecoAssignment.Site;
+            if (!otherSiteContact
+                && context.Round.Threat.ConfirmedSite is CtGambleSite.A or CtGambleSite.B
+                && context.Round.Threat.ConfirmedSite != ecoAssignment.Site
+                && responderRole)
             {
-                return Decision(bot, role, CtTacticalState.Save, 0,
-                    isActive: false, shouldRepath: true, shouldRun: true,
-                    gambleDecision.Reason) with
+                return Decision(bot, role, CtTacticalState.Rotate, activeBudget,
+                    isActive: true, shouldRepath: true, shouldRun: true,
+                    "confirmed-site-threat") with
                 {
-                    TargetSite = gambleDecision.Site,
-                    ShouldMoveToRetreat = true,
-                    PreserveWeapon = gambleDecision.PreserveWeapon,
+                    TargetSite = context.Round.Threat.ConfirmedSite,
+                };
+            }
+            if (otherSiteContact && responderRole)
+            {
+                return Decision(bot, role, CtTacticalState.Rotate, activeBudget,
+                    isActive: true, shouldRepath: true, shouldRun: true,
+                    "threat-site-rotation") with
+                {
+                    TargetSite = contact!.Site,
                 };
             }
 
-            if (gambleDecision.Stage == CtGambleStage.Withdraw)
+            CtTacticalState state = ecoAssignment.Role is CtEcoRole.Information
+                or CtEcoRole.MidControl
+                ? CtTacticalState.Information
+                : CtTacticalState.Hold;
+            return Decision(bot, role, state, 0,
+                isActive: false, shouldRepath: true, shouldRun: true,
+                $"eco-{context.EcoPlan!.Tactic}") with
             {
-                return Decision(bot, role, CtTacticalState.Withdraw, 0,
-                    isActive: false, shouldRepath: true, shouldRun: true,
-                    gambleDecision.Reason) with
-                {
-                    TargetSite = gambleDecision.Site,
-                    ShouldMoveToRetreat = true,
-                    PreserveWeapon = gambleDecision.PreserveWeapon,
-                };
-            }
-
-            if (gambleDecision.Stage == CtGambleStage.Rotate)
-            {
-                bool canRotate = role is CtRole.Information
-                    or CtRole.Rotator
-                    or CtRole.Playmaker;
-                if (canRotate && contact?.Site is CtGambleSite.A or CtGambleSite.B)
-                {
-                    return Decision(bot, role, CtTacticalState.Rotate, gambleDecision.RotationBudget,
-                        isActive: true, shouldRepath: true, shouldRun: true,
-                        gambleDecision.Reason) with
-                    {
-                        TargetSite = contact.Site,
-                    };
-                }
-
-                return Decision(bot, role, CtTacticalState.Hold, 0,
-                    isActive: false, shouldRepath: false, shouldRun: true,
-                    "gambled-site-hold") with
-                {
-                    TargetSite = gambleDecision.Site,
-                    ShouldMoveToGambleSite = true,
-                };
-            }
-
-            return Decision(bot, role, CtTacticalState.Hold, 0,
-                isActive: false, shouldRepath: false, shouldRun: true,
-                gambleDecision.Reason) with
-            {
-                TargetSite = gambleDecision.Site,
-                ShouldMoveToGambleSite = gambleDecision.Stage is CtGambleStage.Stack or CtGambleStage.Hold,
+                TargetSite = ecoAssignment.Site,
+                ShouldMoveToGambleSite = true,
             };
         }
 
-        var saveDecision = CtSavePolicy.Evaluate(
-            BotMatchProfile.Competitive,
-            context.Round.CtBuyPhase,
-            context.Round.Phase,
-            context.Round.BombPlanted,
-            context.Round.AliveTeam,
-            context.Round.AliveOpponent,
-            bot.HasValuableWeapon,
-            context.Round.CtTeamHasDefuser,
-            reliableContact,
-            probeCompleted,
-            context.Round.LiveElapsedSeconds);
-        if (saveDecision.ShouldSave)
+        bool shouldSaveEconomyWeapon = context.Round.Pressure != MatchPressure.Elimination
+            && context.Round.CtBuyPhase is BuyPhase.Eco or BuyPhase.HalfBuy
+            && context.Round.AliveTeam <= 2
+            && context.Round.AliveOpponent >= context.Round.AliveTeam + 2
+            && !reliableContact
+            && context.Round.LiveElapsedSeconds >= 4f;
+        if (shouldSaveEconomyWeapon)
         {
             return Decision(bot, role, CtTacticalState.Save, 0,
                 isActive: false, shouldRepath: false, shouldRun: false,
-                $"save-{saveDecision.Reason}");
+                "save-economy-man-disadvantage");
         }
 
         if (context.Round.Phase == RoundPhase.Save)
@@ -3216,7 +2998,14 @@ public sealed class CompetitiveTacticalDirector : ITacticalDirector
                     && role != breachedGroup.Value);
             return Decision(bot, role, CtTacticalState.Reinforce, activeBudget,
                 isActive: canReinforce, shouldRepath: canReinforce, shouldRun: canReinforce,
-                "same-group-deaths");
+                "same-group-deaths") with
+            {
+                TargetSite = context.RecentCtDeaths
+                    .Where(death => death.VictimRole == breachedGroup.Value)
+                    .OrderByDescending(death => death.RecordedAt)
+                    .Select(death => death.Site)
+                    .FirstOrDefault(site => site != CtGambleSite.None),
+            };
         }
 
         var economyCandidate = context.Bots
@@ -3240,7 +3029,10 @@ public sealed class CompetitiveTacticalDirector : ITacticalDirector
             if (responderRole)
             {
                 return Decision(bot, role, CtTacticalState.Rotate, activeBudget,
-                    isActive: true, shouldRepath: true, shouldRun: true, "reliable-contact");
+                    isActive: true, shouldRepath: true, shouldRun: true, "reliable-contact") with
+                {
+                    TargetSite = contact?.Site ?? CtGambleSite.None,
+                };
             }
 
             return Decision(bot, economyPlaymaker ? CtRole.Playmaker : role,
@@ -3259,6 +3051,56 @@ public sealed class CompetitiveTacticalDirector : ITacticalDirector
 
         return Decision(bot, role, CtTacticalState.Hold, activeBudget,
             isActive: false, shouldRepath: false, shouldRun: false, "no-reliable-contact");
+    }
+
+    private static CtGambleSite ResolveThreatSite(
+        CtTacticalContext context,
+        CtContact? contact)
+    {
+        CtThreatLevel siteA = context.Round.Threat.SiteA;
+        CtThreatLevel siteB = context.Round.Threat.SiteB;
+        if (siteA > CtThreatLevel.None || siteB > CtThreatLevel.None)
+        {
+            // Site evidence is more specific than a generic contact or the
+            // previously selected gamble. Route to the stronger site first;
+            // use the contact/fallback only when both site levels tie.
+            if (siteA > siteB)
+                return CtGambleSite.A;
+            if (siteB > siteA)
+                return CtGambleSite.B;
+
+            if (contact?.Site is CtGambleSite.A or CtGambleSite.B)
+                return contact.Site;
+
+            if (context.Round.SelectedGambleSite is CtGambleSite.A or CtGambleSite.B)
+                return context.Round.SelectedGambleSite;
+
+            return CtGambleSite.A;
+        }
+
+        if (contact?.Site is CtGambleSite.A or CtGambleSite.B)
+            return contact.Site;
+
+        // Mid/connector information has no bomb site of its own. Route the
+        // responder to the weaker site anchor so the main-thread executor
+        // always receives an actionable A/B target instead of a nameless
+        // Rotate decision.
+        if (context.Round.Threat.Mid >= CtThreatLevel.Medium)
+        {
+            return context.Round.Threat.SiteA <= context.Round.Threat.SiteB
+                ? CtGambleSite.A
+                : CtGambleSite.B;
+        }
+
+        CtGambleSite deathSite = context.RecentCtDeaths
+            .OrderByDescending(death => death.RecordedAt)
+            .Select(death => death.Site)
+            .FirstOrDefault(site => site is CtGambleSite.A or CtGambleSite.B);
+        return deathSite is CtGambleSite.A or CtGambleSite.B
+            ? deathSite
+            : context.Round.SelectedGambleSite is CtGambleSite.A or CtGambleSite.B
+                ? context.Round.SelectedGambleSite
+                : CtGambleSite.A;
     }
 
     public IReadOnlyDictionary<int, CtRole> AssignCtRoles(

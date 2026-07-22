@@ -902,13 +902,31 @@ public class NadeSystemPlugin : BasePlugin
             _earlySmokeCountByTeam.TryGetValue(bot.TeamNum, out int cnt);
             _earlySmokeCountByTeam[bot.TeamNum] = cnt + 1;
         }
-        SpawnProjectile(bot, g);
+        SpawnProjectile(
+            bot,
+            g,
+            spawned =>
+            {
+                if (spawned) return;
+                RefundUtility(bot, gtype);
+                _replayBots.Remove((uint)bot.Index);
+                RemoveCooldown(g.Id);
+                DecrementCount(gtype, bot.TeamNum);
+                if (_botNadesMode == "normal" && gtype == "smoke"
+                    && _earlySmokeCountByTeam.TryGetValue(bot.TeamNum, out int earlyCount))
+                {
+                    _earlySmokeCountByTeam[bot.TeamNum] = Math.Max(0, earlyCount - 1);
+                }
+            });
 
         // Allow bot to throw another grenade after this window
         AddTimer(1f, () => _replayBots.Remove((uint)bot.Index));
     }
 
-    private void SpawnProjectile(CCSPlayerController bot, GrenadeData g)
+    private void SpawnProjectile(
+        CCSPlayerController bot,
+        GrenadeData g,
+        Action<bool>? onCompleted = null)
     {
         // ── Item definition indices (weapon_def_index) ────────────
         // The native Create() functions require the item def index.
@@ -939,12 +957,14 @@ public class NadeSystemPlugin : BasePlugin
 
         Server.NextFrame(() =>
         {
+            void Complete(bool spawned) => onCompleted?.Invoke(spawned);
             try
             {
                 var botPawn = bot.PlayerPawn?.Value;
                 if (botPawn == null || !botPawn.IsValid)
                 {
                     Server.PrintToConsole("[NadeSystem] bot pawn invalid, skipping replay");
+                    Complete(false);
                     return;
                 }
 
@@ -957,6 +977,7 @@ public class NadeSystemPlugin : BasePlugin
                     if (flash == null)
                     {
                         Server.PrintToConsole("[NadeSystem] flash CreateEntityByName null");
+                        Complete(false);
                         return;
                     }
                     flash.TeamNum             = teamNum;
@@ -987,6 +1008,7 @@ public class NadeSystemPlugin : BasePlugin
                         $"bot=[{bot.PlayerName}] " +
                         $"origin=({origin.X:F0},{origin.Y:F0},{origin.Z:F0}) " +
                         $"vel=({velocity.X:F1},{velocity.Y:F1},{velocity.Z:F1})");
+                    Complete(true);
                     return;
                 }
 
@@ -997,6 +1019,7 @@ public class NadeSystemPlugin : BasePlugin
                     if (decoy == null)
                     {
                         Server.PrintToConsole("[NadeSystem] decoy CreateEntityByName null");
+                        Complete(false);
                         return;
                     }
                     decoy.TeamNum             = teamNum;
@@ -1019,6 +1042,7 @@ public class NadeSystemPlugin : BasePlugin
                         $"[NadeSystem] Replayed [decoy] id={g.Id[..8]}... " +
                         $"bot=[{bot.PlayerName}] " +
                         $"origin=({origin.X:F0},{origin.Y:F0},{origin.Z:F0})");
+                    Complete(true);
                     return;
                 }
 
@@ -1036,6 +1060,7 @@ public class NadeSystemPlugin : BasePlugin
                     if (smoke == null || !smoke.IsValid)
                     {
                         Server.PrintToConsole("[NadeSystem] smoke native Create returned null");
+                        Complete(false);
                         return;
                     }
                     smoke.TeamNum             = teamNum;
@@ -1047,6 +1072,7 @@ public class NadeSystemPlugin : BasePlugin
                         $"bot=[{bot.PlayerName}] " +
                         $"origin=({origin.X:F0},{origin.Y:F0},{origin.Z:F0}) " +
                         $"vel=({velocity.X:F1},{velocity.Y:F1},{velocity.Z:F1})");
+                    Complete(true);
                     return;
                 }
 
@@ -1063,6 +1089,7 @@ public class NadeSystemPlugin : BasePlugin
                     if (he == null || !he.IsValid)
                     {
                         Server.PrintToConsole("[NadeSystem] HE native Create returned null");
+                        Complete(false);
                         return;
                     }
                     he.TeamNum             = teamNum;
@@ -1074,6 +1101,7 @@ public class NadeSystemPlugin : BasePlugin
                         $"bot=[{bot.PlayerName}] " +
                         $"origin=({origin.X:F0},{origin.Y:F0},{origin.Z:F0}) " +
                         $"vel=({velocity.X:F1},{velocity.Y:F1},{velocity.Z:F1})");
+                    Complete(true);
                     return;
                 }
 
@@ -1092,6 +1120,7 @@ public class NadeSystemPlugin : BasePlugin
                     if (molotov == null || !molotov.IsValid)
                     {
                         Server.PrintToConsole("[NadeSystem] molotov native Create returned null");
+                        Complete(false);
                         return;
                     }
                     molotov.TeamNum             = teamNum;
@@ -1103,15 +1132,18 @@ public class NadeSystemPlugin : BasePlugin
                         $"bot=[{bot.PlayerName}] " +
                         $"origin=({origin.X:F0},{origin.Y:F0},{origin.Z:F0}) " +
                         $"vel=({velocity.X:F1},{velocity.Y:F1},{velocity.Z:F1})");
+                    Complete(true);
                     return;
                 }
 
                 Server.PrintToConsole(
                     $"[NadeSystem] Unknown grenadeType '{g.GrenadeType}' for id {g.Id}");
+                Complete(false);
             }
             catch (Exception ex)
             {
                 Server.PrintToConsole($"[NadeSystem] SpawnProjectile error: {ex.Message}");
+                Complete(false);
             }
         });
     }
@@ -1306,7 +1338,36 @@ public class NadeSystemPlugin : BasePlugin
             _utilityLedgers[botIndex] = ledger;
         }
 
-        return ledger.TryConsume(type, source);
+        string item = grenadeType.ToLowerInvariant() switch
+        {
+            "smoke" => "weapon_smokegrenade",
+            "flash" => "weapon_flashbang",
+            "he" => "weapon_hegrenade",
+            "molotov" => bot.Team == CsTeam.CounterTerrorist
+                ? "weapon_incgrenade"
+                : "weapon_molotov",
+            "incgrenade" => "weapon_incgrenade",
+            _ => string.Empty,
+        };
+        int realCountBefore = item.Length == 0 ? 0 : CountRealUtility(bot, item);
+        if (realCountBefore <= 0)
+            return false;
+        if (!ledger.TryConsume(type, source))
+            return false;
+
+        try
+        {
+            bot.RemoveItemByDesignerName(item);
+            if (CountRealUtility(bot, item) == realCountBefore - 1)
+                return true;
+        }
+        catch
+        {
+            // Fall through to the ledger rollback below.
+        }
+
+        ledger.Refund(type);
+        return false;
     }
 
     private void RefundUtility(
@@ -1316,9 +1377,39 @@ public class NadeSystemPlugin : BasePlugin
         if (!TryGetUtilityType(grenadeType, out var type))
             return;
 
-        if (_utilityLedgers.TryGetValue((uint)bot.Index, out var ledger))
-            ledger.Refund(type);
+        if (!_utilityLedgers.TryGetValue((uint)bot.Index, out var ledger)
+            || !ledger.Refund(type))
+            return;
+
+        string item = grenadeType.ToLowerInvariant() switch
+        {
+            "smoke" => "weapon_smokegrenade",
+            "flash" => "weapon_flashbang",
+            "he" => "weapon_hegrenade",
+            "molotov" => bot.Team == CsTeam.CounterTerrorist
+                ? "weapon_incgrenade"
+                : "weapon_molotov",
+            "incgrenade" => "weapon_incgrenade",
+            _ => string.Empty,
+        };
+        if (item.Length == 0) return;
+        try
+        {
+            bot.GiveNamedItem(item);
+        }
+        catch
+        {
+            Server.PrintToConsole(
+                $"[NadeSystem] Utility rollback failed slot={bot.Index} item={item}");
+        }
     }
+
+    private static bool HasRealUtility(CCSPlayerController bot, string item)
+        => CountRealUtility(bot, item) > 0;
+
+    private static int CountRealUtility(CCSPlayerController bot, string item)
+        => bot.PlayerPawn?.Value?.WeaponServices?.MyWeapons
+            .Count(handle => handle.Value?.DesignerName == item) ?? 0;
 
     private void SynchronizeUtilityLedgers()
     {
@@ -2206,7 +2297,17 @@ public class NadeSystemPlugin : BasePlugin
             if (!TryConsumeUtility(victim, gt, UtilitySource.Retaliation)) continue;
 
             RegisterCooldown(g.Id, gt);
-            SpawnProjectile(victim, g);
+            SpawnProjectile(
+                victim,
+                g,
+                spawned =>
+                {
+                    if (spawned) return;
+                    RefundUtility(victim, gt);
+                    RemoveCooldown(g.Id);
+                    if (_botNadesMode == "normal")
+                        DecrementCount(gt, victim.TeamNum);
+                });
             // Normal mode: counts retaliation nades toward round limit.
             if (_botNadesMode == "normal") 
                 IncrementCount(gt, victim.TeamNum);

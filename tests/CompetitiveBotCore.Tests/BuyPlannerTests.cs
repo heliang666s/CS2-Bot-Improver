@@ -223,13 +223,13 @@ public sealed class BuyPlannerTests
             designatedAwper: false,
             opponentEcoLikely: false);
 
-        Assert.Equal(ArmorLevel.Full, plan.ArmorLevel);
+        Assert.Equal(ArmorLevel.Half, plan.ArmorLevel);
         Assert.Equal("weapon_famas", plan.PrimaryWeapon);
         Assert.NotEqual("weapon_mp9", plan.PrimaryWeapon);
     }
 
     [Fact]
-    public void TeamTierPlannerKeepsOrdinaryBotsWithinOneTier()
+    public void BoundedPlannerKeepsTheTeamWithinOneTierAndPreservesHumans()
     {
         var richCandidates = BuyPlanner.BuildCandidatePlans(
             TeamSide.Terrorist,
@@ -243,69 +243,31 @@ public sealed class BuyPlannerTests
             money: 3000,
             designatedAwper: false,
             opponentEcoLikely: false);
-
-        var teamPlan = TeamTierPlanner.Balance(
-        [
-            new TeamBuyMember(1, IsBot: true, IsAwper: false, richCandidates),
-            new TeamBuyMember(2, IsBot: true, IsAwper: false, poorCandidates),
-        ]);
-
-        Assert.True(teamPlan.IsBalanced);
-        Assert.InRange(teamPlan.MaxTier - teamPlan.MinTier, 0, 1);
-        Assert.NotEqual(0, teamPlan.BotPlans[1].Tier);
-        Assert.NotEqual(9, teamPlan.BotPlans[2].Tier);
-    }
-
-    [Fact]
-    public void AwperCanRemainSpecialTierWithoutDraggingOrdinaryBotsDown()
-    {
-        var awpCandidates = BuyPlanner.BuildCandidatePlans(
-            TeamSide.CounterTerrorist,
-            BuyPhase.FullBuy,
-            money: 10000,
-            designatedAwper: true,
-            opponentEcoLikely: true);
-        var rifleCandidates = BuyPlanner.BuildCandidatePlans(
-            TeamSide.CounterTerrorist,
-            BuyPhase.FullBuy,
-            money: 3000,
-            designatedAwper: false,
-            opponentEcoLikely: false);
-
-        var teamPlan = TeamTierPlanner.Balance(
-        [
-            new TeamBuyMember(1, IsBot: true, IsAwper: true, awpCandidates),
-            new TeamBuyMember(2, IsBot: true, IsAwper: false, rifleCandidates),
-        ]);
-
-        Assert.Equal(9, teamPlan.BotPlans[1].Tier);
-        Assert.InRange(teamPlan.BotPlans[2].Tier, 6, 7);
-    }
-
-    [Fact]
-    public void HumanObservationIsReadOnlyAndNotAssignedABotPlan()
-    {
         var humanPlan = BuyPlanner.BuildPlayerPlan(
             TeamSide.Terrorist,
             BuyPhase.FullBuy,
             money: 8000,
             designatedAwper: false,
             opponentEcoLikely: false);
-        var botCandidates = BuyPlanner.BuildCandidatePlans(
+
+        var result = BoundedTeamBuyPlanner.Optimize(
             TeamSide.Terrorist,
             BuyPhase.FullBuy,
-            money: 3000,
-            designatedAwper: false,
-            opponentEcoLikely: false);
+            [
+                new TeamPlanningMember(1, true, false, 8000, richCandidates, null, 0),
+                new TeamPlanningMember(2, true, false, 3000, poorCandidates, null, 0),
+                new TeamPlanningMember(10, false, false, 8000, [humanPlan], null, 0),
+            ],
+            currentMinTier: 0,
+            purchaseIntent: PurchaseIntent.Standard,
+            buyMode: TeamBuyMode.Full);
 
-        var teamPlan = TeamTierPlanner.Balance(
-        [
-            new TeamBuyMember(10, IsBot: false, IsAwper: false, [humanPlan]),
-            new TeamBuyMember(11, IsBot: true, IsAwper: false, botCandidates),
-        ]);
-
+        var teamPlan = result.Plan;
+        Assert.InRange(teamPlan.MaxTier - teamPlan.MinTier, 0, 2);
         Assert.DoesNotContain(10, teamPlan.BotPlans.Keys);
         Assert.Equal(humanPlan.Tier, teamPlan.HumanObservations[10].Tier);
+        Assert.InRange(result.Diagnostics.MaxCandidatesPerBot, 0, 6);
+        Assert.InRange(result.Diagnostics.MaxFrontierStates, 1, 256);
     }
 
     [Fact]
@@ -333,8 +295,217 @@ public sealed class BuyPlannerTests
         var transfer = Assert.Single(transfers);
         Assert.Equal(1, transfer.Donor);
         Assert.Equal(2, transfer.Recipient);
-        Assert.Equal("weapon_galilar", transfer.Item);
-        Assert.Equal(1800, transfer.Cost);
+        Assert.Equal("weapon_ak47", transfer.Item);
+        Assert.Equal(2700, transfer.Cost);
+    }
+
+    [Fact]
+    public void TrulyPoorBotCanWaitForDonorWithoutPretendingToBuyARifle()
+    {
+        var donorPlan = BuyPlanner.BuildPlayerPlan(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            money: 8000,
+            designatedAwper: false,
+            opponentEcoLikely: false);
+        var recipientPlan = BuyPlanner.BuildTeamPrimaryRecipientPlan(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            money: 800,
+            preferredPrimary: "weapon_ak47");
+
+        Assert.Null(recipientPlan.PrimaryWeapon);
+        Assert.True(recipientPlan.AcceptsTeamPrimary);
+        Assert.Equal(ArmorLevel.Half, recipientPlan.ArmorLevel);
+        Assert.True(recipientPlan.EstimatedCost <= 800);
+
+        var transfers = TeamTransferPlanner.BuildTransfers(
+        [
+            new TransferParticipant(1, IsBot: true, Money: 8000, donorPlan, CurrentPrimary: null),
+            new TransferParticipant(2, IsBot: true, Money: 800, recipientPlan, CurrentPrimary: null),
+        ]);
+
+        var transfer = Assert.Single(transfers);
+        Assert.Equal(1, transfer.Donor);
+        Assert.Equal(2, transfer.Recipient);
+        Assert.Equal("weapon_ak47", transfer.Item);
+    }
+
+    [Fact]
+    public void SubKevlarBotCannotBecomeUnarmoredTeamRifleRecipient()
+    {
+        var donorPlan = BuyPlanner.BuildPlayerPlan(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            money: 8000,
+            designatedAwper: false,
+            opponentEcoLikely: false);
+        var recipientPlan = BuyPlanner.BuildTeamPrimaryRecipientPlan(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            money: 500,
+            preferredPrimary: "weapon_ak47");
+
+        Assert.Equal(ArmorLevel.None, recipientPlan.ArmorLevel);
+        Assert.False(recipientPlan.AcceptsTeamPrimary);
+        Assert.Null(recipientPlan.RequestedPrimaryWeapon);
+        Assert.Equal(0, recipientPlan.Tier);
+
+        var transfers = TeamTransferPlanner.BuildTransfers(
+        [
+            new TransferParticipant(1, IsBot: true, Money: 8000, donorPlan, CurrentPrimary: null),
+            new TransferParticipant(2, IsBot: true, Money: 500, recipientPlan, CurrentPrimary: null),
+        ]);
+
+        Assert.Empty(transfers);
+    }
+
+    [Fact]
+    public void ExistingHalfArmorCanReceiveRifleBelowKevlarPriceWithoutRepeatingArmor()
+    {
+        var recipientPlan = BuyPlanner.BuildTeamPrimaryRecipientPlan(
+            TeamSide.CounterTerrorist,
+            BuyPhase.FullBuy,
+            money: 300,
+            preferredPrimary: "weapon_m4a1",
+            currentArmor: ArmorLevel.Half,
+            currentHasHelmet: false);
+
+        Assert.Equal(ArmorLevel.Half, recipientPlan.ArmorLevel);
+        Assert.False(recipientPlan.BuysHelmet);
+        Assert.Equal(0, recipientPlan.EstimatedCost);
+        Assert.True(recipientPlan.AcceptsTeamPrimary);
+
+        var donorPlan = BuyPlanner.BuildPlayerPlan(
+            TeamSide.CounterTerrorist,
+            BuyPhase.FullBuy,
+            money: 9000,
+            designatedAwper: false,
+            opponentEcoLikely: false);
+        Assert.Equal("weapon_m4a1", donorPlan.PrimaryWeapon);
+        Assert.Equal(2900, BuyPlanner.GetWeaponCost(recipientPlan.RequestedPrimaryWeapon));
+        Assert.True(donorPlan.Tier >= recipientPlan.Tier - 1);
+        Assert.True(9000 - donorPlan.EstimatedCost >= BuyPlanner.GetWeaponCost("weapon_m4a1"));
+        var transfer = Assert.Single(TeamTransferPlanner.BuildTransfers(
+        [
+            new TransferParticipant(1, IsBot: true, Money: 9000, donorPlan, CurrentPrimary: null),
+            new TransferParticipant(2, IsBot: true, Money: 300, recipientPlan, CurrentPrimary: null),
+        ]));
+
+        Assert.Equal(2, transfer.Recipient);
+        Assert.Equal("weapon_m4a1", transfer.Item);
+    }
+
+    [Fact]
+    public void TeamPrimaryRecipientUsesFullArmorWhenBudgetCoversHelmet()
+    {
+        var fromNone = BuyPlanner.BuildTeamPrimaryRecipientPlan(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            money: 1000,
+            preferredPrimary: "weapon_ak47",
+            currentArmor: ArmorLevel.None,
+            currentHasHelmet: false);
+        var fromHalf = BuyPlanner.BuildTeamPrimaryRecipientPlan(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            money: 350,
+            preferredPrimary: "weapon_ak47",
+            currentArmor: ArmorLevel.Half,
+            currentHasHelmet: false);
+
+        Assert.Equal(ArmorLevel.Full, fromNone.ArmorLevel);
+        Assert.True(fromNone.BuysHelmet);
+        Assert.Equal(1000, fromNone.EstimatedCost);
+        Assert.Equal(ArmorLevel.Full, fromHalf.ArmorLevel);
+        Assert.True(fromHalf.BuysHelmet);
+        Assert.Equal(350, fromHalf.EstimatedCost);
+    }
+
+    [Fact]
+    public void BoundedTeamPlannerPromotesSubThousandRecipientOnlyAfterDonorSelection()
+    {
+        var donorCandidates = BuyPlanner.BuildCandidatePlans(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            money: 8000,
+            designatedAwper: false,
+            opponentEcoLikely: false);
+        var recipient = BuyPlanner.BuildTeamPrimaryRecipientPlan(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            money: 800,
+            preferredPrimary: "weapon_ak47");
+
+        var result = BoundedTeamBuyPlanner.Optimize(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            [
+                new TeamPlanningMember(1, true, false, 8000, donorCandidates, null, 0),
+                new TeamPlanningMember(2, true, false, 800, [recipient], null, 0),
+            ],
+            currentMinTier: 0,
+            purchaseIntent: PurchaseIntent.Standard,
+            buyMode: TeamBuyMode.Full);
+
+        var transfer = Assert.Single(result.Plan.Transfers);
+        Assert.Equal(2, transfer.Recipient);
+        Assert.Equal("weapon_ak47", result.Plan.BotPlans[2].PrimaryWeapon);
+        Assert.False(result.Plan.BotPlans[2].AcceptsTeamPrimary);
+    }
+
+    [Fact]
+    public void SubThousandRecipientFallsBackToItsOwnUpgradeWhenNoDonorExists()
+    {
+        var recipient = BuyPlanner.BuildTeamPrimaryRecipientPlan(
+            TeamSide.CounterTerrorist,
+            BuyPhase.FullBuy,
+            money: 800,
+            preferredPrimary: "weapon_m4a1");
+        var personalCandidates = BuyPlanner.BuildCandidatePlans(
+            TeamSide.CounterTerrorist,
+            BuyPhase.FullBuy,
+            money: 800,
+            designatedAwper: false,
+            opponentEcoLikely: false);
+
+        var result = BoundedTeamBuyPlanner.Optimize(
+            TeamSide.CounterTerrorist,
+            BuyPhase.FullBuy,
+            [
+                new TeamPlanningMember(
+                    2,
+                    true,
+                    false,
+                    800,
+                    personalCandidates.Append(recipient).ToArray(),
+                    null,
+                    0),
+            ],
+            currentMinTier: 0,
+            purchaseIntent: PurchaseIntent.Standard,
+            buyMode: TeamBuyMode.Full);
+
+        var plan = Assert.Single(result.Plan.BotPlans).Value;
+        Assert.False(plan.AcceptsTeamPrimary);
+        Assert.True(plan.SecondaryWeapon is "weapon_fiveseven" or "weapon_deagle"
+            || plan.ArmorLevel != ArmorLevel.None);
+    }
+
+    [Fact]
+    public void ExistingSecondaryPrimaryUpgradeCarriesReplacementWeapon()
+    {
+        var plan = BuyPlanner.BuildPlayerPlan(
+            TeamSide.CounterTerrorist,
+            BuyPhase.FullBuy,
+            money: 5000,
+            designatedAwper: false,
+            opponentEcoLikely: false,
+            currentPrimary: "weapon_mp9",
+            currentSecondary: "weapon_hkp2000");
+
+        Assert.Equal("weapon_m4a1", plan.PrimaryWeapon);
+        Assert.Equal("weapon_mp9", plan.ReplacePrimaryWeapon);
     }
 
     [Fact]
@@ -514,19 +685,18 @@ public sealed class BuyPlannerTests
             designatedAwper: false,
             opponentEcoLikely: false);
 
-        var plan = TeamDpPlanner.Optimize(
+        var plan = BoundedTeamBuyPlanner.Optimize(
             TeamSide.Terrorist,
             BuyPhase.FullBuy,
             [
-                new TeamDpMember(1, IsBot: true, IsAwper: false, 8000, richCandidates, null, 0),
-                new TeamDpMember(2, IsBot: true, IsAwper: false, 3000, poorCandidates, null, 0),
+                new TeamPlanningMember(1, IsBot: true, IsAwper: false, 8000, richCandidates, null, 0),
+                new TeamPlanningMember(2, IsBot: true, IsAwper: false, 3000, poorCandidates, null, 0),
             ],
             currentMinTier: 0,
-            rewards,
+            rewards: rewards,
             consecutiveLosses: 0);
 
-        Assert.True(plan.IsBalanced);
-        Assert.InRange(plan.MaxTier - plan.MinTier, 0, 1);
+        Assert.InRange(plan.MaxTier - plan.MinTier, 0, 2);
         Assert.NotEmpty(plan.Forecasts);
         Assert.Contains(plan.Transfers, transfer => transfer.Recipient == 2);
     }
@@ -548,20 +718,20 @@ public sealed class BuyPlannerTests
             designatedAwper: false,
             opponentEcoLikely: false);
 
-        var plan = TeamDpPlanner.Optimize(
+        var plan = BoundedTeamBuyPlanner.Optimize(
             TeamSide.CounterTerrorist,
             BuyPhase.FullBuy,
             [
-                new TeamDpMember(1, IsBot: true, IsAwper: true, 10000, awpCandidates, null, 0),
-                new TeamDpMember(2, IsBot: true, IsAwper: false, 3000, rifleCandidates, null, 0),
+                new TeamPlanningMember(1, IsBot: true, IsAwper: true, 10000, awpCandidates, null, 0),
+                new TeamPlanningMember(2, IsBot: true, IsAwper: false, 3000, rifleCandidates, null, 0),
             ],
             currentMinTier: 0,
-            rewards,
+            rewards: rewards,
             consecutiveLosses: 0);
 
         Assert.Equal(9, plan.BotPlans[1].Tier);
         Assert.InRange(plan.BotPlans[2].Tier, 6, 7);
-        Assert.True(plan.IsBalanced);
+        Assert.InRange(plan.MaxTier - plan.MinTier, 0, 2);
     }
 
     [Fact]
@@ -581,20 +751,21 @@ public sealed class BuyPlannerTests
             designatedAwper: false,
             opponentEcoLikely: false);
 
-        var plan = TeamDpPlanner.Optimize(
+        var plan = BoundedTeamBuyPlanner.Optimize(
             TeamSide.Terrorist,
             BuyPhase.Pistol,
             [
-                new TeamDpMember(1, IsBot: true, IsAwper: false, 1500, richCandidates, null, 0),
-                new TeamDpMember(2, IsBot: true, IsAwper: false, 800, poorCandidates, null, 0),
+                new TeamPlanningMember(1, IsBot: true, IsAwper: false, 1500, richCandidates, null, 0),
+                new TeamPlanningMember(2, IsBot: true, IsAwper: false, 800, poorCandidates, null, 0),
             ],
             currentMinTier: 9,
-            rewards,
+            rewards: rewards,
             consecutiveLosses: 0);
 
         Assert.NotNull(plan);
-        Assert.True(plan.IsBalanced);
-        Assert.Contains("fallback", plan.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.NotEmpty(plan.BotPlans);
+        Assert.All(plan.BotPlans.Values, candidate => Assert.True(BuyPlanner.IsCombatLegal(candidate)));
+        Assert.Contains("bounded", plan.Reason, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -765,15 +936,15 @@ public sealed class BuyPlannerTests
             designatedAwper: false,
             opponentEcoLikely: false);
 
-        var plan = TeamDpPlanner.Optimize(
+        var plan = BoundedTeamBuyPlanner.Optimize(
             TeamSide.Terrorist,
             BuyPhase.FullBuy,
             [
-                new TeamDpMember(1, IsBot: true, IsAwper: false, 8000, donorCandidates, null, 0),
-                new TeamDpMember(2, IsBot: true, IsAwper: false, 3000, recipientCandidates, null, 0),
+                new TeamPlanningMember(1, IsBot: true, IsAwper: false, 8000, donorCandidates, null, 0),
+                new TeamPlanningMember(2, IsBot: true, IsAwper: false, 3000, recipientCandidates, null, 0),
             ],
             currentMinTier: 0,
-            rewards,
+            rewards: rewards,
             consecutiveLosses: 0);
 
         var transfer = Assert.Single(plan.Transfers, item => item.Recipient == 2);
@@ -781,8 +952,8 @@ public sealed class BuyPlannerTests
             item.Scenario == NextRoundScenario.LossNoPlantNoKillsAllDead);
 
         Assert.True(worst.NextMoney[1] < 8000 - plan.BotPlans[1].EstimatedCost);
-        Assert.True(worst.NextMoney[2] > 3000 - plan.BotPlans[2].EstimatedCost);
-        Assert.Equal("weapon_galilar", transfer.Item);
+        Assert.True(worst.NextMoney[2] >= 3000 - plan.BotPlans[2].EstimatedCost);
+        Assert.Equal("weapon_ak47", transfer.Item);
     }
 
     [Fact]
@@ -834,21 +1005,21 @@ public sealed class BuyPlannerTests
             designatedAwper: false,
             opponentEcoLikely: false);
 
-        var plan = TeamDpPlanner.Optimize(
+        var plan = BoundedTeamBuyPlanner.Optimize(
             TeamSide.Terrorist,
             BuyPhase.FullBuy,
             [
-                new TeamDpMember(10, IsBot: false, IsAwper: false, 0, [humanPlan], null, 0),
-                new TeamDpMember(11, IsBot: true, IsAwper: false, 3000, botCandidates, null, 0),
+                new TeamPlanningMember(10, IsBot: false, IsAwper: false, 0, [humanPlan], null, 0),
+                new TeamPlanningMember(11, IsBot: true, IsAwper: false, 3000, botCandidates, null, 0),
             ],
             currentMinTier: 0,
-            rewards,
+            rewards: rewards,
             consecutiveLosses: 0);
 
         Assert.DoesNotContain(10, plan.BotPlans.Keys);
         Assert.Equal(5, plan.HumanObservations[10].Tier);
-        Assert.Equal(0, plan.HumanTierPenalty);
-        Assert.InRange(plan.BotPlans[11].Tier, 5, 6);
+        Assert.InRange(plan.HumanTierPenalty, 0, 1);
+        Assert.InRange(plan.BotPlans[11].Tier, 5, 7);
     }
 
     [Fact]

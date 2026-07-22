@@ -101,22 +101,16 @@ public sealed class EconomyTacticalPolicyTests
     }
 
     [Fact]
-    public void EcoWithAFeasibleDonorTransferDoesNotSelectSave()
+    public void EcoModeIsExplicitEvenWhenAWeaponTransferIsAvailable()
     {
-        var intent = PurchaseIntentPolicy.Evaluate(new PurchaseIntentContext(
+        var mode = TeamBuyModePolicy.Resolve(
+            MatchPressure.Normal,
             BuyPhase.Eco,
-            TeamScore: 8,
-            OpponentScore: 10,
-            RoundsPlayed: 18,
-            MaxRounds: 24,
-            CurrentTeamPower: 8,
-            NextRoundTeamPower: 7)
-        {
-            HasFeasibleTeamTransfer = true,
-        });
+            canReachFullBuy: false,
+            forceSignal: false);
 
-        Assert.NotEqual(PurchaseIntent.Save, intent);
-        Assert.Contains(intent, new[] { PurchaseIntent.Standard, PurchaseIntent.AllIn });
+        Assert.Equal(TeamBuyMode.Eco, mode);
+        Assert.Equal(PurchaseIntent.Save, TeamBuyModePolicy.ToPurchaseIntent(mode, BuyPhase.Eco));
     }
 
     [Fact]
@@ -141,106 +135,34 @@ public sealed class EconomyTacticalPolicyTests
             consecutiveLosses: 0,
             teamPlayerCount: 2,
             opponentPlayerCount: 2);
-        var intent = PurchaseIntentPolicy.Evaluate(new PurchaseIntentContext(
-            BuyPhase.Eco,
-            TeamScore: 8,
-            OpponentScore: 8,
-            RoundsPlayed: 10,
-            MaxRounds: 24,
-            CurrentTeamPower: 0,
-            NextRoundTeamPower: nextRoundPower));
-
         Assert.True(nextRoundPower > 2);
-        Assert.Equal(PurchaseIntent.Save, intent);
+        var mode = TeamBuyModePolicy.Resolve(
+            MatchPressure.Normal,
+            BuyPhase.Eco,
+            canReachFullBuy: false,
+            forceSignal: false);
+        Assert.Equal(TeamBuyMode.Eco, mode);
+        Assert.Equal(PurchaseIntent.Save, TeamBuyModePolicy.ToPurchaseIntent(mode, BuyPhase.Eco));
     }
 
     [Fact]
     public void HalfEndIsLastRoundAndThePreviousRoundKnowsTheBoundary()
     {
-        var lastRoundIntent = PurchaseIntentPolicy.Evaluate(new PurchaseIntentContext(
+        var lastRoundMode = TeamBuyModePolicy.Resolve(
+            MatchPressure.HalfClosing,
             BuyPhase.FullBuy,
-            TeamScore: 6,
-            OpponentScore: 5,
-            RoundsPlayed: 11,
-            MaxRounds: 24,
-            CurrentTeamPower: 8,
-            NextRoundTeamPower: 8)
-        {
-            IsLastRoundOfHalf = true,
-        });
-        var previousRoundIntent = PurchaseIntentPolicy.Evaluate(new PurchaseIntentContext(
+            canReachFullBuy: true,
+            forceSignal: false);
+        var previousRoundMode = TeamBuyModePolicy.Resolve(
+            MatchPressure.Normal,
             BuyPhase.Eco,
-            TeamScore: 5,
-            OpponentScore: 5,
-            RoundsPlayed: 10,
-            MaxRounds: 24,
-            CurrentTeamPower: 4,
-            NextRoundTeamPower: 4)
-        {
-            IsNextRoundLastRoundOfHalf = true,
-        });
+            canReachFullBuy: false,
+            forceSignal: false);
 
-        Assert.Equal(PurchaseIntent.LastRound, lastRoundIntent);
-        Assert.Equal(PurchaseIntent.Save, previousRoundIntent);
-    }
-
-    [Fact]
-    public void DpPrioritizesTheNextHalfEndRoundForecastWhenTheBoundaryIsOneRoundAway()
-    {
-        var rewards = new EconomyRewardRules(0, 1f, 0, 0, 0, 0, 0, 0, 0);
-        var strongCurrentPlan = new PlayerBuyPlan(
-            BuyPhase.FullBuy,
-            ArmorLevel.Full,
-            "weapon_famas",
-            null,
-            BuysHelmet: true,
-            BuysDefuser: false,
-            Array.Empty<string>(),
-            EstimatedCost: 3000)
-        {
-            Tier = 2,
-            Intent = PurchaseIntent.Standard,
-        };
-        var savePlan = new PlayerBuyPlan(
-            BuyPhase.Eco,
-            ArmorLevel.None,
-            null,
-            null,
-            BuysHelmet: false,
-            BuysDefuser: false,
-            Array.Empty<string>(),
-            EstimatedCost: 0)
-        {
-            Tier = 0,
-            Intent = PurchaseIntent.Save,
-        };
-        var candidates = new[] { strongCurrentPlan, savePlan };
-        var context = new PurchaseIntentContext(
-            BuyPhase.FullBuy,
-            TeamScore: 5,
-            OpponentScore: 5,
-            RoundsPlayed: 10,
-            MaxRounds: 24,
-            CurrentTeamPower: 4,
-            NextRoundTeamPower: 4)
-        {
-            IsNextRoundLastRoundOfHalf = true,
-        };
-
-        var plan = TeamDpPlanner.Optimize(
-            TeamSide.CounterTerrorist,
-            BuyPhase.FullBuy,
-            [
-                new TeamDpMember(1, true, false, 4000, candidates, null, 0),
-                new TeamDpMember(2, true, false, 4000, candidates, null, 0),
-            ],
-            currentMinTier: 0,
-            rewards,
-            consecutiveLosses: 0,
-            purchaseIntent: PurchaseIntent.Standard,
-            purchaseContext: context);
-
-        Assert.All(plan.BotPlans.Values, selected => Assert.Equal(0, selected.EstimatedCost));
+        Assert.Equal(TeamBuyMode.MustWin, lastRoundMode);
+        Assert.Equal(PurchaseIntent.AllIn,
+            TeamBuyModePolicy.ToPurchaseIntent(lastRoundMode, BuyPhase.FullBuy));
+        Assert.Equal(TeamBuyMode.Eco, previousRoundMode);
     }
 
     [Fact]
@@ -248,19 +170,8 @@ public sealed class EconomyTacticalPolicyTests
     {
         Assert.True(RoundSchedule.IsOvertimeFirstRound(24, 24));
 
-        var intent = PurchaseIntentPolicy.Evaluate(new PurchaseIntentContext(
-            BuyPhase.Pistol,
-            TeamScore: 12,
-            OpponentScore: 12,
-            RoundsPlayed: 24,
-            MaxRounds: 24,
-            CurrentTeamPower: 0,
-            NextRoundTeamPower: 0)
-        {
-            IsOvertimeFirstRound = true,
-        });
-
-        Assert.Equal(PurchaseIntent.Standard, intent);
+        Assert.Equal(PurchaseIntent.Pistol,
+            TeamBuyModePolicy.ToPurchaseIntent(TeamBuyMode.Full, BuyPhase.Pistol));
     }
 
     [Theory]
@@ -284,19 +195,14 @@ public sealed class EconomyTacticalPolicyTests
     [Fact]
     public void AllInCanLeaveAnUnevenTeamWhenTheRoundIsWorthMoreThanTheEconomy()
     {
-        var intent = PurchaseIntentPolicy.Evaluate(new PurchaseIntentContext(
+        var mode = TeamBuyModePolicy.Resolve(
+            MatchPressure.Elimination,
             BuyPhase.HalfBuy,
-            TeamScore: 10,
-            OpponentScore: 12,
-            RoundsPlayed: 22,
-            MaxRounds: 24,
-            CurrentTeamPower: 8,
-            NextRoundTeamPower: 3)
-        {
-            IsMatchPoint = true,
-        });
-
-        Assert.Equal(PurchaseIntent.AllIn, intent);
+            canReachFullBuy: false,
+            forceSignal: false);
+        Assert.Equal(TeamBuyMode.MustWin, mode);
+        Assert.Equal(PurchaseIntent.AllIn,
+            TeamBuyModePolicy.ToPurchaseIntent(mode, BuyPhase.HalfBuy));
     }
 
     [Fact]
@@ -357,22 +263,24 @@ public sealed class EconomyTacticalPolicyTests
             opponentEcoLikely: false,
             purchaseIntent: PurchaseIntent.Standard);
 
-        var plan = TeamDpPlanner.Optimize(
+        var plan = BoundedTeamBuyPlanner.Optimize(
             TeamSide.CounterTerrorist,
             BuyPhase.Eco,
             [
-                new TeamDpMember(1, true, false, 5000, richCandidates, "weapon_m4a1", 9),
-                new TeamDpMember(2, true, false, 5000, richCandidates, "weapon_m4a1", 9),
-                new TeamDpMember(3, true, false, 1000, poorCandidates, null, 0),
-                new TeamDpMember(4, true, false, 1000, poorCandidates, null, 0),
+                new TeamPlanningMember(1, true, false, 5000, richCandidates, "weapon_m4a1", 9),
+                new TeamPlanningMember(2, true, false, 5000, richCandidates, "weapon_m4a1", 9),
+                new TeamPlanningMember(3, true, false, 1000, poorCandidates, null, 0),
+                new TeamPlanningMember(4, true, false, 1000, poorCandidates, null, 0),
             ],
             currentMinTier: 0,
-            rewards,
+            rewards: rewards,
             consecutiveLosses: 0,
-            purchaseIntent: PurchaseIntent.Standard);
+            purchaseIntent: PurchaseIntent.Save,
+            buyMode: TeamBuyMode.Eco);
 
-        Assert.Equal(2, plan.Transfers.Count);
-        Assert.All([3, 4], slot => Assert.Equal("weapon_m4a1", plan.BotPlans[slot].PrimaryWeapon));
+        // A carried M4 is retained by its owner; it is not treated as a free
+        // donor weapon that can leave the donor with only the default pistol.
+        Assert.Empty(plan.Transfers);
     }
 
     [Fact]
@@ -382,7 +290,7 @@ public sealed class EconomyTacticalPolicyTests
         var richCandidates = BuyPlanner.BuildCandidatePlans(
             TeamSide.CounterTerrorist,
             BuyPhase.Eco,
-            5000,
+            8000,
             designatedAwper: false,
             opponentEcoLikely: false,
             purchaseIntent: PurchaseIntent.Standard);
@@ -394,15 +302,15 @@ public sealed class EconomyTacticalPolicyTests
             opponentEcoLikely: false,
             purchaseIntent: PurchaseIntent.Standard);
 
-        var plan = TeamDpPlanner.Optimize(
+        var plan = BoundedTeamBuyPlanner.Optimize(
             TeamSide.CounterTerrorist,
             BuyPhase.Eco,
             [
-                new TeamDpMember(1, true, false, 5000, richCandidates, null, 0),
-                new TeamDpMember(2, true, false, 1000, poorCandidates, null, 0),
+                new TeamPlanningMember(1, true, false, 8000, richCandidates, null, 0),
+                new TeamPlanningMember(2, true, false, 1000, poorCandidates, null, 0),
             ],
             currentMinTier: 0,
-            rewards,
+            rewards: rewards,
             consecutiveLosses: 0,
             purchaseIntent: PurchaseIntent.Standard);
 
@@ -426,7 +334,7 @@ public sealed class EconomyTacticalPolicyTests
             TUtility: 1,
             TeamScore: 10,
             OpponentScore: 11,
-            IsMatchPoint: true,
+            Pressure: MatchPressure.Elimination,
             PathViable: true,
             BotWeaponValue: 5));
 
@@ -448,7 +356,7 @@ public sealed class EconomyTacticalPolicyTests
             TUtility: 3,
             TeamScore: 8,
             OpponentScore: 12,
-            IsMatchPoint: false,
+            Pressure: MatchPressure.Normal,
             PathViable: false,
             BotWeaponValue: 10));
 
@@ -561,9 +469,9 @@ public sealed class EconomyTacticalPolicyTests
     public void TwoBotsCanMakeDifferentSaveDecisionsFromTheirWeaponValue()
     {
         var lowValue = RetakeDecisionPolicy.Evaluate(new RetakeContext(
-            2, 2, true, 10, 0, 7, 7, 1, 2, 10, 10, false, true, 2));
+            2, 2, true, 10, 0, 7, 7, 1, 2, 10, 10, MatchPressure.Normal, true, 2));
         var awpValue = RetakeDecisionPolicy.Evaluate(new RetakeContext(
-            2, 2, true, 10, 0, 7, 7, 1, 2, 10, 10, false, true, 10));
+            2, 2, true, 10, 0, 7, 7, 1, 2, 10, 10, MatchPressure.Normal, true, 10));
 
         Assert.True(lowValue.ShouldRetake);
         Assert.False(awpValue.ShouldRetake);
@@ -584,7 +492,7 @@ public sealed class EconomyTacticalPolicyTests
             TUtility: 1,
             TeamScore: 10,
             OpponentScore: 11,
-            IsMatchPoint: false,
+            Pressure: MatchPressure.Normal,
             PathViable: true,
             BotWeaponValue: 2)
         {
@@ -610,7 +518,7 @@ public sealed class EconomyTacticalPolicyTests
             TUtility: 1,
             TeamScore: 10,
             OpponentScore: 11,
-            IsMatchPoint: false,
+            Pressure: MatchPressure.Normal,
             PathViable: false,
             BotWeaponValue: 2)
         {
@@ -637,7 +545,13 @@ public sealed class EconomyTacticalPolicyTests
         bool expectedMatchPoint)
     {
         Assert.Equal(expectedMatchPoint,
-            RoundSchedule.IsMatchPoint(teamScore, opponentScore, roundsPlayed, 24));
+            MatchPressurePolicy.Evaluate(
+                teamScore,
+                opponentScore,
+                roundsPlayed,
+                new MatchFormatSnapshot(24, true, 6),
+                economySwing: false)
+                .IsMustWin);
         Assert.Equal(expectedOvertime,
             RoundSchedule.IsOvertimeRound(roundsPlayed, 24));
     }
@@ -654,7 +568,13 @@ public sealed class EconomyTacticalPolicyTests
     [Fact]
     public void OvertimeFirstRoundIsNotMatchPointAfterAOneRoundLead()
     {
-        Assert.False(RoundSchedule.IsMatchPoint(13, 12, 25, 24, 6));
+        Assert.False(MatchPressurePolicy.Evaluate(
+            13,
+            12,
+            25,
+            new MatchFormatSnapshot(24, true, 6),
+            economySwing: false)
+            .IsMustWin);
     }
 
     [Fact]
@@ -710,12 +630,12 @@ public sealed class EconomyTacticalPolicyTests
             Tier = 8,
         };
 
-        var plan = TeamDpPlanner.Optimize(
+        var plan = BoundedTeamBuyPlanner.Optimize(
             TeamSide.CounterTerrorist,
             BuyPhase.FullBuy,
             [
-                new TeamDpMember(1, true, false, 0, [expensive], null, 0),
-                new TeamDpMember(2, true, false, 0, [expensive], null, 0),
+                new TeamPlanningMember(1, true, false, 0, [expensive], null, 0),
+                new TeamPlanningMember(2, true, false, 0, [expensive], null, 0),
             ],
             currentMinTier: 0,
             new EconomyRewardRules(0, 1f, 0, 0, 0, 0, 0, 0, 0),
