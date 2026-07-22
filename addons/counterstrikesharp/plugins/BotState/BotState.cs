@@ -188,7 +188,7 @@ public class BotState : BasePlugin
             _competitiveBotPlayers.Clear();
             _ctEcoPlanningWorker.Reset(new PlanVersion(-1, 0, 0));
             _ctDecisionPlanningWorker.Reset(new PlanVersion(-1, 0, 0));
-            while (_ctDecisionResults.TryDequeue(out _)) { }
+            while (_ctDecisionResults.TryDequeue(out var pendingDecision)) { }
             _latestCtDecisions = Array.Empty<CtTacticalDecision>();
             _tacticalRolesInitialized = false;
             _lastTacticalEconomyCheckpoint = null;
