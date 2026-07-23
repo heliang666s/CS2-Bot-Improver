@@ -299,6 +299,18 @@ public enum CtThreatEventKind
     BombFound,
 }
 
+public static class CtThreatAdmissionPolicy
+{
+    public static bool ShouldPromoteToTeam(
+        CtThreatEventKind kind,
+        int informedListeners)
+        => kind is CtThreatEventKind.CtDamage
+            or CtThreatEventKind.CtDeath
+            or CtThreatEventKind.BombFound
+            or CtThreatEventKind.MultipleEnemies
+            || informedListeners > 0;
+}
+
 public sealed record CtThreatEvent(
     CtThreatEventKind Kind,
     CtGambleSite Site,

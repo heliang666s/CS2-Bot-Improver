@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.IO;
 
 namespace CompetitiveBotCore;
 
@@ -41,13 +42,244 @@ public static class ProfilePolicy
             : configured;
 }
 
+public enum GrenadeExecutionRoute
+{
+    Cancel,
+    RealInventoryThrow,
+    GeneratedProjectile,
+}
+
+public readonly record struct GrenadeExecutionDecision(
+    GrenadeExecutionRoute Route,
+    bool SettleInventoryOnlyAfterEngineConfirmation);
+
+public static class GrenadeExecutionPolicy
+{
+    public static GrenadeExecutionDecision Resolve(
+        BotMatchProfile profile,
+        bool realThrowApiAvailable)
+    {
+        if (profile == BotMatchProfile.Competitive)
+        {
+            return realThrowApiAvailable
+                ? new(GrenadeExecutionRoute.RealInventoryThrow, true)
+                : new(GrenadeExecutionRoute.Cancel, false);
+        }
+
+        return realThrowApiAvailable
+            ? new(GrenadeExecutionRoute.RealInventoryThrow, true)
+            : new(GrenadeExecutionRoute.GeneratedProjectile, false);
+    }
+
+    public static bool ShouldSettleInventory(
+        GrenadeExecutionRoute route,
+        bool engineConfirmedThrow)
+        => route == GrenadeExecutionRoute.RealInventoryThrow
+            && engineConfirmedThrow;
+
+    public static bool ShouldPreserveBombAction(UtilitySource source)
+        => source is UtilitySource.PlantSmoke
+            or UtilitySource.DefuseSmoke
+            or UtilitySource.FlashSupport;
+
+    public static bool ShouldKeepRealThrowPending(
+        bool engineConfirmed,
+        bool projectileDetected,
+        int inventoryBefore,
+        int inventoryAfter)
+        => !engineConfirmed
+            && !projectileDetected
+            && inventoryAfter < inventoryBefore;
+}
+
+public static class GrenadeInventoryPolicy
+{
+    public static string ExpectedWeapon(string grenadeType, TeamSide side)
+        => grenadeType.Trim().ToLowerInvariant() switch
+        {
+            "smoke" => "weapon_smokegrenade",
+            "flash" => "weapon_flashbang",
+            "he" => "weapon_hegrenade",
+            "molotov" or "incgrenade"
+                when side == TeamSide.CounterTerrorist => "weapon_incgrenade",
+            "molotov" or "incgrenade" => "weapon_molotov",
+            _ => string.Empty,
+        };
+
+    public static int GetItemDefinition(string grenadeType, TeamSide side)
+        => ExpectedWeapon(grenadeType, side) switch
+        {
+            "weapon_flashbang" => 43,
+            "weapon_hegrenade" => 44,
+            "weapon_smokegrenade" => 45,
+            "weapon_molotov" => 46,
+            "weapon_incgrenade" => 48,
+            _ => -1,
+        };
+
+    public static bool MatchesThrownWeapon(
+        string grenadeType,
+        string? eventWeapon,
+        TeamSide side)
+    {
+        if (string.IsNullOrWhiteSpace(eventWeapon))
+            return false;
+
+        string expected = ExpectedWeapon(grenadeType, side);
+        string actual = eventWeapon.Trim().ToLowerInvariant();
+        return expected.Length > 0
+            && (actual == expected
+                || actual == expected["weapon_".Length..]);
+    }
+
+    public static bool ShouldRestoreAfterFailedRealThrow(
+        int inventoryBefore,
+        int inventoryAfter,
+        bool allowPhysicalRestore = true)
+        => allowPhysicalRestore
+            && inventoryAfter >= 0
+            && inventoryAfter < inventoryBefore;
+}
+
+public static class BuyExecutionPolicy
+{
+    public static long InvalidateGeneration(long currentGeneration)
+        => currentGeneration + 1;
+
+    public static bool IsLatestGeneration(
+        long scheduledGeneration,
+        long latestGeneration)
+        => scheduledGeneration == latestGeneration;
+}
+
+public static class BuyPollingPolicy
+{
+    public static bool ShouldStartPolling(bool pollingAlreadyScheduled)
+        => !pollingAlreadyScheduled;
+
+    public static bool ShouldContinuePolling(
+        bool finalWindowStillOpen,
+        int attempt)
+        => attempt < 64 && (finalWindowStillOpen || attempt < 8);
+}
+
+public static class ScoreRecoveryPolicy
+{
+    public const int MaxAttempts = 8;
+
+    public static bool ShouldRetry(bool recovered, int attempt)
+        => !recovered && attempt >= 0 && attempt < MaxAttempts;
+
+    public static float RetryDelaySeconds(int attempt)
+        => Math.Min(0.5f, 0.05f * Math.Max(1, attempt + 1));
+}
+
+public enum AimDifficultyTier
+{
+    Easy,
+    Medium,
+    High,
+}
+
+public readonly record struct AimDifficultyProfile(
+    float ReactionDelaySeconds,
+    float InitialAimErrorUnits,
+    float FocusDelaySeconds,
+    float BurstStability);
+
+public static class AimDifficultyPolicy
+{
+    public static AimDifficultyProfile Resolve(
+        AimDifficultyTier tier,
+        bool pistolRound = true)
+    {
+        if (!pistolRound)
+            return new(0f, 0f, 0f, 1f);
+
+        return tier switch
+        {
+            AimDifficultyTier.Easy => new(
+                ReactionDelaySeconds: 0.035f,
+                InitialAimErrorUnits: 1.5f,
+                FocusDelaySeconds: 0.035f,
+                BurstStability: 0.55f),
+            AimDifficultyTier.High => new(
+                ReactionDelaySeconds: -0.015f,
+                InitialAimErrorUnits: -0.75f,
+                FocusDelaySeconds: -0.02f,
+                BurstStability: 0.88f),
+            _ => new(
+                ReactionDelaySeconds: 0f,
+                InitialAimErrorUnits: 0f,
+                FocusDelaySeconds: 0f,
+                BurstStability: 0.72f),
+        };
+    }
+
+    public static AimDifficultyTier FromBotDifficulty(int value)
+        => value <= 1
+            ? AimDifficultyTier.Easy
+            : value >= 3
+                ? AimDifficultyTier.High
+                : AimDifficultyTier.Medium;
+
+    public static AimDifficultyTier ResolveActiveProfile(
+        string? gameDirectory,
+        int fallbackBotDifficulty)
+    {
+        if (!string.IsNullOrWhiteSpace(gameDirectory))
+        {
+            try
+            {
+                string overrides = Path.Combine(gameDirectory, "overrides");
+                string active = Path.Combine(overrides, "botprofile.vpk");
+                if (File.Exists(active))
+                {
+                    byte[] activeBytes = File.ReadAllBytes(active);
+                    foreach ((string name, AimDifficultyTier tier) in new[]
+                    {
+                        ("Low", AimDifficultyTier.Easy),
+                        ("Medium", AimDifficultyTier.Medium),
+                        ("High", AimDifficultyTier.High),
+                    })
+                    {
+                        string candidate = Path.Combine(overrides, name, "botprofile.vpk");
+                        if (File.Exists(candidate)
+                            && activeBytes.SequenceEqual(File.ReadAllBytes(candidate)))
+                            return tier;
+                    }
+                }
+            }
+            catch
+            {
+                // Custom installations can omit the profile bundle. Use the
+                // server cvar as the deterministic fallback in that case.
+            }
+        }
+
+        return FromBotDifficulty(fallbackBotDifficulty);
+    }
+
+    public static float PistolFireRecoverySeconds(
+        AimDifficultyTier tier,
+        int shotNumber)
+        => tier switch
+        {
+            AimDifficultyTier.Easy => 0.12f + (shotNumber % 3) * 0.04f,
+            AimDifficultyTier.Medium => 0.04f + (shotNumber % 2) * 0.015f,
+            _ => 0f,
+        };
+}
+
 public static class AimWeaponPolicy
 {
     public readonly record struct PistolAimAdjustment(
         bool ApplyOverride,
         float ReactionDelaySeconds,
         float TargetJitterUnits,
-        int JitterSeed);
+        int JitterSeed,
+        float FocusDelaySeconds = 0f,
+        float BurstStability = 1f);
 
     public static bool IsCompetitivePistolRound(
         int roundsPlayed,
@@ -67,18 +299,28 @@ public static class AimWeaponPolicy
         BuyPhase phase,
         int botSlot,
         int targetId,
-        float now)
+        float now,
+        AimDifficultyTier difficulty = AimDifficultyTier.Medium)
     {
         if (!IsCompetitivePistolRound(profile, phase))
             return new(true, 0f, 0f, 0);
 
         int seed = HashCode.Combine(botSlot, targetId, (int)(now * 10f));
         int bucket = Math.Abs(seed) % 20;
+        var difficultyProfile = AimDifficultyPolicy.Resolve(difficulty);
         return new(
             ApplyOverride: bucket >= 3,
-            ReactionDelaySeconds: 0.04f + (bucket % 5) * 0.015f,
-            TargetJitterUnits: 2f + (bucket % 3) * 1.5f,
-            JitterSeed: seed);
+            ReactionDelaySeconds: Math.Max(
+                0.025f,
+                0.04f + (bucket % 5) * 0.015f
+                    + difficultyProfile.ReactionDelaySeconds),
+            TargetJitterUnits: Math.Max(
+                0.5f,
+                2f + (bucket % 3) * 1.5f
+                    + difficultyProfile.InitialAimErrorUnits),
+            JitterSeed: seed,
+            FocusDelaySeconds: Math.Max(0f, difficultyProfile.FocusDelaySeconds),
+            BurstStability: difficultyProfile.BurstStability);
     }
 
     public static bool ShouldApplyPistolOverride(
@@ -217,6 +459,27 @@ public enum TeamSide
     CounterTerrorist,
 }
 
+public static class TeamScoreEntityPolicy
+{
+    public const string DesignerName = "cs_team_manager";
+
+    public static bool TryResolveSide(int teamNum, out TeamSide side)
+    {
+        switch (teamNum)
+        {
+            case 2:
+                side = TeamSide.Terrorist;
+                return true;
+            case 3:
+                side = TeamSide.CounterTerrorist;
+                return true;
+            default:
+                side = default;
+                return false;
+        }
+    }
+}
+
 public enum BuyPhase
 {
     Pistol,
@@ -335,6 +598,68 @@ public sealed record TeamEconomySnapshot(
     bool OpponentEcoLikely)
 {
     public bool IsOvertimeFirstRound { get; init; }
+}
+
+public static class EconomySnapshotPolicy
+{
+    public static IReadOnlyList<int> ForPhaseClassification(
+        IReadOnlyList<int> roundStartMoney,
+        IReadOnlyList<int> currentMoney)
+        => roundStartMoney.Count > 0
+            && roundStartMoney.Count == currentMoney.Count
+            ? roundStartMoney
+            : currentMoney;
+}
+
+public static class CompetitiveBuyBudgetPolicy
+{
+    public static int GetPlanningMoney(
+        int roundStartMoney,
+        int currentMoney,
+        bool nativeBuySuppressed)
+        => Math.Max(
+            0,
+            nativeBuySuppressed
+                ? roundStartMoney
+                : currentMoney);
+
+    public static bool CanExecutePlan(
+        PlayerBuyPlan plan,
+        int currentMoney)
+        => plan.EstimatedCost <= Math.Max(0, currentMoney);
+
+    public static IReadOnlyList<PlayerBuyPlan> FilterExecutablePlans(
+        IReadOnlyList<PlayerBuyPlan> candidates,
+        int currentMoney)
+        => candidates
+            .Where(plan => CanExecutePlan(plan, currentMoney))
+            .ToArray();
+}
+
+public readonly record struct CompetitiveBuySuppressionState(
+    int? OriginalEcoLimit)
+{
+    public static CompetitiveBuySuppressionState Inactive => new(null);
+
+    public bool IsActive => OriginalEcoLimit.HasValue;
+}
+
+public static class CompetitiveBuySuppressionPolicy
+{
+    public static CompetitiveBuySuppressionState Enter(
+        CompetitiveBuySuppressionState state,
+        int currentEcoLimit)
+        => state.IsActive
+            ? state
+            : new CompetitiveBuySuppressionState(currentEcoLimit);
+
+    public static int? RestoreValue(
+        CompetitiveBuySuppressionState state)
+        => state.OriginalEcoLimit;
+
+    public static CompetitiveBuySuppressionState Exit(
+        CompetitiveBuySuppressionState state)
+        => CompetitiveBuySuppressionState.Inactive;
 }
 
 public sealed class TacticalEconomyPhaseCache
@@ -1464,11 +1789,12 @@ public static class BuyPlanner
             cost += GetWeaponCost(targetSecondary);
 
         remaining -= cost;
+        bool isAllInPackage = purchaseIntent is PurchaseIntent.AllIn or PurchaseIntent.LastRound;
         bool buysDefuser = side == TeamSide.CounterTerrorist
             && !currentHasDefuser
             && primary is not null
             && remaining >= DefuserPrice
-            && phase is BuyPhase.FullBuy or BuyPhase.LastRound;
+            && (phase is BuyPhase.FullBuy or BuyPhase.LastRound || isAllInPackage);
         if (buysDefuser)
         {
             remaining -= DefuserPrice;
@@ -1476,7 +1802,8 @@ public static class BuyPlanner
         }
 
         var utility = new List<string>();
-        if (primary is not null && (phase is BuyPhase.FullBuy or BuyPhase.LastRound))
+        if (primary is not null
+            && (phase is BuyPhase.FullBuy or BuyPhase.LastRound || isAllInPackage))
         {
             AddUtility("smoke", SmokePrice, 1);
             AddUtility("flash", FlashPrice, phase == BuyPhase.LastRound ? 2 : 1);
@@ -1703,75 +2030,6 @@ public static class RoundSchedule
 }
 
 public readonly record struct RoundScoreSnapshot(int Terrorist, int CounterTerrorist);
-
-public static class RoundScoreReader
-{
-    private static readonly string[] TerroristScoreNames =
-    [
-        "TeamTScore", "TerroristScore", "TScore",
-        "m_iTeamTScore", "m_iTerroristScore", "m_iTScore",
-    ];
-
-    private static readonly string[] CounterTerroristScoreNames =
-    [
-        "TeamCTScore", "CounterTerroristScore", "CTScore",
-        "m_iTeamCTScore", "m_iCounterTerroristScore", "m_iCTScore",
-    ];
-
-    public static bool TryRead(object? gameRules, out RoundScoreSnapshot score)
-    {
-        score = default;
-        if (gameRules == null
-            || !TryReadNamedValue(gameRules, TerroristScoreNames, out int terrorist)
-            || !TryReadNamedValue(gameRules, CounterTerroristScoreNames, out int counterTerrorist)
-            || terrorist < 0
-            || counterTerrorist < 0)
-        {
-            return false;
-        }
-
-        score = new RoundScoreSnapshot(terrorist, counterTerrorist);
-        return true;
-    }
-
-    private static bool TryReadNamedValue(
-        object source,
-        IEnumerable<string> names,
-        out int value)
-    {
-        const System.Reflection.BindingFlags flags =
-            System.Reflection.BindingFlags.Instance
-            | System.Reflection.BindingFlags.Public
-            | System.Reflection.BindingFlags.NonPublic;
-
-        foreach (string name in names)
-        {
-            try
-            {
-                var property = source.GetType().GetProperty(name, flags);
-                if (property?.GetValue(source) is IConvertible propertyValue)
-                {
-                    value = Convert.ToInt32(propertyValue);
-                    return true;
-                }
-
-                var field = source.GetType().GetField(name, flags);
-                if (field?.GetValue(source) is IConvertible fieldValue)
-                {
-                    value = Convert.ToInt32(fieldValue);
-                    return true;
-                }
-            }
-            catch
-            {
-                // The generated GameRules schema varies across CSS builds.
-            }
-        }
-
-        value = 0;
-        return false;
-    }
-}
 
 public static class BombTimerPolicy
 {

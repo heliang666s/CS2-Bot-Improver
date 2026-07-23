@@ -702,6 +702,41 @@ public sealed class BuyPlannerTests
     }
 
     [Fact]
+    public void TeamDpRetainsPremiumRifleCombinationWhenFrontierIsTiny()
+    {
+        var cheap = new PlayerBuyPlan(
+            BuyPhase.FullBuy,
+            ArmorLevel.Full,
+            "weapon_famas",
+            "weapon_glock",
+            BuysHelmet: false,
+            BuysDefuser: false,
+            Utility: [],
+            EstimatedCost: 1000)
+        {
+            Tier = 5,
+        };
+        var premium = cheap with
+        {
+            PrimaryWeapon = "weapon_ak47",
+            EstimatedCost = 3000,
+            Tier = 8,
+        };
+
+        var result = BoundedTeamBuyPlanner.Optimize(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            [
+                new TeamPlanningMember(1, IsBot: true, IsAwper: false, 3000, [cheap, premium], null, 0),
+                new TeamPlanningMember(2, IsBot: true, IsAwper: false, 3000, [cheap, premium], null, 0),
+            ],
+            currentMinTier: 0,
+            options: new BoundedPlannerOptions(MaxFrontierStates: 1));
+
+        Assert.All(result.BotPlans.Values, plan => Assert.Equal("weapon_ak47", plan.PrimaryWeapon));
+    }
+
+    [Fact]
     public void TeamDpAllowsAwperExceptionWhileBalancingOrdinaryBots()
     {
         var rewards = new EconomyRewardRules(0, 1f, 0, 0, 0, 0, 0, 0, 0);

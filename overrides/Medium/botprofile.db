@@ -178,8 +178,8 @@ End
 
 Template ProTop
     Skill = 100
-	ReactionTime = 0.16
-	AttackDelay = 0.04
+	ReactionTime = 0.145
+	AttackDelay = 0.03
 	AimFocusInitial = 0.06
 	AimFocusDecay = 0.55
 	AimFocusOffsetScale = 0.08
@@ -189,8 +189,8 @@ End
 
 Template ProFast   // sniper rifler rusher
 	Skill = 100
-	ReactionTime = 0.14
-	AttackDelay = 0.03
+	ReactionTime = 0.125
+	AttackDelay = 0.025
 	AimFocusInitial = 0.08
 	AimFocusDecay = 0.50
 	AimFocusOffsetScale = 0.10
@@ -200,8 +200,8 @@ End
 
 Template ProPrecise   // sniper scoper fastshot camper
 	Skill = 100
-	ReactionTime = 0.17
-	AttackDelay = 0.05
+	ReactionTime = 0.155
+	AttackDelay = 0.04
 	AimFocusInitial = 0.05
 	AimFocusDecay = 0.60
 	AimFocusOffsetScale = 0.07
@@ -211,8 +211,8 @@ End
 
 Template ProSlow    // duelist sniper
 	Skill = 100
-    ReactionTime = 0.22
-    AttackDelay = 0.07
+    ReactionTime = 0.205
+    AttackDelay = 0.06
     AimFocusInitial = 0.12
 	AimFocusDecay = 0.35
 	AimFocusOffsetScale = 0.18
@@ -222,8 +222,8 @@ End
 
 Template ProSteady    // rifler
     Skill = 100
-    ReactionTime = 0.19
-    AttackDelay = 0.05
+    ReactionTime = 0.175
+    AttackDelay = 0.04
     AimFocusInitial = 0.07
 	AimFocusDecay = 0.55
 	AimFocusOffsetScale = 0.09
@@ -233,8 +233,8 @@ End
 
 Template RankRifler    // rifler
 	Skill = 49
-	ReactionTime = 0.2
-	AttackDelay = 0.01
+	ReactionTime = 0.085
+	AttackDelay = 0.005
 	VoicePitch = 85
 	AimFocusInitial = 0.01
 	AimFocusDecay = 1
@@ -245,7 +245,7 @@ End
 
 Template RankDuelist    // duelist rusher
 	Skill = 49
-	ReactionTime = 0.2
+	ReactionTime = 0.085
 	AttackDelay = 0
 	AimFocusInitial = 0.25
 	AimFocusDecay = 0.05
@@ -256,7 +256,7 @@ End
 
 Template RankOthers    // sniper scoper rifler
     Skill = 49
-    ReactionTime = 0.1
+    ReactionTime = 0.085
     AttackDelay = 0
     AimFocusInitial = 0.00001
 	AimFocusDecay = 0.0000001

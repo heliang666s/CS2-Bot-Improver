@@ -26,6 +26,9 @@ public readonly record struct MatchPressureResult(
     bool OpponentCanEndMatch,
     bool IsHalfClosing)
 {
+    public bool RequiresAllIn
+        => TeamCanEndMatch || OpponentCanEndMatch || IsHalfClosing;
+
     public bool IsMustWin => TeamCanEndMatch || OpponentCanEndMatch;
 }
 
@@ -110,6 +113,15 @@ public static class TeamBuyModePolicy
                 TeamBuyMode.Force => PurchaseIntent.Standard,
                 _ => PurchaseIntent.Standard,
             };
+
+    public static TeamBuyMode Resolve(
+        MatchPressureResult pressure,
+        BuyPhase phase,
+        bool canReachFullBuy,
+        bool forceSignal)
+        => pressure.RequiresAllIn
+            ? TeamBuyMode.MustWin
+            : Resolve(pressure.Level, phase, canReachFullBuy, forceSignal);
 
     public static TeamBuyMode Resolve(
         MatchPressure pressure,
@@ -670,7 +682,9 @@ public static class BoundedTeamBuyPlanner
         int TierSum,
         int AwpCount,
         int PreferredRifleCount,
-        int LimitedSmgCount);
+        int LimitedSmgCount,
+        int UtilityCoverage,
+        int DefuserCount);
 
     public static BoundedTeamBuyResult Optimize(
         TeamSide side,
@@ -721,9 +735,10 @@ public static class BoundedTeamBuyPlanner
         }
 
         int teamBudget = bots.Sum(member => Math.Max(0, member.Member.Money));
+        int utilityCoverageTarget = Math.Max(3, bots.Length * 3);
         var frontier = new List<FrontierState>
         {
-            new(Array.Empty<int>(), 0, int.MaxValue, int.MinValue, 0, 0, 0, 0),
+            new(Array.Empty<int>(), 0, int.MaxValue, int.MinValue, 0, 0, 0, 0, 0, 0),
         };
 
         for (int memberIndex = 0; memberIndex < bots.Length; memberIndex++)
@@ -774,14 +789,16 @@ public static class BoundedTeamBuyPlanner
                         awpCount,
                         state.PreferredRifleCount
                             + (IsPreferredRifle(candidate.PrimaryWeapon, side) ? 1 : 0),
-                        state.LimitedSmgCount + (IsLimitedSmg(candidate.PrimaryWeapon) ? 1 : 0)));
+                        state.LimitedSmgCount + (IsLimitedSmg(candidate.PrimaryWeapon) ? 1 : 0),
+                        state.UtilityCoverage + GetUtilityCoverage(candidate),
+                        state.DefuserCount + (candidate.BuysDefuser ? 1 : 0)));
                 }
 
                 if (timedOut)
                     break;
             }
 
-            frontier = Prune(next, limits.FrontierLimit);
+            frontier = Prune(next, limits.FrontierLimit, utilityCoverageTarget);
             maxFrontier = Math.Max(maxFrontier, frontier.Count);
             if (frontier.Count == 0 || timedOut)
                 break;
@@ -792,12 +809,19 @@ public static class BoundedTeamBuyPlanner
             ? BuildFallbackState(bots, teamBudget, side, buyMode, preferredRifleExists)
             : frontier
                 .OrderByDescending(state => state.MinTier >= currentMinTier)
+                .ThenByDescending(state => FrontierQualityScore(
+                    state,
+                    utilityCoverageTarget))
                 .ThenByDescending(state => state.MinTier)
                 .ThenByDescending(state => state.TierSum)
                 // Keep the one-AWP structure when it does not lower the
                 // team's combat floor; otherwise min/tier sum already wins.
                 .ThenByDescending(state => state.AwpCount)
                 .ThenByDescending(state => state.PreferredRifleCount)
+                .ThenBy(state => ComputeHumanTierPenalty(
+                    state,
+                    bots,
+                    humanObservations))
                 .ThenBy(state => state.MaxTier - state.MinTier)
                 .ThenBy(state => state.TotalCost)
                 .FirstOrDefault();
@@ -930,7 +954,9 @@ public static class BoundedTeamBuyPlanner
     {
         var ordered = member.Candidates
             .Where(BuyPlanner.IsCombatLegal)
-            .OrderByDescending(plan => plan.Tier)
+            .OrderByDescending(plan => PlanQualityScore(plan, member.IsAwper))
+            .ThenByDescending(plan => plan.Tier)
+            .ThenByDescending(GetUtilityCoverage)
             .ThenBy(plan => plan.EstimatedCost)
             .ThenBy(plan => plan.PrimaryWeapon, StringComparer.Ordinal)
             .Take(limit)
@@ -971,13 +997,22 @@ public static class BoundedTeamBuyPlanner
 
     private static List<FrontierState> Prune(
         List<FrontierState> states,
-        int limit)
+        int limit,
+        int utilityCoverageTarget)
     {
         var result = new List<FrontierState>(Math.Min(limit, states.Count));
         foreach (var state in states
-                     .OrderBy(state => state.TotalCost)
+                     // Quality is the admission order. Cost remains a
+                     // tie-breaker, so a premium rifle/utility structure can
+                     // enter the frontier before the cheap-but-shallow states
+                     // consume the bounded slot budget.
+                     .OrderByDescending(state => FrontierQualityScore(
+                         state,
+                         utilityCoverageTarget))
                      .ThenByDescending(state => state.MinTier)
                      .ThenByDescending(state => state.TierSum)
+                     .ThenByDescending(state => state.PreferredRifleCount)
+                     .ThenByDescending(state => state.AwpCount)
                      .ThenBy(state => state.MaxTier - state.MinTier))
         {
             bool dominated = result.Any(existing =>
@@ -985,6 +1020,8 @@ public static class BoundedTeamBuyPlanner
                 && existing.MinTier >= state.MinTier
                 && existing.TierSum >= state.TierSum
                 && existing.PreferredRifleCount >= state.PreferredRifleCount
+                && existing.UtilityCoverage >= state.UtilityCoverage
+                && existing.DefuserCount >= state.DefuserCount
                 && existing.MaxTier - existing.MinTier <= state.MaxTier - state.MinTier
                 // AWP and rifle structures are intentionally separate Pareto
                 // dimensions. A cheaper M4 must not erase the designated AWP
@@ -1001,6 +1038,40 @@ public static class BoundedTeamBuyPlanner
 
         return result;
     }
+
+    private static int FrontierQualityScore(
+        FrontierState state,
+        int utilityCoverageTarget)
+    {
+        int utility = DiminishingCoverageScore(
+            state.UtilityCoverage,
+            utilityCoverageTarget,
+            usefulWeight: 10,
+            excessPenalty: 2);
+        int defusers = DiminishingCoverageScore(
+            state.DefuserCount,
+            target: 1,
+            usefulWeight: 24,
+            excessPenalty: 8);
+        int spreadPenalty = Math.Max(0, state.MaxTier - state.MinTier) * 14;
+        int limitedSmgPenalty = state.LimitedSmgCount * 8;
+        return state.MinTier * 1000
+            + state.TierSum * 100
+            + state.PreferredRifleCount * 28
+            + state.AwpCount * 18
+            + utility
+            + defusers
+            - spreadPenalty
+            - limitedSmgPenalty;
+    }
+
+    private static int DiminishingCoverageScore(
+        int coverage,
+        int target,
+        int usefulWeight,
+        int excessPenalty)
+        => Math.Min(coverage, target) * usefulWeight
+            - Math.Max(0, coverage - target) * excessPenalty;
 
     private static Dictionary<int, int> BuildPurchaseCosts(
         IReadOnlyList<CandidateMember> members,
@@ -1049,11 +1120,24 @@ public static class BoundedTeamBuyPlanner
     private static int ComputeHumanTierPenalty(
         IReadOnlyDictionary<int, PlayerBuyPlan> botPlans,
         IReadOnlyDictionary<int, PlayerBuyPlan> humanObservations)
+        => ComputeHumanTierPenalty(botPlans.Values, humanObservations);
+
+    private static int ComputeHumanTierPenalty(
+        FrontierState state,
+        IReadOnlyList<CandidateMember> members,
+        IReadOnlyDictionary<int, PlayerBuyPlan> humanObservations)
+        => ComputeHumanTierPenalty(
+            members.Select((member, index) => member.Candidates[state.CandidateIndexes[index]]),
+            humanObservations);
+
+    private static int ComputeHumanTierPenalty(
+        IEnumerable<PlayerBuyPlan> botPlans,
+        IReadOnlyDictionary<int, PlayerBuyPlan> humanObservations)
     {
         if (humanObservations.Count == 0)
             return 0;
 
-        return botPlans.Values
+        return botPlans
             .Select(botPlan => humanObservations.Values
                 .Select(humanPlan => Math.Max(0, Math.Abs(botPlan.Tier - humanPlan.Tier) - 1))
                 .DefaultIfEmpty(0)
@@ -1076,6 +1160,8 @@ public static class BoundedTeamBuyPlanner
         int awpCount = 0;
         int preferredRifleCount = 0;
         int limitedSmgCount = 0;
+        int utilityCoverage = 0;
+        int defuserCount = 0;
 
         for (int i = 0; i < members.Count; i++)
         {
@@ -1114,6 +1200,8 @@ public static class BoundedTeamBuyPlanner
             awpCount += selected.PrimaryWeapon == "weapon_awp" ? 1 : 0;
             preferredRifleCount += IsPreferredRifle(selected.PrimaryWeapon, side) ? 1 : 0;
             limitedSmgCount += IsLimitedSmg(selected.PrimaryWeapon) ? 1 : 0;
+            utilityCoverage += GetUtilityCoverage(selected);
+            defuserCount += selected.BuysDefuser ? 1 : 0;
         }
 
         return new FrontierState(
@@ -1124,7 +1212,9 @@ public static class BoundedTeamBuyPlanner
             tierSum,
             awpCount,
             preferredRifleCount,
-            limitedSmgCount);
+            limitedSmgCount,
+            utilityCoverage,
+            defuserCount);
     }
 
     private static bool IsTeamWeaponAllowed(
@@ -1154,4 +1244,41 @@ public static class BoundedTeamBuyPlanner
 
     private static bool IsLimitedSmg(string? weapon)
         => weapon is "weapon_mp9" or "weapon_mac10";
+
+    private static int GetUtilityCoverage(PlayerBuyPlan plan)
+        => plan.Utility
+            .Select(utility => utility switch
+            {
+                "smoke" or "weapon_smokegrenade" => 2,
+                "flash" or "weapon_flashbang" => 1,
+                "he" or "weapon_hegrenade" => 1,
+                "molotov" or "weapon_molotov" or "weapon_incgrenade" => 1,
+                _ => 0,
+            })
+            .Sum();
+
+    private static int PlanQualityScore(PlayerBuyPlan plan, bool designatedAwper)
+    {
+        int weaponScore = plan.PrimaryWeapon switch
+        {
+            "weapon_ak47" or "weapon_m4a1" or "weapon_m4a1_silencer" => 80,
+            "weapon_awp" => designatedAwper ? 86 : 72,
+            "weapon_aug" or "weapon_sg556" => 70,
+            "weapon_galilar" or "weapon_famas" => 48,
+            "weapon_mp9" or "weapon_mac10" => 30,
+            null => 0,
+            _ => 24,
+        };
+        int armorScore = plan.ArmorLevel switch
+        {
+            ArmorLevel.Full => 24,
+            ArmorLevel.Half => 12,
+            _ => 0,
+        };
+        int structureScore = (plan.BuysHelmet ? 4 : 0)
+            + (plan.BuysDefuser ? 4 : 0)
+            + GetUtilityCoverage(plan) * 3
+            + (plan.AcceptsTeamPrimary ? -30 : 0);
+        return weaponScore + armorScore + structureScore;
+    }
 }

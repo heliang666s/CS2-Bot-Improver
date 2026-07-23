@@ -1,6 +1,7 @@
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Capabilities;
+using CounterStrikeSharp.API.Core.Attributes.Registration;
 using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Modules.Events;
@@ -14,7 +15,9 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Runtime.CompilerServices;
 using RayTraceAPI;
+using BotControllerApi;
 using CompetitiveBotCore;
 
 namespace NadeSystem;
@@ -111,7 +114,57 @@ public class NadeSystemPlugin : BasePlugin
     private List<GrenadeData> _mapNades = new();
     private string _botNadesMode = "normal"; // "off" | "normal" | "more" | "max"
     private BotMatchProfile _profile = BotMatchProfile.Competitive;
+    // Competitive throws use the bot's real inventory only when the optional
+    // controller capability is present and the engine emits grenade_thrown.
+    // The generated-projectile path remains available for Arcade/Legacy only.
+    private bool RealThrowApiAvailable => _botController != null;
+    private bool UsesLedgerOnlyRealReservation
+        => ProfilePolicy.IsCompetitive(_profile) && RealThrowApiAvailable;
+    private const float RealThrowInitialConfirmationDelay = 0.35f;
+    private const float RealThrowConfirmationRetryDelay = 0.10f;
+    private const float RealThrowLateConfirmationProbeDelay = 0.25f;
+    private const int RealThrowConfirmationRetryCount = 6;
+    private object? _botController;
+    private readonly Dictionary<int, PendingRealThrow> _pendingRealThrows = new();
     private readonly IRoundState _roundState = new RoundState();
+    private readonly PerformanceMetrics _performance = new();
+
+    private enum RealThrowConfirmationState
+    {
+        AwaitingInitialConfirmation,
+        AwaitingLateConfirmation,
+    }
+
+    private sealed class PendingRealThrow
+    {
+        public PendingRealThrow(
+            CCSPlayerController bot,
+            string grenadeType,
+            string inventoryItem,
+            int inventoryCountBefore,
+            int ownedProjectileCountBefore,
+            GrenadeThrowTrajectory? trajectory,
+            Action<bool, bool>? completed)
+        {
+            Bot = bot;
+            GrenadeType = grenadeType;
+            InventoryItem = inventoryItem;
+            InventoryCountBefore = inventoryCountBefore;
+            OwnedProjectileCountBefore = ownedProjectileCountBefore;
+            Trajectory = trajectory;
+            Completed = completed;
+        }
+
+        public CCSPlayerController Bot { get; }
+        public string GrenadeType { get; }
+        public string InventoryItem { get; }
+        public int InventoryCountBefore { get; }
+        public int OwnedProjectileCountBefore { get; }
+        public GrenadeThrowTrajectory? Trajectory { get; }
+        public Action<bool, bool>? Completed { get; }
+        public RealThrowConfirmationState State { get; set; }
+            = RealThrowConfirmationState.AwaitingInitialConfirmation;
+    }
     // ── State ──────────────────────────────────────────────────
     private List<GrenadeData>     _db                = new();
     private List<CooldownEntry>   _cooldowns         = new();
@@ -282,6 +335,7 @@ public class NadeSystemPlugin : BasePlugin
             _cooldowns.Clear();
             _roundCountByTeam.Clear();
             _replayBots.Clear();
+            CancelPendingRealThrows();
             _utilityLedgers.Clear();
             _defuseSmokeUsers.Clear();
         });
@@ -292,6 +346,35 @@ public class NadeSystemPlugin : BasePlugin
             AddTimer(0.1f, SynchronizeRoundPhaseFromGameRules);
         
         Server.PrintToConsole($"[NadeSystem] Loaded — profile={_profile}, mode={_botNadesMode}, grenades={_db.Count}, utilityLedger=per-bot");
+    }
+
+    public override void OnAllPluginsLoaded(bool hotReload)
+    {
+        try
+        {
+            _botController = BotControllerBridge.TryGet();
+        }
+        catch
+        {
+            _botController = null;
+        }
+
+        Server.PrintToConsole(
+            $"[NadeSystem] real inventory throw API = {RealThrowApiAvailable}");
+    }
+
+    [ConsoleCommand("css_nade_perf", "Print NadeSystem phase latency percentiles")]
+    [CommandHelper(minArgs: 0, usage: "", whoCanExecute: CommandUsage.CLIENT_AND_SERVER)]
+    public void OnPerformanceCommand(CCSPlayerController? caller, CommandInfo command)
+    {
+        string[] lines =
+        {
+            _performance.FormatSnapshot(PerformancePhase.NormalTick),
+            _performance.FormatSnapshot(PerformancePhase.SoundMaintenance),
+        };
+        foreach (string line in lines)
+            command.ReplyToCommand($"[NadeSystem] {line}");
+        Console.WriteLine($"[NadeSystem] perf\n{string.Join('\n', lines)}");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -652,7 +735,311 @@ public class NadeSystemPlugin : BasePlugin
     private HookResult OnGrenadeThrown(EventGrenadeThrown @event, GameEventInfo info)
     {
         RecordSoundPoint(@event.Userid);
+        var thrower = @event.Userid;
+        if (thrower != null
+            && thrower.IsValid
+            && _pendingRealThrows.TryGetValue((int)thrower.Index, out var pending)
+            && GrenadeInventoryPolicy.MatchesThrownWeapon(
+                pending.GrenadeType,
+                @event.Weapon,
+                pending.Bot.Team == CsTeam.CounterTerrorist
+                    ? TeamSide.CounterTerrorist
+                    : TeamSide.Terrorist))
+        {
+            // The event is the settlement boundary: the engine accepted the
+            // selected inventory item and created a real grenade projectile.
+            ConfirmRealThrow(thrower, pending);
+        }
         return HookResult.Continue;
+    }
+
+    private bool TryThrowFromRealInventory(
+        CCSPlayerController bot,
+        string grenadeType,
+        GrenadeThrowTrajectory? trajectory,
+        Action<bool, bool>? onCompleted)
+    {
+        if (_botController == null || !bot.IsValid || !bot.IsBot)
+            return false;
+
+        TeamSide side = bot.Team == CsTeam.CounterTerrorist
+            ? TeamSide.CounterTerrorist
+            : TeamSide.Terrorist;
+        string inventoryItem = GrenadeInventoryPolicy.ExpectedWeapon(
+            grenadeType,
+            side);
+        int inventoryCountBefore = CountRealUtility(bot, inventoryItem);
+        int ownedProjectileCountBefore = CountOwnedRealProjectiles(
+            bot,
+            grenadeType);
+        int itemDefinition = GrenadeInventoryPolicy.GetItemDefinition(
+            grenadeType,
+            side);
+        if (itemDefinition < 0
+            || inventoryCountBefore <= 0
+            || _pendingRealThrows.ContainsKey((int)bot.Index))
+            return false;
+
+        if (!BotControllerBridge.SwitchBotWeapon(
+                _botController,
+                bot.Slot,
+                itemDefinition))
+            return false;
+
+        var pending = new PendingRealThrow(
+            bot,
+            grenadeType,
+            inventoryItem,
+            inventoryCountBefore,
+            ownedProjectileCountBefore,
+            trajectory,
+            onCompleted);
+        _pendingRealThrows[(int)bot.Index] = pending;
+
+        // SwitchBotWeapon changes the actual active item. Raising the bot's
+        // attack input on the next frame lets the game own projectile creation,
+        // inventory decrement, trajectory and grenade_thrown emission.
+        Server.NextFrame(() =>
+        {
+            if (!_pendingRealThrows.ContainsKey((int)bot.Index)) return;
+            var pawn = bot.PlayerPawn?.Value;
+            if (pawn?.Bot == null || !pawn.IsValid)
+            {
+                ResolveRealThrowConfirmation(bot, attempt: 0);
+                return;
+            }
+
+            pawn.Bot.IsAttacking = true;
+            AddTimer(0.1f, () =>
+            {
+                var currentPawn = bot.PlayerPawn?.Value;
+                if (currentPawn?.Bot != null && currentPawn.IsValid)
+                    currentPawn.Bot.IsAttacking = false;
+            });
+        });
+
+        // A real throw must be confirmed by the engine. The first timeout is
+        // only an observation point: a consumed inventory item keeps the
+        // pending entry alive so a delayed grenade_thrown event can still
+        // settle it. No timeout path fabricates a replacement item.
+        AddTimer(
+            RealThrowInitialConfirmationDelay,
+            () => ResolveRealThrowConfirmation(bot, attempt: 0));
+        return true;
+    }
+
+    private void ResolveRealThrowConfirmation(
+        CCSPlayerController bot,
+        int attempt)
+    {
+        if (!_pendingRealThrows.TryGetValue((int)bot.Index, out var pending))
+            return;
+
+        bool projectileDetected = CountOwnedRealProjectiles(
+            bot,
+            pending.GrenadeType) > pending.OwnedProjectileCountBefore;
+        if (projectileDetected)
+        {
+            ConfirmRealThrow(bot, pending);
+            return;
+        }
+
+        if (pending.State == RealThrowConfirmationState.AwaitingLateConfirmation)
+        {
+            // The event may be lost entirely, so keep probing for the new
+            // owned projectile until round teardown settles this entry. This
+            // path never restores a physical item on its own.
+            AddTimer(
+                RealThrowLateConfirmationProbeDelay,
+                () => ResolveRealThrowConfirmation(
+                    bot,
+                    RealThrowConfirmationRetryCount));
+            return;
+        }
+
+        int inventoryAfter = CountRealUtility(bot, pending.InventoryItem);
+        if (attempt < RealThrowConfirmationRetryCount)
+        {
+            AddTimer(
+                RealThrowConfirmationRetryDelay,
+                () => ResolveRealThrowConfirmation(bot, attempt + 1));
+            return;
+        }
+
+        if (GrenadeExecutionPolicy.ShouldKeepRealThrowPending(
+                engineConfirmed: false,
+                projectileDetected: false,
+                inventoryBefore: pending.InventoryCountBefore,
+                inventoryAfter: inventoryAfter))
+        {
+            pending.State = RealThrowConfirmationState.AwaitingLateConfirmation;
+            Server.PrintToConsole(
+                $"[NadeSystem] real throw awaiting late confirmation "
+                + $"bot={pending.Bot.PlayerName} type={pending.GrenadeType}");
+            AddTimer(
+                RealThrowLateConfirmationProbeDelay,
+                () => ResolveRealThrowConfirmation(
+                    bot,
+                    RealThrowConfirmationRetryCount));
+            return;
+        }
+
+        // The item is still present (or the bot acquired another one), so the
+        // engine did not consume this reservation. Refund only the plugin
+        // ledger; physical inventory restoration belongs to explicit
+        // non-engine-consuming paths, never this unconfirmed path.
+        CompleteRealThrow(bot, engineConfirmed: false);
+    }
+
+    private void ConfirmRealThrow(
+        CCSPlayerController bot,
+        PendingRealThrow pending)
+    {
+        if (GrenadeTrajectoryPolicy.ShouldRetargetEngineProjectile(
+                _profile,
+                engineConfirmedThrow: true,
+                pending.Trajectory))
+        {
+            Server.NextFrame(() => RetargetRealProjectile(pending, attempt: 0));
+        }
+
+        CompleteRealThrow(bot, engineConfirmed: true);
+    }
+
+    private static int CountOwnedRealProjectiles(
+        CCSPlayerController bot,
+        string grenadeType)
+    {
+        if (!bot.IsValid
+            || !TypeToProjectile.TryGetValue(
+                grenadeType,
+                out string? designerName))
+            return 0;
+
+        var pawn = bot.PlayerPawn?.Value;
+        if (pawn?.IsValid != true)
+            return 0;
+
+        uint ownerHandle = pawn.EntityHandle.Raw;
+        return Utilities
+            .FindAllEntitiesByDesignerName<CBaseCSGrenadeProjectile>(
+                designerName)
+            .Count(projectile => projectile.IsValid
+                && (projectile.Thrower.Raw == ownerHandle
+                    || projectile.OriginalThrower.Raw == ownerHandle));
+    }
+
+    private void RetargetRealProjectile(
+        PendingRealThrow pending,
+        int attempt)
+    {
+        if (TryRetargetRealProjectile(pending))
+            return;
+
+        if (attempt < 2)
+        {
+            AddTimer(
+                0.02f,
+                () => RetargetRealProjectile(pending, attempt + 1));
+            return;
+        }
+
+        Server.PrintToConsole(
+            $"[NadeSystem] real projectile retarget failed "
+            + $"bot={pending.Bot.PlayerName} type={pending.GrenadeType}");
+    }
+
+    private static bool TryRetargetRealProjectile(PendingRealThrow pending)
+    {
+        if (pending.Trajectory is not { } trajectory
+            || !pending.Bot.IsValid
+            || !TypeToProjectile.TryGetValue(
+                pending.GrenadeType,
+                out string? designerName))
+        {
+            return false;
+        }
+
+        var botPawn = pending.Bot.PlayerPawn?.Value;
+        var botOrigin = botPawn?.AbsOrigin;
+        if (botPawn?.IsValid != true || botOrigin == null)
+            return false;
+
+        uint ownerHandle = botPawn.EntityHandle.Raw;
+        var projectile = Utilities
+            .FindAllEntitiesByDesignerName<CBaseCSGrenadeProjectile>(
+                designerName)
+            .Where(candidate => candidate.IsValid
+                && (candidate.Thrower.Raw == ownerHandle
+                    || candidate.OriginalThrower.Raw == ownerHandle))
+            .OrderBy(candidate =>
+            {
+                var position = candidate.AbsOrigin;
+                return position == null
+                    ? float.MaxValue
+                    : DistanceSquared(position, botOrigin);
+            })
+            .FirstOrDefault();
+        if (projectile == null)
+            return false;
+
+        var origin = new Vector(
+            trajectory.OriginX,
+            trajectory.OriginY,
+            trajectory.OriginZ);
+        var velocity = new Vector(
+            trajectory.VelocityX,
+            trajectory.VelocityY,
+            trajectory.VelocityZ);
+        float horizontal = MathF.Sqrt(
+            velocity.X * velocity.X + velocity.Y * velocity.Y);
+        float yaw = horizontal <= 0.001f
+            ? 0f
+            : MathF.Atan2(velocity.Y, velocity.X) * (180f / MathF.PI);
+        float pitch = horizontal <= 0.001f
+            ? 0f
+            : -MathF.Atan2(velocity.Z, horizontal) * (180f / MathF.PI);
+        var angles = new QAngle(pitch, yaw, 0f);
+
+        projectile.InitialPosition.X = origin.X;
+        projectile.InitialPosition.Y = origin.Y;
+        projectile.InitialPosition.Z = origin.Z;
+        projectile.InitialVelocity.X = velocity.X;
+        projectile.InitialVelocity.Y = velocity.Y;
+        projectile.InitialVelocity.Z = velocity.Z;
+        projectile.Teleport(origin, angles, velocity);
+        return true;
+    }
+
+    private static float DistanceSquared(Vector left, Vector right)
+    {
+        float dx = left.X - right.X;
+        float dy = left.Y - right.Y;
+        float dz = left.Z - right.Z;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private void CompleteRealThrow(
+        CCSPlayerController bot,
+        bool engineConfirmed,
+        bool allowPhysicalRestore = true)
+    {
+        if (!_pendingRealThrows.Remove((int)bot.Index, out var pending))
+            return;
+
+        pending.Completed?.Invoke(
+            engineConfirmed,
+            allowPhysicalRestore
+                && pending.State != RealThrowConfirmationState.AwaitingLateConfirmation);
+    }
+
+    private void CancelPendingRealThrows()
+    {
+        foreach (var pending in _pendingRealThrows.Values.ToArray())
+            CompleteRealThrow(
+                pending.Bot,
+                engineConfirmed: false,
+                allowPhysicalRestore: false);
     }
 
     private HookResult OnPlayerJump(EventPlayerJump @event, GameEventInfo info)
@@ -843,6 +1230,10 @@ public class NadeSystemPlugin : BasePlugin
         bool isTakenOver = bot.HasBeenControlledByPlayerThisRound;
         if (isTakenOver) return;
 
+        if (GrenadeExecutionPolicy.Resolve(_profile, RealThrowApiAvailable).Route
+            == GrenadeExecutionRoute.Cancel)
+            return;
+
         var gtype = g.GrenadeType; // lowercase since LoadDb
 
         // ── Round limit checks ─────────────────────────────────
@@ -890,7 +1281,7 @@ public class NadeSystemPlugin : BasePlugin
 
         // BotBuy owns the cash transaction. NadeSystem only consumes the
         // utility item that BotBuy placed in the bot's inventory.
-        if (!TryConsumeUtility(bot, gtype, UtilitySource.LineupThrow)) return;
+        if (!TryPrepareUtility(bot, gtype, UtilitySource.LineupThrow)) return;
 
         _replayBots.Add((uint)bot.Index);
         RegisterCooldown(g.Id, gtype);
@@ -905,10 +1296,14 @@ public class NadeSystemPlugin : BasePlugin
         SpawnProjectile(
             bot,
             g,
-            spawned =>
+            (spawned, allowPhysicalRestore) =>
             {
                 if (spawned) return;
-                RefundUtility(bot, gtype);
+                RefundUtility(
+                    bot,
+                    gtype,
+                    restorePhysicalItem:
+                        allowPhysicalRestore && !UsesLedgerOnlyRealReservation);
                 _replayBots.Remove((uint)bot.Index);
                 RemoveCooldown(g.Id);
                 DecrementCount(gtype, bot.TeamNum);
@@ -926,8 +1321,36 @@ public class NadeSystemPlugin : BasePlugin
     private void SpawnProjectile(
         CCSPlayerController bot,
         GrenadeData g,
-        Action<bool>? onCompleted = null)
+        Action<bool, bool>? onCompleted = null)
     {
+        if (GrenadeExecutionPolicy.Resolve(_profile, RealThrowApiAvailable).Route
+            == GrenadeExecutionRoute.Cancel)
+        {
+            onCompleted?.Invoke(false, true);
+            return;
+        }
+
+        if (ProfilePolicy.IsCompetitive(_profile))
+        {
+            if (!GrenadeTrajectoryPolicy.TryCreate(
+                    g.ProjectilePosition.X,
+                    g.ProjectilePosition.Y,
+                    g.ProjectilePosition.Z,
+                    g.ProjectileVelocity.X,
+                    g.ProjectileVelocity.Y,
+                    g.ProjectileVelocity.Z,
+                    out GrenadeThrowTrajectory trajectory)
+                || !TryThrowFromRealInventory(
+                    bot,
+                    g.GrenadeType,
+                    trajectory,
+                    onCompleted))
+            {
+                onCompleted?.Invoke(false, true);
+            }
+            return;
+        }
+
         // ── Item definition indices (weapon_def_index) ────────────
         // The native Create() functions require the item def index.
         static ushort GetItemIndex(string t) => t switch
@@ -957,7 +1380,7 @@ public class NadeSystemPlugin : BasePlugin
 
         Server.NextFrame(() =>
         {
-            void Complete(bool spawned) => onCompleted?.Invoke(spawned);
+            void Complete(bool spawned) => onCompleted?.Invoke(spawned, true);
             try
             {
                 var botPawn = bot.PlayerPawn?.Value;
@@ -1324,6 +1747,47 @@ public class NadeSystemPlugin : BasePlugin
         return true;
     }
 
+    private bool TryPrepareUtility(
+        CCSPlayerController bot,
+        string grenadeType,
+        UtilitySource source)
+    {
+        return ProfilePolicy.IsCompetitive(_profile) && RealThrowApiAvailable
+            ? TryReserveUtility(bot, grenadeType, source)
+            : TryConsumeUtility(bot, grenadeType, source);
+    }
+
+    // Reserve only the plugin ledger for an engine-backed throw. The actual
+    // inventory item must remain on the bot until the engine accepts the throw;
+    // removing it here would turn a switch+attack into a fake inventory event.
+    private bool TryReserveUtility(
+        CCSPlayerController bot,
+        string grenadeType,
+        UtilitySource source)
+    {
+        if (!TryGetUtilityType(grenadeType, out var type))
+            return true;
+        if (!ProfilePolicy.ShouldEnforceUtilityInventory(_profile))
+            return true;
+
+        string item = GrenadeInventoryPolicy.ExpectedWeapon(
+            grenadeType,
+            bot.Team == CsTeam.CounterTerrorist
+                ? TeamSide.CounterTerrorist
+                : TeamSide.Terrorist);
+        if (item.Length == 0 || CountRealUtility(bot, item) <= 0)
+            return false;
+
+        uint botIndex = (uint)bot.Index;
+        if (!_utilityLedgers.TryGetValue(botIndex, out var ledger))
+        {
+            ledger = new UtilityLedger(ReadUtilityInventory(bot));
+            _utilityLedgers[botIndex] = ledger;
+        }
+
+        return ledger.TryConsume(type, source);
+    }
+
     private bool TryConsumeUtility(
         CCSPlayerController bot,
         string grenadeType,
@@ -1341,17 +1805,11 @@ public class NadeSystemPlugin : BasePlugin
             _utilityLedgers[botIndex] = ledger;
         }
 
-        string item = grenadeType.ToLowerInvariant() switch
-        {
-            "smoke" => "weapon_smokegrenade",
-            "flash" => "weapon_flashbang",
-            "he" => "weapon_hegrenade",
-            "molotov" => bot.Team == CsTeam.CounterTerrorist
-                ? "weapon_incgrenade"
-                : "weapon_molotov",
-            "incgrenade" => "weapon_incgrenade",
-            _ => string.Empty,
-        };
+        string item = GrenadeInventoryPolicy.ExpectedWeapon(
+            grenadeType,
+            bot.Team == CsTeam.CounterTerrorist
+                ? TeamSide.CounterTerrorist
+                : TeamSide.Terrorist);
         int realCountBefore = item.Length == 0 ? 0 : CountRealUtility(bot, item);
         if (realCountBefore <= 0)
             return false;
@@ -1375,7 +1833,8 @@ public class NadeSystemPlugin : BasePlugin
 
     private void RefundUtility(
         CCSPlayerController bot,
-        string grenadeType)
+        string grenadeType,
+        bool restorePhysicalItem = true)
     {
         if (!TryGetUtilityType(grenadeType, out var type))
             return;
@@ -1384,17 +1843,13 @@ public class NadeSystemPlugin : BasePlugin
             || !ledger.Refund(type))
             return;
 
-        string item = grenadeType.ToLowerInvariant() switch
-        {
-            "smoke" => "weapon_smokegrenade",
-            "flash" => "weapon_flashbang",
-            "he" => "weapon_hegrenade",
-            "molotov" => bot.Team == CsTeam.CounterTerrorist
-                ? "weapon_incgrenade"
-                : "weapon_molotov",
-            "incgrenade" => "weapon_incgrenade",
-            _ => string.Empty,
-        };
+        if (!restorePhysicalItem) return;
+
+        string item = GrenadeInventoryPolicy.ExpectedWeapon(
+            grenadeType,
+            bot.Team == CsTeam.CounterTerrorist
+                ? TeamSide.CounterTerrorist
+                : TeamSide.Terrorist);
         if (item.Length == 0) return;
         try
         {
@@ -1484,6 +1939,7 @@ public class NadeSystemPlugin : BasePlugin
         _cooldowns.Clear();
         _replayBots.Clear();
         _smokeCooldownBots.Clear();
+        CancelPendingRealThrows();
         _utilityLedgers.Clear();
         _defuseSmokeUsers.Clear();
         _defuseFlashUsed  = false;
@@ -1961,6 +2417,22 @@ public class NadeSystemPlugin : BasePlugin
         // In case the bot has been taken over
         bool isTakenOver = bot.HasBeenControlledByPlayerThisRound;
         if (isTakenOver) return false;
+        CCSPlayerController actionOwner = bot;
+        GrenadeExecutionRoute executionRoute = GrenadeExecutionPolicy
+            .Resolve(_profile, RealThrowApiAvailable)
+            .Route;
+        if (executionRoute == GrenadeExecutionRoute.Cancel)
+            return false;
+        if (executionRoute == GrenadeExecutionRoute.RealInventoryThrow
+            && GrenadeExecutionPolicy.ShouldPreserveBombAction(source))
+        {
+            // Never switch the action owner to a grenade. Let a teammate own
+            // the real throw; if there is no safe teammate, skip the utility
+            // rather than interrupting an already active plant/defuse.
+            var teammate = FindBombActionThrower(bot, gtype);
+            if (teammate == null) return false;
+            bot = teammate;
+        }
         bool hasLiveEnemy = Utilities
             .FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
             .Any(p => p.IsValid && p.PawnIsAlive
@@ -1970,15 +2442,70 @@ public class NadeSystemPlugin : BasePlugin
 
         // BotBuy already paid for this item. Special throws consume the same
         // per-bot inventory as lineups and must not charge the account again.
-        if (!TryConsumeUtility(bot, gtype, source)) return false;
+        if (!TryPrepareUtility(bot, gtype, source)) return false;
         bool tracksRoundBudget = _botNadesMode == "normal"
             && TryGetUtilityType(gtype, out _);
         bool roundBudgetReserved = tracksRoundBudget
             && TryReserveNormalRoundBudget(bot, gtype);
         if (tracksRoundBudget && !roundBudgetReserved)
         {
-            RefundUtility(bot, gtype);
+            RefundUtility(
+                bot,
+                gtype,
+                restorePhysicalItem: !UsesLedgerOnlyRealReservation);
             return false;
+        }
+
+        if (ProfilePolicy.IsCompetitive(_profile))
+        {
+            void CompleteRealSpecialThrow(
+                bool engineConfirmed,
+                bool allowPhysicalRestore)
+            {
+                if (engineConfirmed) return;
+                RefundUtility(
+                    bot,
+                    gtype,
+                    restorePhysicalItem:
+                        allowPhysicalRestore && !UsesLedgerOnlyRealReservation);
+                if (roundBudgetReserved)
+                    DecrementCount(gtype, bot.TeamNum);
+                switch (source)
+                {
+                    case UtilitySource.DefuseSmoke:
+                        _defuseSmokeUsers.Remove((uint)actionOwner.Index);
+                        break;
+                    case UtilitySource.FlashSupport:
+                        _defuseFlashUsed = false;
+                        break;
+                    case UtilitySource.PlantSmoke:
+                        _plantSmokeUsed = false;
+                        break;
+                }
+            }
+
+            var realVelocity = velocity ?? new Vector(0f, 0f, 0f);
+            if (!GrenadeTrajectoryPolicy.TryCreate(
+                    spawnPos.X,
+                    spawnPos.Y,
+                    spawnPos.Z,
+                    realVelocity.X,
+                    realVelocity.Y,
+                    realVelocity.Z,
+                    out GrenadeThrowTrajectory trajectory)
+                || !TryThrowFromRealInventory(
+                    bot,
+                    gtype,
+                    trajectory,
+                    CompleteRealSpecialThrow))
+            {
+                CompleteRealSpecialThrow(
+                    engineConfirmed: false,
+                    allowPhysicalRestore: true);
+                return false;
+            }
+
+            return true;
         }
 
         var vel = velocity ?? new Vector(0f, 0f, 0f);
@@ -2040,7 +2567,10 @@ public class NadeSystemPlugin : BasePlugin
                     // events can queue in the same tick. If entity creation
                     // fails, return the item and allow a later defuse attempt
                     // to retry.
-                    RefundUtility(bot, gtype);
+                    RefundUtility(
+                        bot,
+                        gtype,
+                        restorePhysicalItem: !UsesLedgerOnlyRealReservation);
                     if (roundBudgetReserved)
                         DecrementCount(gtype, bot.TeamNum);
                     switch (source)
@@ -2059,6 +2589,31 @@ public class NadeSystemPlugin : BasePlugin
             }
         });
         return true;
+    }
+
+    private static CCSPlayerController? FindBombActionThrower(
+        CCSPlayerController actionBot,
+        string grenadeType)
+    {
+        TeamSide side = actionBot.Team == CsTeam.CounterTerrorist
+            ? TeamSide.CounterTerrorist
+            : TeamSide.Terrorist;
+        string item = GrenadeInventoryPolicy.ExpectedWeapon(grenadeType, side);
+        if (item.Length == 0) return null;
+
+        return Utilities
+            .FindAllEntitiesByDesignerName<CCSPlayerController>(
+                "cs_player_controller")
+            .Where(candidate => candidate.IsValid
+                && candidate.IsBot
+                && candidate.Index != actionBot.Index
+                && candidate.TeamNum == actionBot.TeamNum
+                && candidate.PawnIsAlive
+                && !candidate.HasBeenControlledByPlayerThisRound
+                && candidate.PlayerPawn?.Value?.IsDefusing != true
+                && CountRealUtility(candidate, item) > 0)
+            .OrderBy(candidate => candidate.Slot)
+            .FirstOrDefault();
     }
 
     private HookResult OnBombBeginDefuse(EventBombBegindefuse @event, GameEventInfo info)
@@ -2091,7 +2646,11 @@ public class NadeSystemPlugin : BasePlugin
                 hasDefuser = new CCSPlayer_ItemServices(pawn.ItemServices.Handle).HasDefuser;
             }
 
-            bool hasSmoke = ReadUtilityInventory(bot).Smoke > 0;
+            bool hasSmoke = ReadUtilityInventory(bot).Smoke > 0
+                || (GrenadeExecutionPolicy
+                        .Resolve(_profile, RealThrowApiAvailable)
+                        .Route == GrenadeExecutionRoute.RealInventoryThrow
+                    && FindBombActionThrower(bot, "smoke") != null);
             if (DefuseDecisionPolicy.ShouldDeployDefuseSmoke(
                     _profile,
                     hasSmoke,
@@ -2297,16 +2856,20 @@ public class NadeSystemPlugin : BasePlugin
             if (retaliationSpawned >= retaliationLimit) break;
 
             string gt = g.GrenadeType; // lowercase since LoadDb
-            if (!TryConsumeUtility(victim, gt, UtilitySource.Retaliation)) continue;
+            if (!TryPrepareUtility(victim, gt, UtilitySource.Retaliation)) continue;
 
             RegisterCooldown(g.Id, gt);
             SpawnProjectile(
                 victim,
                 g,
-                spawned =>
+                (spawned, allowPhysicalRestore) =>
                 {
                     if (spawned) return;
-                    RefundUtility(victim, gt);
+                    RefundUtility(
+                        victim,
+                        gt,
+                        restorePhysicalItem:
+                            allowPhysicalRestore && !UsesLedgerOnlyRealReservation);
                     RemoveCooldown(g.Id);
                     if (_botNadesMode == "normal")
                         DecrementCount(gt, victim.TeamNum);
@@ -2326,9 +2889,38 @@ public class NadeSystemPlugin : BasePlugin
 
     private void OnTick()
     {
+        long tickStartedAt = _performance.Start();
         _tick++;
-        UpdateSoundTrails(_tick % 4 == 0);
-        if (_tick % 4   == 0) CheckBotZones();
+        // Game events record weapon/jump/grenade sounds immediately. The
+        // periodic pass only needs to prune trails and add movement footsteps,
+        // so keep that work at 1/4 of the tick rate.
+        if (_tick % 4 == 0)
+        {
+            long soundStartedAt = _performance.Start();
+            UpdateSoundTrails(recordFootsteps: true);
+            _performance.Stop(PerformancePhase.SoundMaintenance, soundStartedAt);
+        }
+
+        // Lineup proximity is a planning concern, not a per-tick requirement.
+        // Eight ticks keeps the response sub-150ms on common server rates while
+        // removing repeated entity-table walks from the hot path.
+        if (_tick % 8 == 0) CheckBotZones();
         if (_tick % 256 == 0) PruneCooldowns();
+        _performance.Stop(PerformancePhase.NormalTick, tickStartedAt);
+    }
+
+    private static class BotControllerBridge
+    {
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static object? TryGet()
+        {
+            var capability = new PluginCapability<IBotControllerApi>(
+                "botcontroller:api");
+            return capability.Get();
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static bool SwitchBotWeapon(object api, int slot, int defIndex)
+            => ((IBotControllerApi)api).SwitchBotWeapon(slot, defIndex);
     }
 }

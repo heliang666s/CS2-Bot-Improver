@@ -85,6 +85,7 @@ public class BotState : BasePlugin
     }
     private readonly Dictionary<(int bot, uint flash), FlashDecision> _flashDecisions = new();
     private readonly HashSet<(int bot, uint flash)> _flashRejectLogged = new();
+    private float _nextFlashScanAt;
 
     // Debug logging (toggle with `css_botstate_flashdebug`)
     private bool _debugFlash = false;
@@ -146,6 +147,12 @@ public class BotState : BasePlugin
     private int _tacticalRoundKey = -1;
     private RoundSnapshot? _latestRoundSnapshot;
     private readonly TacticalEconomyPhaseCache _tacticalEconomy = new();
+    private readonly MatchStateCoordinator _matchState = MatchStateCoordinator.Shared;
+    private readonly PerformanceMetrics _performance = new();
+    private readonly Dictionary<int, float> _nextPistolShotAt = new();
+    private readonly Dictionary<int, int> _pistolShotCount = new();
+    private bool _isTacticalPistolRound;
+    private AimDifficultyTier _aimDifficulty = AimDifficultyTier.Medium;
     private int _terroristScore;
     private int _counterTerroristScore;
 
@@ -177,13 +184,18 @@ public class BotState : BasePlugin
         _profile = ProfilePolicy.Resolve(
             ProfileConfig.Load(ProfileConfig.DefaultPath(Server.GameDirectory)),
             IsEntertainmentMode());
+        _aimDifficulty = AimDifficultyPolicy.ResolveActiveProfile(
+            Server.GameDirectory,
+            ConVar.Find("bot_difficulty")?.GetPrimitiveValue<int>() ?? 2);
         _smokeVisibilityCvar = ConVar.Find("bot_max_visible_smoke_length");
         RegisterListener<Listeners.OnMapStart>(_ =>
         {
             _terroristScore = 0;
             _counterTerroristScore = 0;
+            _matchState.ResetForMapOrHotReload();
             _tacticalRoundNumber = 0;
             _tacticalRoundKey = -1;
+            _isTacticalPistolRound = false;
             _latestRoundSnapshot = null;
             _competitiveBotPlayers.Clear();
             _ctEcoPlanningWorker.Reset(new PlanVersion(-1, 0, 0));
@@ -280,6 +292,23 @@ public class BotState : BasePlugin
         }
     }
 
+    [ConsoleCommand("css_botstate_perf", "Print Smarter-Bot phase latency percentiles")]
+    [CommandHelper(minArgs: 0, usage: "", whoCanExecute: CommandUsage.CLIENT_AND_SERVER)]
+    public void OnPerformanceCommand(CCSPlayerController? caller, CommandInfo command)
+    {
+        string[] lines =
+        {
+            _performance.FormatSnapshot(PerformancePhase.NormalTick),
+            _performance.FormatSnapshot(PerformancePhase.FlashDetection),
+            _performance.FormatSnapshot(PerformancePhase.BombPlanted),
+            _performance.FormatSnapshot(PerformancePhase.CtTacticalPlanning),
+            _performance.FormatSnapshot(PerformancePhase.TPostPlantPlanning),
+        };
+        foreach (string line in lines)
+            command.ReplyToCommand($"[Smarter-Bot] {line}");
+        Console.WriteLine($"[Smarter-Bot] perf\n{string.Join('\n', lines)}");
+    }
+
     // Server stdout + every connected human's console. Use only for debug-gated lines
     // so we don't spam non-debug runs.
     private static void BroadcastDebug(string msg)
@@ -359,23 +388,32 @@ public class BotState : BasePlugin
             || victim.Team != CsTeam.CounterTerrorist)
             return;
 
-        if (attacker.PlayerPawn?.Value?.AbsOrigin is { } attackerOrigin)
-            RecordCtThreat(CtThreatEventKind.CtDamage, ResolveContactSite(attackerOrigin));
-        RecordTacticalContact(attacker, ContactConfidence.Medium);
+        int informedListeners = RecordTacticalContact(
+            attacker,
+            ContactConfidence.Medium);
+        if (attacker.PlayerPawn?.Value?.AbsOrigin is { } attackerOrigin
+            && CtThreatAdmissionPolicy.ShouldPromoteToTeam(
+                CtThreatEventKind.CtDamage,
+                informedListeners))
+        {
+            RecordCtThreat(
+                CtThreatEventKind.CtDamage,
+                ResolveContactSite(attackerOrigin));
+        }
     }
 
-    private void RecordTacticalContact(
+    private int RecordTacticalContact(
         CCSPlayerController source,
         ContactConfidence confidence,
         int? preferredListenerSlot = null)
     {
         if (!IsCompetitiveProfile() || source == null || !source.IsValid)
-            return;
+            return 0;
 
         var pawn = source.PlayerPawn?.Value;
         var origin = pawn?.IsValid == true ? pawn.AbsOrigin : null;
         if (origin == null)
-            return;
+            return 0;
 
         var contact = new CtContact(
             SourceSlot: source.Slot,
@@ -388,13 +426,6 @@ public class BotState : BasePlugin
         {
             Site = ResolveContactSite(origin),
         };
-        RecordCtThreat(
-            confidence == ContactConfidence.Low
-                ? CtThreatEventKind.Sound
-                : confidence == ContactConfidence.Medium
-                    ? CtThreatEventKind.CtDamage
-                    : CtThreatEventKind.MultipleEnemies,
-            contact.Site);
 
         var listeners = Utilities
             .FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
@@ -435,6 +466,7 @@ public class BotState : BasePlugin
 
         foreach (var listener in listeners)
             _tacticalRuntime.RecordContactForBot(listener.Player.Slot, contact);
+        return listeners.Count;
     }
 
     private void RecordCtThreat(CtThreatEventKind kind, CtGambleSite site, int count = 1)
@@ -726,23 +758,36 @@ public class BotState : BasePlugin
     //---------------------------------------------------------------------------------------
     private void OnTick()
     {
+        long tickStartedAt = _performance.Start();
         ProcessWeaponSwitchRequests();
-        ProcessFlashbangAvoidance();
+        float now = Server.CurrentTime;
+        if (now >= _nextFlashScanAt)
+        {
+            long flashStartedAt = _performance.Start();
+            ProcessFlashbangAvoidance();
+            _performance.Stop(PerformancePhase.FlashDetection, flashStartedAt);
+            _nextFlashScanAt = now + (_flashThrownAt.Count > 0 ? 0.05f : 0.20f);
+        }
 
         if (IsCompetitiveProfile())
         {
-            float now = Server.CurrentTime;
             if (now >= _nextTacticalTick)
             {
-                _nextTacticalTick = now + 0.25f;
+                // Tactical actions are event-fed and latest-only; a 300ms
+                // cadence is enough for replans while avoiding repeated site
+                // scans on every fourth server tick.
+                _nextTacticalTick = now + 0.30f;
                 ApplyReadyCtEcoPlan();
+                long tacticalStartedAt = _performance.Start();
                 ApplyCompetitiveTacticalActions(now);
+                _performance.Stop(PerformancePhase.CtTacticalPlanning, tacticalStartedAt);
             }
         }
 
         var statePlayers = IsCompetitiveProfile()
             ? _competitiveBotPlayers.Values
             : Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller");
+        bool throttlePistolFire = IsCompetitiveProfile() && _isTacticalPistolRound;
         foreach (var player in statePlayers)
         {
             if (!player.IsValid || !player.IsBot)
@@ -760,7 +805,6 @@ public class BotState : BasePlugin
             if (isTakenOver) continue;
 
             int idx = (int)player.Index;
-            float now = Server.CurrentTime;
             // Door Stuck Fix
             bool inDoorCooldown = _doorEventCooldown.TryGetValue(idx, out float doorCooldownEnd) && now < doorCooldownEnd;
 
@@ -866,6 +910,19 @@ public class BotState : BasePlugin
 
             // Sniper Peek
             bool curIsAttacking = bot.IsAttacking;
+            string? activeWeaponName = pawn.WeaponServices?.ActiveWeapon?.Value?.DesignerName;
+            if (throttlePistolFire
+                && curIsAttacking
+                && AimWeaponPolicy.IsPistol(activeWeaponName)
+                && _nextPistolShotAt.TryGetValue(idx, out float nextPistolShotAt)
+                && now < nextPistolShotAt)
+            {
+                // Native AI can hold attack across ticks. Make the difficulty
+                // affect actual fire cadence, not only the target point, while
+                // leaving weapon cooldown and engine inventory authoritative.
+                bot.IsAttacking = false;
+                curIsAttacking = false;
+            }
 
             if (curIsAttacking && _hasFiredThisAttack.Remove(idx))
             {
@@ -1176,6 +1233,8 @@ public class BotState : BasePlugin
                 }
             }
         }
+
+        _performance.Stop(PerformancePhase.NormalTick, tickStartedAt);
     }
 
     private void ProcessWeaponSwitchRequests()
@@ -1421,6 +1480,16 @@ public class BotState : BasePlugin
         _lastTPostPlantReason = null;
         var phase = ResolveTacticalRoundPhaseFromGameState();
         _tacticalRoundKey = ResolveTacticalRoundKey();
+        _matchState.UpdateFormat(new MatchFormatSnapshot(
+            ReadMaxRounds(),
+            ReadOvertimeEnabled(),
+            ReadOvertimeMaxRounds()));
+        _matchState.BeginRound(_tacticalRoundKey, CurrentRoundsPlayed());
+        SynchronizeCompetitiveScore(
+            recoverFromTeamEntities: true,
+            out bool recoveredFromTeamEntities);
+        if (!recoveredFromTeamEntities)
+            ScheduleCompetitiveScoreRecovery(attempt: 0);
         _latestRoundSnapshot = null;
         _isFreezeTime = phase == RoundPhase.Freeze;
         _tacticalRuntime.Reset(CreateTacticalRoundContext(phase));
@@ -2121,8 +2190,16 @@ public class BotState : BasePlugin
             : _ctGambleTargets.ContainsKey(_tPostPlantSite);
     }
 
+    private static CCSPlayerController[] FindValidMatchPlayers()
+        => Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>(
+                "cs_player_controller")
+            .Where(player => player.IsValid
+                && player.Team is CsTeam.Terrorist or CsTeam.CounterTerrorist)
+            .ToArray();
+
     private void RunCompetitiveTPostPlantTick(float now)
     {
+        long startedAt = _performance.Start();
         var bomb = _cachedBombEntity;
         if (!_tPostPlantActive || (bomb?.IsValid != true && _cachedBombOrigin == null))
         {
@@ -2134,6 +2211,7 @@ public class BotState : BasePlugin
             _tPostPlantAssignmentsDirty = false;
             _lastTPostPlantAction = null;
             _lastTPostPlantReason = null;
+            _performance.Stop(PerformancePhase.TPostPlantPlanning, startedAt);
             return;
         }
 
@@ -2160,20 +2238,22 @@ public class BotState : BasePlugin
             _tPostPlantAssignmentsDirty = false;
         }
 
-        var players = _competitiveBotPlayers.Values
-            .Where(player => player.IsValid && player.Team is CsTeam.Terrorist or CsTeam.CounterTerrorist)
-            .ToArray();
-        int aliveT = players.Count(player => player.Team == CsTeam.Terrorist && player.PawnIsAlive);
-        int aliveCt = players.Count(player => player.Team == CsTeam.CounterTerrorist && player.PawnIsAlive);
-        var ctPlayers = players.Where(player => player.Team == CsTeam.CounterTerrorist);
+        var players = FindValidMatchPlayers();
+        var roster = PostPlantRosterPolicy.Summarize(
+            players.Select(player => new PostPlantPlayerSnapshot(
+                player.Team == CsTeam.Terrorist
+                    ? TeamSide.Terrorist
+                    : TeamSide.CounterTerrorist,
+                player.PawnIsAlive,
+                player.Team == CsTeam.CounterTerrorist && HasDefuser(player))));
         int bombSeconds = ResolveBombSecondsRemaining(out bool bombTimerKnown);
         var decision = TPostPlantPolicy.Evaluate(new TPostPlantContext(
             BombPlanted: true,
             bombSeconds,
-            aliveT,
-            aliveCt,
+            roster.AliveTerrorists,
+            roster.AliveCounterTerrorists,
             PathViable: _tPostPlantTargets.Count > 0,
-            CtDefusers: ctPlayers.Count(player => player.PawnIsAlive && HasDefuser(player)),
+            CtDefusers: roster.CtDefusers,
             CtRetakePathViable: ResolveCtPostPlantPathViable(),
             RetreatPathViable: _tPostPlantRetreatTargets.Count > 0,
             BombTimerKnown: bombTimerKnown));
@@ -2195,7 +2275,7 @@ public class BotState : BasePlugin
                 BroadcastDebug(
                     $"[Smarter-Bot/Tactical] t-postplant action={decision.Action} "
                     + $"reason={decision.Reason} bomb={bombSeconds} "
-                    + $"timer-known={bombTimerKnown} alive={aliveT}v{aliveCt} "
+                    + $"timer-known={bombTimerKnown} alive={roster.AliveTerrorists}v{roster.AliveCounterTerrorists} "
                     + $"site-targets={_tPostPlantTargets.Count} "
                     + $"retreat-targets={_tPostPlantRetreatTargets.Count}");
             }
@@ -2280,6 +2360,8 @@ public class BotState : BasePlugin
                 timescale = 1f;
             }
         }
+
+        _performance.Stop(PerformancePhase.TPostPlantPlanning, startedAt);
     }
 
     private void ApplyTPostPlantAttention(
@@ -2557,7 +2639,7 @@ public class BotState : BasePlugin
         // Account balances are post-purchase state after BotBuy runs and can
         // also be low in a normal loss streak. The round schedule is the only
         // source of truth for pistol rounds.
-        bool pistolRound = IsTacticalPistolRound();
+        bool pistolRound = _isTacticalPistolRound;
         bool forceBuySignal = !pistolRound
             && ctMoney.Count(money => money >= BuyPlanner.KevlarPrice + 1250)
                 >= Math.Max(1, (int)Math.Ceiling(ctMoney.Length * 0.60d))
@@ -2738,23 +2820,97 @@ public class BotState : BasePlugin
         }
     }
 
-    private void SynchronizeCompetitiveScore()
+    private void ScheduleCompetitiveScoreRecovery(int attempt)
     {
+        AddTimer(
+            ScoreRecoveryPolicy.RetryDelaySeconds(attempt),
+            () =>
+            {
+                SynchronizeCompetitiveScore(
+                    recoverFromTeamEntities: true,
+                    out bool recoveredFromTeamEntities);
+                if (ScoreRecoveryPolicy.ShouldRetry(
+                        recoveredFromTeamEntities,
+                        attempt))
+                {
+                    ScheduleCompetitiveScoreRecovery(attempt + 1);
+                }
+            });
+    }
+
+    private bool SynchronizeCompetitiveScore(
+        bool recoverFromTeamEntities = false)
+        => SynchronizeCompetitiveScore(
+            recoverFromTeamEntities,
+            out _);
+
+    private bool SynchronizeCompetitiveScore(
+        bool recoverFromTeamEntities,
+        out bool recoveredFromTeamEntities)
+    {
+        recoveredFromTeamEntities = false;
+        if (recoverFromTeamEntities
+            && TryReadTeamScoreSnapshot(
+                out int terroristScore,
+                out int counterTerroristScore))
+        {
+            int roundsPlayed = CurrentRoundsPlayed();
+            _matchState.RestoreHotReloadState(
+                terroristScore,
+                counterTerroristScore,
+                roundKey: roundsPlayed,
+                roundsPlayed: roundsPlayed);
+            recoveredFromTeamEntities = true;
+            Console.WriteLine(
+                $"[Smarter-Bot] ScoreRecovered T={terroristScore} CT={counterTerroristScore}");
+        }
+
+        _matchState.UpdateFormat(new MatchFormatSnapshot(
+            ReadMaxRounds(),
+            ReadOvertimeEnabled(),
+            ReadOvertimeMaxRounds()));
+
+        _terroristScore = _matchState.Score.Terrorist;
+        _counterTerroristScore = _matchState.Score.CounterTerrorist;
+        return _matchState.ScoreIsAuthoritative;
+    }
+
+    private static bool TryReadTeamScoreSnapshot(
+        out int terroristScore,
+        out int counterTerroristScore)
+    {
+        terroristScore = -1;
+        counterTerroristScore = -1;
         try
         {
-            var gameRules = Utilities
-                .FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules")
-                .FirstOrDefault()?.GameRules;
-            if (RoundScoreReader.TryRead(gameRules, out var score))
+            foreach (var team in Utilities
+                         .FindAllEntitiesByDesignerName<CCSTeam>(
+                             TeamScoreEntityPolicy.DesignerName)
+                         .Where(team => team.IsValid
+                             && team.DesignerName == TeamScoreEntityPolicy.DesignerName))
             {
-                _terroristScore = score.Terrorist;
-                _counterTerroristScore = score.CounterTerrorist;
+                if (!TeamScoreEntityPolicy.TryResolveSide(
+                        (int)team.TeamNum,
+                        out TeamSide side))
+                    continue;
+
+                if (side == TeamSide.Terrorist)
+                {
+                    terroristScore = team.Score;
+                }
+                else
+                {
+                    counterTerroristScore = team.Score;
+                }
             }
+
+            return terroristScore >= 0 && counterTerroristScore >= 0;
         }
         catch
         {
-            // Keep event-based counters as a fallback for CSS builds that do
-            // not expose team score fields through GameRules.
+            terroristScore = -1;
+            counterTerroristScore = -1;
+            return false;
         }
     }
 
@@ -2923,6 +3079,15 @@ public class BotState : BasePlugin
         _isFreezeTime = true;
         _tacticalRoundNumber++;
         _tacticalRoundKey = ResolveTacticalRoundKey();
+        _matchState.UpdateFormat(new MatchFormatSnapshot(
+            ReadMaxRounds(),
+            ReadOvertimeEnabled(),
+            ReadOvertimeMaxRounds()));
+        _matchState.BeginRound(_tacticalRoundKey, CurrentRoundsPlayed());
+        // The round schedule is stable after round_start. Cache the result so
+        // the per-tick attack path never scans cs_gamerules or reads ConVars.
+        _isTacticalPistolRound = IsCompetitiveProfile()
+            && IsTacticalPistolRound();
         _competitiveBotPlayers.Clear();
         _ctEcoPlanningWorker.Reset(new PlanVersion(_tacticalRoundKey, 0, 0));
         _ctDecisionSnapshotValue = 0;
@@ -2974,15 +3139,30 @@ public class BotState : BasePlugin
         _lastRepathTime.Clear();
         _hasFiredThisAttack.Clear();
         _prevIsAttacking.Clear();
+        _nextPistolShotAt.Clear();
+        _pistolShotCount.Clear();
         _cachedInAir.Clear();
         _cachedNearLadder.Clear();
 
         // Flash projectiles never survive a round transition; drop their tracking
         // so entity indices reused next round don't match stale decisions.
         _flashThrownAt.Clear();
+        _nextFlashScanAt = 0f;
         _flashRolledByBot.Clear();
         _flashDecisions.Clear();
         _flashRejectLogged.Clear();
+        return HookResult.Continue;
+    }
+
+    [GameEventHandler]
+    private HookResult OnTeamScore(EventTeamScore @event, GameEventInfo info)
+    {
+        if (IsCompetitiveProfile())
+        {
+            _matchState.ApplyTeamScoreEvent(@event.Teamid, @event.Score);
+            SynchronizeCompetitiveScore();
+        }
+
         return HookResult.Continue;
     }
 
@@ -2992,10 +3172,10 @@ public class BotState : BasePlugin
         if (IsCompetitiveProfile())
         {
             TeamSide? winner = ResolveRoundWinner(@event);
-            if (winner == TeamSide.Terrorist)
-                _terroristScore++;
-            else if (winner == TeamSide.CounterTerrorist)
-                _counterTerroristScore++;
+            bool authoritativeScore = SynchronizeCompetitiveScore();
+            if (winner.HasValue && !authoritativeScore)
+                _matchState.ApplyRoundWinner(winner.Value);
+            SynchronizeCompetitiveScore();
 
             _tacticalRuntime.SetPhase(RoundPhase.RoundEnd);
             _tacticalRolesInitialized = false;
@@ -3090,9 +3270,18 @@ public class BotState : BasePlugin
             var attacker = @event.Attacker;
             if (attacker != null && attacker.IsValid && attacker.Team == CsTeam.Terrorist)
             {
-                if (attacker.PlayerPawn?.Value?.AbsOrigin is { } attackerOrigin)
-                    RecordCtThreat(CtThreatEventKind.CtDeath, ResolveContactSite(attackerOrigin));
-                RecordTacticalContact(attacker, ContactConfidence.High);
+                int informedListeners = RecordTacticalContact(
+                    attacker,
+                    ContactConfidence.High);
+                if (attacker.PlayerPawn?.Value?.AbsOrigin is { } attackerOrigin
+                    && CtThreatAdmissionPolicy.ShouldPromoteToTeam(
+                        CtThreatEventKind.CtDeath,
+                        informedListeners))
+                {
+                    RecordCtThreat(
+                        CtThreatEventKind.CtDeath,
+                        ResolveContactSite(attackerOrigin));
+                }
             }
         }
 
@@ -3255,9 +3444,18 @@ public class BotState : BasePlugin
 
         if (IsCompetitiveProfile() && shooter.Team == CsTeam.Terrorist)
         {
-            if (shooter.PlayerPawn?.Value?.AbsOrigin is { } shooterOrigin)
-                RecordCtThreat(CtThreatEventKind.Sound, ResolveContactSite(shooterOrigin));
-            RecordTacticalContact(shooter, ContactConfidence.Low);
+            int informedListeners = RecordTacticalContact(
+                shooter,
+                ContactConfidence.Low);
+            if (shooter.PlayerPawn?.Value?.AbsOrigin is { } shooterOrigin
+                && CtThreatAdmissionPolicy.ShouldPromoteToTeam(
+                    CtThreatEventKind.Sound,
+                    informedListeners))
+            {
+                RecordCtThreat(
+                    CtThreatEventKind.Sound,
+                    ResolveContactSite(shooterOrigin));
+            }
         }
 
         if (!shooter.IsBot) return HookResult.Continue;
@@ -3271,12 +3469,24 @@ public class BotState : BasePlugin
         // Sniper Peek
         _hasFiredThisAttack.Add(idx);
 
+        string? wpnFire = pawn.WeaponServices?.ActiveWeapon?.Value?.DesignerName;
+        if (IsCompetitiveProfile()
+            && _isTacticalPistolRound
+            && AimWeaponPolicy.IsPistol(wpnFire))
+        {
+            int shotNumber = _pistolShotCount.GetValueOrDefault(idx);
+            _pistolShotCount[idx] = shotNumber + 1;
+            _nextPistolShotAt[idx] = Server.CurrentTime
+                + AimDifficultyPolicy.PistolFireRecoverySeconds(
+                    _aimDifficulty,
+                    shotNumber);
+        }
+
         // Counter-strafe on fire
         bool cachedInAir = _cachedInAir.GetValueOrDefault(idx, false);
         bool cachedNearLadder = _cachedNearLadder.GetValueOrDefault(idx, false);
         if (!cachedInAir && !cachedNearLadder)
         {
-            string? wpnFire = pawn.WeaponServices?.ActiveWeapon?.Value?.DesignerName;
             if (wpnFire != null)
             {
                 float vx = pawn.AbsVelocity.X;
@@ -3370,15 +3580,24 @@ public class BotState : BasePlugin
             || thrower.Team != CsTeam.Terrorist)
             return HookResult.Continue;
 
-        if (thrower.PlayerPawn?.Value?.AbsOrigin is { } origin)
+        int informedListeners = RecordTacticalContact(
+            thrower,
+            ContactConfidence.Low);
+        if (thrower.PlayerPawn?.Value?.AbsOrigin is { } origin
+            && CtThreatAdmissionPolicy.ShouldPromoteToTeam(
+                CtThreatEventKind.AttackUtility,
+                informedListeners))
+        {
             RecordCtThreat(
                 CtThreatEventKind.AttackUtility,
                 ResolveContactSite(origin));
+        }
         return HookResult.Continue;
     }
 
     private HookResult OnBombPlanted(EventBombPlanted @event, GameEventInfo info)
     {
+        long startedAt = _performance.Start();
         if (IsCompetitiveProfile())
         {
             _bombPlantedAt = Server.CurrentTime;
@@ -3420,6 +3639,7 @@ public class BotState : BasePlugin
             _nextTPostPlantTargetRefreshAt = Server.CurrentTime + 1f;
             _nextTPostPlantRetreatRefreshAt = Server.CurrentTime + 1f;
 
+            _performance.Stop(PerformancePhase.BombPlanted, startedAt);
             return HookResult.Continue;
         }
 
@@ -3453,6 +3673,7 @@ public class BotState : BasePlugin
             ref bool isRunning = ref bot.IsRunning;
             isRunning = true;
         }
+        _performance.Stop(PerformancePhase.BombPlanted, startedAt);
         return HookResult.Continue;
     }
 

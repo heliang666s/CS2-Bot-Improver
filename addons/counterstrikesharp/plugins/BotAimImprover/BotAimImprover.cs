@@ -140,6 +140,7 @@ public class BotAimImprover : BasePlugin
 
     private MemoryFunctionVoid<IntPtr>? _pickNewAimSpot;
     private BotMatchProfile _profile = BotMatchProfile.Competitive;
+    private AimDifficultyTier _aimDifficulty = AimDifficultyTier.Medium;
     private bool _isPistolRound;
     private readonly IVisibilityPolicy _visibilityPolicy = new CompetitiveVisibilityPolicy();
     private static readonly PluginCapability<CRayTraceInterface> _rayTraceCapability =
@@ -180,6 +181,7 @@ public class BotAimImprover : BasePlugin
         _profile = ProfilePolicy.Resolve(
             ProfileConfig.Load(ProfileConfig.DefaultPath(Server.GameDirectory)),
             IsEntertainmentMode());
+        _aimDifficulty = ResolveAimDifficultyFromActiveProfile();
         bool win = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
         _off = win ? WindowsOffsets : LinuxOffsets;
 
@@ -195,7 +197,11 @@ public class BotAimImprover : BasePlugin
 
             Logger.LogInformation("[BotAimImprover] Loaded ({Plat}). PickNewAimSpot=0x{Pna:X16}",
                 win ? "Windows" : "Linux", pnaRuntime);
-            Logger.LogInformation("[BotAimImprover] Active profile: {Profile}; aim override requires native visibility and RayTrace", _profile);
+            Logger.LogInformation(
+                "[BotAimImprover] Active profile: {Profile}, aim difficulty: {Difficulty}; "
+                + "aim override requires native visibility and RayTrace",
+                _profile,
+                _aimDifficulty);
         }
         catch (Exception ex)
         {
@@ -260,6 +266,13 @@ public class BotAimImprover : BasePlugin
         bool noSpread = ConVar.Find("weapon_accuracy_nospread")?.StringValue is "1" or "true";
         bool unlimitedMoney = ConVar.Find("mp_maxmoney")?.StringValue == "0";
         return teammatesAreEnemies || noSpread || unlimitedMoney;
+    }
+
+    private AimDifficultyTier ResolveAimDifficultyFromActiveProfile()
+    {
+        return AimDifficultyPolicy.ResolveActiveProfile(
+            Server.GameDirectory,
+            ConVar.Find("bot_difficulty")?.GetPrimitiveValue<int>() ?? 2);
     }
 
     public override void Unload(bool hotReload)
@@ -328,12 +341,14 @@ public class BotAimImprover : BasePlugin
             bool competitivePistolRound = _isPistolRound
                 && _profile == BotMatchProfile.Competitive
                 && AimWeaponPolicy.IsPistol(wpn);
+            var difficulty = _aimDifficulty;
             var pistolAimAdjustment = AimWeaponPolicy.GetPistolAimAdjustment(
                 _profile,
                 competitivePistolRound ? BuyPhase.Pistol : BuyPhase.FullBuy,
                 (int)botController.Index,
                 enemyIdx,
-                Server.CurrentTime);
+                Server.CurrentTime,
+                difficulty);
             if (competitivePistolRound)
             {
                 if (!pistolAimAdjustment.ApplyOverride)
@@ -343,7 +358,8 @@ public class BotAimImprover : BasePlugin
                 if (!_pistolAimReadyAt.TryGetValue(readyKey, out float readyAt))
                 {
                     _pistolAimReadyAt[readyKey] = Server.CurrentTime
-                        + pistolAimAdjustment.ReactionDelaySeconds;
+                        + pistolAimAdjustment.ReactionDelaySeconds
+                        + pistolAimAdjustment.FocusDelaySeconds;
                     return HookResult.Continue;
                 }
                 if (Server.CurrentTime < readyAt)
@@ -392,7 +408,10 @@ public class BotAimImprover : BasePlugin
                 if (length > 0.1f)
                 {
                     float direction = (pistolAimAdjustment.JitterSeed & 1) == 0 ? 1f : -1f;
-                    float jitter = pistolAimAdjustment.TargetJitterUnits * direction;
+                    float stabilityMultiplier = 1f
+                        + (1f - pistolAimAdjustment.BurstStability) * 0.5f;
+                    float jitter = pistolAimAdjustment.TargetJitterUnits
+                        * stabilityMultiplier * direction;
                     rx += -dy / length * jitter;
                     ry += dx / length * jitter;
                     rz += ((pistolAimAdjustment.JitterSeed % 3) - 1)

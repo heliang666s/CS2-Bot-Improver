@@ -578,20 +578,6 @@ public sealed class EconomyTacticalPolicyTests
     }
 
     [Fact]
-    public void ReadsAuthoritativeScoresFromTheGameRulesShape()
-    {
-        var rules = new FakeScoreRules
-        {
-            TeamTScore = 12,
-            TeamCTScore = 11,
-        };
-
-        Assert.True(RoundScoreReader.TryRead(rules, out var score));
-        Assert.Equal(12, score.Terrorist);
-        Assert.Equal(11, score.CounterTerrorist);
-    }
-
-    [Fact]
     public void BombTimerReaderSupportsAbsoluteBlowTime()
     {
         var bomb = new FakeBomb { BlowTime = 109.2f };
@@ -672,12 +658,6 @@ public sealed class EconomyTacticalPolicyTests
 
         Assert.False(settlement.Confirmed);
         Assert.True(settlement.ShouldRefund);
-    }
-
-    private sealed class FakeScoreRules
-    {
-        public int TeamTScore { get; init; }
-        public int TeamCTScore { get; init; }
     }
 
     private sealed class FakeBomb

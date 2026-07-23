@@ -4,6 +4,26 @@ namespace CompetitiveBotCore.Tests;
 
 public sealed class CompetitiveTacticalV2Tests
 {
+    [Theory]
+    [InlineData(CtThreatEventKind.Sound, 0, false)]
+    [InlineData(CtThreatEventKind.Sound, 1, true)]
+    [InlineData(CtThreatEventKind.AttackUtility, 0, false)]
+    [InlineData(CtThreatEventKind.AttackUtility, 1, true)]
+    [InlineData(CtThreatEventKind.CtDamage, 0, true)]
+    [InlineData(CtThreatEventKind.CtDeath, 0, true)]
+    [InlineData(CtThreatEventKind.BombFound, 0, true)]
+    public void TeamThreatRequiresAnInformedListenerForAmbientEvidence(
+        CtThreatEventKind kind,
+        int informedListeners,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            CtThreatAdmissionPolicy.ShouldPromoteToTeam(
+                kind,
+                informedListeners));
+    }
+
     [Fact]
     public void FourPlusOneUsesDistinctCrossfireAssignments()
     {
