@@ -1,6 +1,7 @@
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
+using CounterStrikeSharp.API.Core.Capabilities;
 using CounterStrikeSharp.API.Modules.Utils;
 using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Modules.Commands;
@@ -10,6 +11,7 @@ using CompetitiveBotCore;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 
 namespace BotBuyPatch;
 
@@ -19,6 +21,9 @@ public sealed class BotBuyPatch : BasePlugin
     public override string ModuleVersion     => "1.0.12";
     public override string ModuleAuthor      => "ed0ard";
     public override string ModuleDescription => "Enable bots to take more buy options";
+
+    private const int CompetitiveTransferRetryLimit =
+        FreezeBuyPolicy.MaximumDeferredConfirmationAttempts - 1;
 
     private sealed record CompetitiveBuyPlanningInput(
         TeamSide Side,
@@ -49,6 +54,18 @@ public sealed class BotBuyPatch : BasePlugin
         _counterTerroristBuyWorker = CreateBuyWorker();
     }
 
+    public override void OnAllPluginsLoaded(bool hotReload)
+    {
+        try
+        {
+            _botController = BotControllerBridge.TryGet();
+        }
+        catch
+        {
+            _botController = null;
+        }
+    }
+
     private LatestOnlyPlanningWorker<CompetitiveBuyPlanningInput, CompetitiveBuyPlanningOutput> CreateBuyWorker()
         => new(
             input => new CompetitiveBuyPlanningOutput(
@@ -77,6 +94,8 @@ public sealed class BotBuyPatch : BasePlugin
             _botUserIdToIndex.Clear();
             _botIndexCounter = 0;
             _roundStartMoney.Clear();
+            _stableAwperSlots.Clear();
+            _pendingCompetitivePurchases.Clear();
             _competitiveBuyExecutionClosed = true;
             _competitiveNativeBuySuppressed = false;
             ResetBuyPlanning(new PlanVersion(-1, 0, 0));
@@ -135,6 +154,9 @@ public sealed class BotBuyPatch : BasePlugin
     private float _freezeExecutionAt;
     private float _freezeEndAt;
     private long _lastCalibrationInventoryRevision = long.MinValue;
+    private readonly Dictionary<TeamSide, int> _stableAwperSlots = new();
+    private readonly HashSet<(int Slot, string Item, int ExpectedCount)> _pendingCompetitivePurchases = new();
+    private object? _botController;
     private BoundedTeamBuyResult? _pendingTerroristExecution;
     private BoundedTeamBuyResult? _pendingCounterTerroristExecution;
     private long _terroristExecutionGeneration;
@@ -163,6 +185,12 @@ public sealed class BotBuyPatch : BasePlugin
         if (player != null)
         {
             _roundStartMoney.Remove((int)player.Index);
+            _pendingCompetitivePurchases.RemoveWhere(entry => entry.Slot == (int)player.Index);
+            foreach (TeamSide side in Enum.GetValues<TeamSide>())
+            {
+                if (_stableAwperSlots.GetValueOrDefault(side) == (int)player.Index)
+                    _stableAwperSlots.Remove(side);
+            }
             RemoveBot(player);
         }
         return HookResult.Continue;
@@ -300,8 +328,9 @@ public sealed class BotBuyPatch : BasePlugin
 
         bool competitive = CurrentProfile() == BotMatchProfile.Competitive;
         float freezeSeconds = competitive ? ReadFreezeTimeSeconds() : 5f;
+        string? nativeLoadout = ConVar.Find("bot_loadout")?.StringValue;
         bool customCompetitiveBuy = competitive
-            && string.IsNullOrEmpty(ConVar.Find("bot_loadout")?.StringValue);
+            && string.IsNullOrEmpty(nativeLoadout);
         if (competitive)
         {
             ResetRoundEconomyFacts();
@@ -309,7 +338,9 @@ public sealed class BotBuyPatch : BasePlugin
             _competitiveNativeBuySuppressed = customCompetitiveBuy
                 && SuppressNativeCompetitiveBotBuying();
             _finalCalibrationCompleted = false;
-            _competitiveBuyExecutionClosed = false;
+            _pendingCompetitivePurchases.Clear();
+            _competitiveBuyExecutionClosed = !customCompetitiveBuy
+                || !_competitiveNativeBuySuppressed;
             _buyExecutionSequence = 0;
             _lastCalibrationInventoryRevision = long.MinValue;
             _freezeExecutionAt = FreezeBuyPolicy.ExecutionAt(
@@ -324,9 +355,22 @@ public sealed class BotBuyPatch : BasePlugin
                 ReadOvertimeMaxRounds()));
             _matchState.BeginRound(CurrentRoundsPlayed(), CurrentRoundsPlayed());
             ResetBuyPlanning(new PlanVersion(CurrentRoundsPlayed(), 0, 0));
+            if (!customCompetitiveBuy)
+            {
+                Server.PrintToConsole(
+                    $"[BotBuy] CustomCompetitiveBuyDisabled reason="
+                    + (string.IsNullOrEmpty(nativeLoadout)
+                        ? "not-competitive-profile"
+                        : "bot_loadout-nonempty"));
+            }
+            else if (!_competitiveNativeBuySuppressed)
+            {
+                Server.PrintToConsole(
+                    "[BotBuy] CustomCompetitiveBuyDisabled reason=bot_eco_limit-suppression-failed failClosed=1");
+            }
         }
 
-        if (customCompetitiveBuy)
+        if (customCompetitiveBuy && _competitiveNativeBuySuppressed)
         {
             AddTimer(
                 Math.Max(0f, freezeSeconds - FreezeBuyPolicy.FinalCalibrationWindowSeconds),
@@ -870,6 +914,26 @@ public sealed class BotBuyPatch : BasePlugin
             _roundStartMoney[(int)player.Index] =
                 player.InGameMoneyServices?.Account ?? 0;
         }
+    }
+
+    private PlayerEquipmentSnapshot CaptureEquipmentSnapshot(
+        CCSPlayerController player)
+    {
+        TeamSide side = player.Team == CsTeam.CounterTerrorist
+            ? TeamSide.CounterTerrorist
+            : TeamSide.Terrorist;
+        var pawn = player.PlayerPawn?.Value;
+        return new PlayerEquipmentSnapshot(
+            (int)player.Index,
+            player.IsBot,
+            player.InGameMoneyServices?.Account ?? 0,
+            RoundStartMoney(player),
+            pawn?.ArmorValue ?? 0,
+            HasHelmet(player),
+            CurrentPrimary(player),
+            CurrentSecondary(player),
+            side == TeamSide.CounterTerrorist && HasDefuser(player),
+            CurrentUtilityCounts(player, side));
     }
 
     private bool SuppressNativeCompetitiveBotBuying()
@@ -1499,21 +1563,25 @@ public sealed class BotBuyPatch : BasePlugin
             opponentScore,
             roundsPlayed,
             maxRounds);
-        var currentTeamMoney = allTeamPlayers
-            .Select(player => player.InGameMoneyServices?.Account ?? 0)
+        var equipmentSnapshots = allTeamPlayers
+            .Select(CaptureEquipmentSnapshot)
             .ToArray();
-        var currentOpponentMoney = allOpponentPlayers
-            .Select(player => player.InGameMoneyServices?.Account ?? 0)
+        var currentTeamMoney = equipmentSnapshots
+            .Select(snapshot => snapshot.CurrentMoney)
             .ToArray();
-        var phaseTeamMoney = EconomySnapshotPolicy.ForPhaseClassification(
-            allTeamPlayers.Select(RoundStartMoney).ToArray(),
-            currentTeamMoney);
-        var phaseOpponentMoney = EconomySnapshotPolicy.ForPhaseClassification(
-            allOpponentPlayers.Select(RoundStartMoney).ToArray(),
-            currentOpponentMoney);
-        bool opponentEcoLikely = phaseOpponentMoney.Count > 0
-            && phaseOpponentMoney.Count(money => money < 1800)
-                >= Math.Max(1, phaseOpponentMoney.Count - 1);
+        var opponentEquipmentSnapshots = allOpponentPlayers
+            .Select(CaptureEquipmentSnapshot)
+            .ToArray();
+        // Equipment snapshots are authoritative once the round is live. The
+        // opening balance remains metadata for next-round accounting, never a
+        // second wallet added to current cash or current equipment.
+        var phaseTeamMoney = currentTeamMoney;
+        TeamSide opponentSide = side == TeamSide.CounterTerrorist
+            ? TeamSide.Terrorist
+            : TeamSide.CounterTerrorist;
+        bool opponentEcoLikely = EquipmentEconomy.IsEcoLikely(
+            opponentEquipmentSnapshots,
+            opponentSide);
         int forceEligible = phaseTeamMoney.Count(money => money
             >= BuyPlanner.KevlarPrice + 1250);
         int forceThreshold = Math.Max(1, (int)Math.Ceiling(allTeamPlayers.Count * 0.60d));
@@ -1529,6 +1597,7 @@ public sealed class BotBuyPatch : BasePlugin
             opponentEcoLikely)
         {
             IsOvertimeFirstRound = overtimeFirstRound,
+            Players = equipmentSnapshots,
         };
         var phase = BuyPlanner.Classify(snapshot);
         var matchPressure = MatchPressurePolicy.Evaluate(
@@ -1543,6 +1612,11 @@ public sealed class BotBuyPatch : BasePlugin
         var observedUtilities = allTeamPlayers.ToDictionary(
             player => (int)player.Index,
             player => CurrentUtilityCounts(player, side));
+        if (_stableAwperSlots.TryGetValue(side, out int stableSlot)
+            && teamBots.All(bot => (int)bot.Index != stableSlot))
+        {
+            _stableAwperSlots.Remove(side);
+        }
         var rewardRules = ReadEconomyRewards();
         _lastRewardSnapshot = rewardRules;
         var buyMode = TeamBuyModePolicy.Resolve(
@@ -1553,10 +1627,46 @@ public sealed class BotBuyPatch : BasePlugin
         var purchaseIntent = TeamBuyModePolicy.ToPurchaseIntent(buyMode, phase);
         Server.PrintToConsole($"[BotBuy] Competitive BuyPlan side={side} phase={phase} mode={buyMode} pressure={matchPressure.Level} intent={purchaseIntent} score={teamScore}-{opponentScore} rounds={roundsPlayed} bots={teamBots.Count} players={allTeamPlayers.Count} requiresAllIn={(matchPressure.RequiresAllIn ? 1 : 0)} halfEnd={lastRoundOfHalf} otFirst={overtimeFirstRound}");
 
-        // Only one high-money bot per side may become the designated AWP role.
-        var awper = teamBots
-            .OrderByDescending(RoundStartMoney)
-            .FirstOrDefault(bot => RoundStartMoney(bot) >= 5400);
+        bool humanHasAwp = allTeamPlayers
+            .Where(player => !player.IsBot)
+            .Any(player => CurrentPrimary(player) == "weapon_awp");
+        var awper = humanHasAwp
+            ? null
+            : teamBots.FirstOrDefault(bot => CurrentPrimary(bot) == "weapon_awp")
+                ?? teamBots.FirstOrDefault(bot =>
+                    HasBotControllerAwpPreference(bot)
+                    && CanAffordAwpRole(
+                        bot,
+                        side,
+                        phase,
+                        opponentEcoLikely,
+                        observedPlans[(int)bot.Index],
+                        observedUtilities[(int)bot.Index],
+                        purchaseIntent))
+                ?? teamBots.FirstOrDefault(bot =>
+                    _stableAwperSlots.GetValueOrDefault(side) == (int)bot.Index
+                    && CanAffordAwpRole(
+                        bot,
+                        side,
+                        phase,
+                        opponentEcoLikely,
+                        observedPlans[(int)bot.Index],
+                        observedUtilities[(int)bot.Index],
+                        purchaseIntent))
+                ?? teamBots
+                    .Where(bot => CanAffordAwpRole(
+                        bot,
+                        side,
+                        phase,
+                        opponentEcoLikely,
+                        observedPlans[(int)bot.Index],
+                        observedUtilities[(int)bot.Index],
+                        purchaseIntent))
+                    .OrderByDescending(bot => bot.InGameMoneyServices?.Account ?? 0)
+                    .ThenBy(bot => (int)bot.Index)
+                    .FirstOrDefault();
+        if (awper != null)
+            _stableAwperSlots[side] = (int)awper.Index;
         var pistolOrdinals = teamBots
             .OrderBy(bot => (int)bot.Index)
             .Select((bot, ordinal) => new { bot.Index, ordinal })
@@ -1595,7 +1705,12 @@ public sealed class BotBuyPatch : BasePlugin
                                 side,
                                 pistolOrdinals.GetValueOrDefault(slot),
                                 teamBots.Count)
-                            : PistolBuyRole.Auto)
+                            : PistolBuyRole.Auto,
+                        role: ResolveBuyRole(
+                            side,
+                            pistolOrdinals.GetValueOrDefault(slot),
+                            teamBots.Count,
+                            ReferenceEquals(awper, player)))
                     : [observed];
             return new TeamPlanningMember(
                     slot,
@@ -1607,7 +1722,7 @@ public sealed class BotBuyPatch : BasePlugin
                     observed.Tier,
                     facts?.Kills ?? 0,
                     facts?.IsPlanter ?? false,
-                    facts?.IsDefuser ?? false);
+                    (facts?.IsDefuser ?? false) || observed.BuysDefuser);
             })
             .ToArray();
         QueueBuyPlanning(new CompetitiveBuyPlanningInput(
@@ -1637,7 +1752,8 @@ public sealed class BotBuyPatch : BasePlugin
         bool currentHasDefuser,
         IReadOnlyDictionary<string, int> currentUtility,
         PurchaseIntent purchaseIntent,
-        PistolBuyRole pistolRole)
+        PistolBuyRole pistolRole,
+        BuyRole role)
     {
         var candidates = BuyPlanner.BuildCandidatePlans(
             side,
@@ -1652,7 +1768,8 @@ public sealed class BotBuyPatch : BasePlugin
             currentHasDefuser,
             currentUtility,
             purchaseIntent,
-            pistolRole);
+            pistolRole,
+            role);
 
         if (phase is BuyPhase.FullBuy or BuyPhase.HalfBuy or BuyPhase.ForceBuy or BuyPhase.LastRound
             && purchaseIntent is PurchaseIntent.Standard or PurchaseIntent.AllIn or PurchaseIntent.LastRound
@@ -1679,6 +1796,78 @@ public sealed class BotBuyPatch : BasePlugin
         return CompetitiveBuyBudgetPolicy.FilterExecutablePlans(
             candidates,
             currentMoney);
+    }
+
+    private bool HasBotControllerAwpPreference(CCSPlayerController bot)
+    {
+        if (_botController == null)
+            return false;
+
+        try
+        {
+            return BotControllerBridge.TryGetProfile(_botController, bot.Slot, out var profile)
+                && profile.WeaponPref is { } preferences
+                && preferences
+                    .Take(Math.Max(0, profile.WeaponPrefCount))
+                    .Contains((ushort)9);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool CanAffordAwpRole(
+        CCSPlayerController bot,
+        TeamSide side,
+        BuyPhase phase,
+        bool opponentEcoLikely,
+        PlayerBuyPlan observed,
+        IReadOnlyDictionary<string, int> utility,
+        PurchaseIntent purchaseIntent)
+    {
+        int currentMoney = bot.InGameMoneyServices?.Account ?? 0;
+        int planningMoney = CompetitiveBuyBudgetPolicy.GetPlanningMoney(
+            RoundStartMoney(bot),
+            currentMoney,
+            _competitiveNativeBuySuppressed);
+        return BuildCompetitiveCandidates(
+                side,
+                phase,
+                planningMoney,
+                currentMoney,
+                designatedAwper: true,
+                opponentEcoLikely,
+                observed.ArmorLevel,
+                observed.PrimaryWeapon,
+                observed.SecondaryWeapon,
+                observed.BuysHelmet,
+                observed.BuysDefuser,
+                utility,
+                purchaseIntent,
+                PistolBuyRole.Auto,
+                BuyRole.AWPer)
+            .Any(plan => plan.PrimaryWeapon == "weapon_awp");
+    }
+
+    private static BuyRole ResolveBuyRole(
+        TeamSide side,
+        int ordinal,
+        int botCount,
+        bool designatedAwper)
+    {
+        if (designatedAwper)
+            return BuyRole.AWPer;
+        if (side == TeamSide.Terrorist)
+        {
+            if (ordinal == 0)
+                return BuyRole.TEntry;
+            if (ordinal == botCount - 1)
+                return BuyRole.TLurk;
+            return BuyRole.TSupport;
+        }
+
+        return ordinal == 0 ? BuyRole.CtAnchor : BuyRole.CtRotator;
     }
 
     private void ScheduleCompetitiveExecution(Action action)
@@ -1781,18 +1970,74 @@ public sealed class BotBuyPatch : BasePlugin
         TeamSide side,
         TransferPlan transfer,
         PlayerBuyPlan? fallbackPlan,
-        PlayerBuyPlan? donorPlan)
+        PlayerBuyPlan? donorPlan,
+        WeaponGrantTransaction? grantTransaction = null,
+        int attempt = 0,
+        InventorySnapshot? recipientBeforeTransfer = null)
     {
-        if (donor == null
-            || recipient == null
-            || !ExecuteCompetitiveTransfer(
+        InventoryTransactionResult result;
+        if (donor == null || recipient == null)
+        {
+            result = new(false, InventoryTransactionStage.Primary, "transfer-player-missing");
+        }
+        else
+        {
+            result = ExecuteCompetitiveTransfer(
                 donor,
                 recipient,
                 side,
                 transfer,
                 fallbackPlan,
-                donorPlan))
+                donorPlan,
+                grantTransaction,
+                recipientBeforeTransfer,
+                out var activeGrantTransaction,
+                out var activeRecipientBeforeTransfer);
+            grantTransaction = activeGrantTransaction;
+            recipientBeforeTransfer = activeRecipientBeforeTransfer;
+        }
+
+        if (result.Retryable && attempt < CompetitiveTransferRetryLimit)
         {
+            // This is a continuation of an already-started transfer, not a
+            // new bot dispatch. Reusing the global sequence delay here can
+            // push the donor rearm past the freeze boundary when several
+            // bots are buying in the same round.
+            AddTimer(
+                FreezeBuyPolicy.ConfirmationRetryIntervalSeconds,
+                () =>
+                {
+                    if (FreezeBuyPolicy.ShouldAbortPendingTransfer(
+                        IsCompetitiveBuyExecutionOpen(),
+                        result.Retryable))
+                    {
+                        CloseCompetitiveTransfer(
+                            donor,
+                            recipient,
+                            side,
+                            transfer,
+                            grantTransaction,
+                            recipientBeforeTransfer);
+                        return;
+                    }
+
+                    ExecuteCompetitiveTransferWithRecovery(
+                        donor,
+                        recipient,
+                        side,
+                        transfer,
+                        fallbackPlan,
+                        donorPlan,
+                        grantTransaction,
+                        attempt + 1,
+                        recipientBeforeTransfer);
+                });
+            return;
+        }
+
+        if (!result.Committed)
+        {
+            grantTransaction?.Abort();
             bool recipientAlreadyArmed = recipient != null && CurrentPrimary(recipient) != null;
             var recoveryPlan = recipientAlreadyArmed && fallbackPlan != null
                 ? fallbackPlan with { PrimaryWeapon = null, ReplacePrimaryWeapon = null }
@@ -1820,34 +2065,80 @@ public sealed class BotBuyPatch : BasePlugin
         }
     }
 
-    private bool ExecuteCompetitiveTransfer(
+    private void CloseCompetitiveTransfer(
+        CCSPlayerController? donor,
+        CCSPlayerController? recipient,
+        TeamSide side,
+        TransferPlan transfer,
+        WeaponGrantTransaction? grantTransaction,
+        InventorySnapshot? recipientBeforeTransfer)
+    {
+        grantTransaction?.Abort();
+        ClearCompetitivePending(donor);
+        ClearCompetitivePending(recipient);
+
+        if (recipient != null
+            && recipient.IsValid
+            && recipientBeforeTransfer is { } before)
+        {
+            new CssInventoryPort(this, recipient, side).TryRestore(before);
+            ClearCompetitivePending(recipient);
+        }
+
+        Server.PrintToConsole(
+            $"[BotBuy] TransferAbortedAtFreezeEnd donor={transfer.Donor} "
+            + $"recipient={transfer.Recipient} item={transfer.Item} "
+            + "reason=execution-window-closed");
+    }
+
+    private void ClearCompetitivePending(CCSPlayerController? player)
+    {
+        if (player != null)
+            _pendingCompetitivePurchases.RemoveWhere(
+                entry => entry.Slot == (int)player.Index);
+    }
+
+    private InventoryTransactionResult ExecuteCompetitiveTransfer(
         CCSPlayerController donor,
         CCSPlayerController recipient,
         TeamSide side,
         TransferPlan transfer,
         PlayerBuyPlan? fallbackPlan,
-        PlayerBuyPlan? donorPlan)
+        PlayerBuyPlan? donorPlan,
+        WeaponGrantTransaction? grantTransaction,
+        InventorySnapshot? recipientBeforeTransfer,
+        out WeaponGrantTransaction? activeGrantTransaction,
+        out InventorySnapshot? activeRecipientBeforeTransfer)
     {
+        activeGrantTransaction = grantTransaction;
+        activeRecipientBeforeTransfer = recipientBeforeTransfer;
         if (!donor.IsValid || !recipient.IsValid || !donor.IsBot || !recipient.IsBot)
-            return false;
+            return new(false, InventoryTransactionStage.Primary, "transfer-player-invalid");
         if (side == TeamSide.Terrorist && (donor.Team != CsTeam.Terrorist || recipient.Team != CsTeam.Terrorist))
-            return false;
+            return new(false, InventoryTransactionStage.Primary, "transfer-team-mismatch");
         if (side == TeamSide.CounterTerrorist && (donor.Team != CsTeam.CounterTerrorist || recipient.Team != CsTeam.CounterTerrorist))
-            return false;
-        var preflight = TransferPreflightPolicy.Evaluate(
-            recipientHasPrimary: CurrentPrimary(recipient) != null,
-            recipientHasTransferItem: HasWeapon(recipient, transfer.Item));
-        if (!preflight.ShouldTransfer)
+            return new(false, InventoryTransactionStage.Primary, "transfer-team-mismatch");
+        if (grantTransaction is null)
         {
-            Server.PrintToConsole(
-                $"[BotBuy] TransferCancelled donor={donor.Index} recipient={recipient.Index} "
-                + $"item={transfer.Item} reason={preflight.Reason}");
-            return false;
+            var preflight = TransferPreflightPolicy.Evaluate(
+                recipientHasPrimary: CurrentPrimary(recipient) != null,
+                recipientHasTransferItem: HasWeapon(recipient, transfer.Item));
+            if (!preflight.ShouldTransfer)
+            {
+                Server.PrintToConsole(
+                    $"[BotBuy] TransferCancelled donor={donor.Index} recipient={recipient.Index} "
+                    + $"item={transfer.Item} reason={preflight.Reason}");
+                return new(false, InventoryTransactionStage.Primary, preflight.Reason);
+            }
         }
-        if (donor.InGameMoneyServices == null || donor.InGameMoneyServices.Account < transfer.Cost)
-            return false;
+        if (grantTransaction is null
+            && (donor.InGameMoneyServices == null || donor.InGameMoneyServices.Account < transfer.Cost))
+            return new(false, InventoryTransactionStage.Primary, "donor-cannot-afford-transfer");
         if (BuyPlanner.GetWeaponCost(transfer.Item) != transfer.Cost)
-            return false;
+            return new(false, InventoryTransactionStage.Primary, "invalid-transfer-cost");
+
+        var recipientPort = new CssInventoryPort(this, recipient, side);
+        activeRecipientBeforeTransfer ??= recipientPort.Capture();
 
         // The recipient gets armor first. Secondary/utility are deliberately
         // deferred until the next branch after the weapon grant confirms.
@@ -1861,58 +2152,24 @@ public sealed class BotBuyPatch : BasePlugin
                 Utility = Array.Empty<string>(),
             };
             var armorResult = new BuyExecutionTransaction(
-                new CssInventoryPort(this, recipient, side))
+                recipientPort)
                 .Execute(armorPlan, side);
             if (!armorResult.Committed)
-                return false;
+                return armorResult;
         }
 
-        var grantResult = new WeaponGrantTransaction(
-                new CssInventoryPort(this, donor, side),
-                new CssInventoryPort(this, recipient, side))
-            .Execute(
+        activeGrantTransaction ??= new WeaponGrantTransaction(
+            new CssInventoryPort(this, donor, side),
+            recipientPort);
+        var grantResult = activeGrantTransaction.Execute(
                 transfer.Item,
                 transfer.Cost,
                 donorRearmWeapon: donorPlan?.PrimaryWeapon);
         if (!grantResult.Committed)
-            return false;
+            return grantResult;
 
-        ConfirmWeaponGrant(
-            recipient,
-            transfer.Item,
-            transfer.Cost,
-            donor,
-            onConfirmed: () =>
-            {
-                BotWeaponSwitchQueue.Enqueue((int)recipient.Index, transfer.Item);
-                // WeaponGrantTransaction already rearms the donor atomically;
-                // this is only the explicit fallback for an asynchronous
-                // confirmation path that had to refund/recover.
-                if (donorPlan != null && CurrentPrimary(donor) == null)
-                    ScheduleCompetitiveExecution(
-                        () => ExecuteCompetitiveBuyPlan(donor, side, donorPlan));
-            },
-            onFailed: () =>
-            {
-                Server.PrintToConsole(
-                    $"[BotBuy] TransferFailedAfterGrant donor={donor.Index} recipient={recipient.Index} item={transfer.Item}");
-                if (fallbackPlan != null)
-                {
-                    bool recipientAlreadyArmed = CurrentPrimary(recipient) != null;
-                    ScheduleCompetitiveExecution(
-                        () => ExecuteCompetitiveBuyPlan(
-                            recipient,
-                            side,
-                            recipientAlreadyArmed
-                                ? fallbackPlan with { PrimaryWeapon = null }
-                                : fallbackPlan));
-                }
-                if (donorPlan != null)
-                    ScheduleCompetitiveExecution(
-                        () => ExecuteCompetitiveBuyPlan(donor, side, donorPlan));
-            },
-            rejectConflictingPrimary: true);
-        return true;
+        BotWeaponSwitchQueue.Enqueue((int)recipient.Index, transfer.Item);
+        return grantResult;
     }
 
     private PlayerBuyPlan ObserveCurrentPlan(
@@ -1921,11 +2178,15 @@ public sealed class BotBuyPatch : BasePlugin
         BuyPhase phase)
     {
         var pawn = player.PlayerPawn?.Value;
-        ArmorLevel armor = pawn?.ArmorValue > 0
-            ? HasHelmet(player) ? ArmorLevel.Full : ArmorLevel.Half
-            : ArmorLevel.None;
+        ArmorLevel armor = EquipmentEconomy.ClassifyArmor(
+            pawn?.ArmorValue ?? 0,
+            HasHelmet(player));
         string? primary = CurrentPrimary(player);
         string? secondary = CurrentSecondary(player);
+        var utilityCounts = CurrentUtilityCounts(player, side);
+        var utility = utilityCounts
+            .SelectMany(entry => Enumerable.Repeat(entry.Key, Math.Max(0, entry.Value)))
+            .ToArray();
 
         return new PlayerBuyPlan(
             phase,
@@ -1934,10 +2195,15 @@ public sealed class BotBuyPatch : BasePlugin
             secondary,
             HasHelmet(player),
             side == TeamSide.CounterTerrorist && HasDefuser(player),
-            Array.Empty<string>(),
+            utility,
             0)
         {
             Tier = BuyPlanner.GetTier(armor, primary, secondary),
+            EmptyPlanReason = primary is not null
+                || secondary is not null
+                || armor != ArmorLevel.None
+                ? "already-equipped"
+                : "explicit-save",
         };
     }
 
@@ -1985,9 +2251,29 @@ public sealed class BotBuyPatch : BasePlugin
         Server.PrintToConsole(
             $"[BotBuy] BuyTransactionFailed slot={player.Index} stage={result.Stage} "
             + $"reason={result.Reason} retry={retry}");
+        if (result.Retryable)
+        {
+            int maxAttempts = BuyExecutionTransaction.EstimateMaxConfirmationAttempts(plan);
+            if (retry < maxAttempts - 1)
+            {
+                AddTimer(FreezeBuyPolicy.ConfirmationRetryIntervalSeconds, () =>
+                {
+                    if (player.IsValid && IsCompetitiveBuyExecutionOpen())
+                        ExecuteCompetitiveBuyPlan(player, side, plan, retry + 1);
+                });
+            }
+            else
+            {
+                _pendingCompetitivePurchases.RemoveWhere(entry => entry.Slot == (int)player.Index);
+                Server.PrintToConsole(
+                    $"[BotBuy] BuyConfirmationStillPending slot={player.Index} "
+                    + $"stage={result.Stage}; pending-cleared; no rollback or duplicate buy");
+            }
+            return;
+        }
         if (retry < 2)
         {
-            AddTimer(0.05f, () =>
+            AddTimer(FreezeBuyPolicy.ConfirmationRetryIntervalSeconds, () =>
             {
                 if (player.IsValid && IsCompetitiveBuyExecutionOpen())
                     ExecuteCompetitiveBuyPlan(player, side, plan, retry + 1);
@@ -2033,7 +2319,7 @@ public sealed class BotBuyPatch : BasePlugin
         }
     }
 
-    private sealed class CssInventoryPort : IInventoryPort
+    private sealed class CssInventoryPort : IInventoryPort, IDeferredInventoryConfirmation, IPendingInventoryPurchase
     {
         private readonly BotBuyPatch _owner;
         private readonly CCSPlayerController _player;
@@ -2046,12 +2332,23 @@ public sealed class BotBuyPatch : BasePlugin
             _side = side;
         }
 
+        public bool RequiresNextTickConfirmation => true;
+
+        public bool IsPurchasePending(string itemName, int expectedCount)
+            => _owner._pendingCompetitivePurchases.Contains(((int)_player.Index, itemName, expectedCount));
+
+        public void MarkPurchasePending(string itemName, int expectedCount)
+            => _owner._pendingCompetitivePurchases.Add(((int)_player.Index, itemName, expectedCount));
+
+        public void ClearPurchasePending(string itemName, int expectedCount)
+            => _owner._pendingCompetitivePurchases.Remove(((int)_player.Index, itemName, expectedCount));
+
         public InventorySnapshot Capture()
         {
             var pawn = _player.PlayerPawn?.Value;
-            ArmorLevel armor = pawn?.ArmorValue > 0
-                ? BotBuyPatch.HasHelmet(_player) ? ArmorLevel.Full : ArmorLevel.Half
-                : ArmorLevel.None;
+            ArmorLevel armor = EquipmentEconomy.ClassifyArmor(
+                pawn?.ArmorValue ?? 0,
+                BotBuyPatch.HasHelmet(_player));
             var utilities = BotBuyPatch.CurrentUtilityCounts(_player, _side)
                 .SelectMany(entry => Enumerable.Repeat(
                     BuyExecutionTransaction.ToUtilityItem(entry.Key, _side) ?? entry.Key,
@@ -2236,6 +2533,8 @@ public sealed class BotBuyPatch : BasePlugin
         ConVar? botLoadout = ConVar.Find("bot_loadout");
         if (botLoadout != null && !string.IsNullOrEmpty(botLoadout.StringValue))
         {
+            Server.PrintToConsole(
+                "[BotBuy] CustomCompetitiveBuyDisabled reason=bot_loadout-nonempty failClosed=1");
             return HookResult.Continue;
         }
 
@@ -2342,7 +2641,7 @@ public sealed class BotBuyPatch : BasePlugin
             case "item_kevlar":              price = 650; break;
             case "item_assaultsuit":
                 price = BuyPlanner.GetAssaultSuitPurchaseCost(
-                    armor > 0 ? ArmorLevel.Half : ArmorLevel.None);
+                    EquipmentEconomy.ClassifyArmor(armor, HasHelmet(player)));
                 break;
 
             case "item_defuser":             price = 400; canBuy = isCT; break;
@@ -3037,6 +3336,22 @@ public sealed class BotBuyPatch : BasePlugin
         if (_prevArmor.TryGetValue(idx, out int a)) armor = a;
 
         return (weapons, money, armor);
+    }
+
+    private static class BotControllerBridge
+    {
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static object? TryGet()
+            => new PluginCapability<BotControllerApi.IBotControllerApi>(
+                "botcontroller:api").Get();
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static bool TryGetProfile(
+            object api,
+            int slot,
+            out BotControllerApi.BotProfileData profile)
+            => ((BotControllerApi.IBotControllerApi)api)
+                .GetBotProfile(slot, out profile);
     }
 }
 //----------------------------------------------------------------------------------------------

@@ -866,7 +866,8 @@ public sealed class BuyPlannerTests
         Assert.Equal(1, plan.Utility.Count(item => item == "smoke"));
         Assert.Equal(2, plan.Utility.Count(item => item == "flash"));
         Assert.Equal(1, plan.Utility.Count(item => item == "he"));
-        Assert.Equal(1, plan.Utility.Count(item => item == "molotov"));
+        Assert.Equal(4, plan.Utility.Count);
+        Assert.DoesNotContain("molotov", plan.Utility);
     }
 
     [Fact]
@@ -1039,6 +1040,7 @@ public sealed class BuyPlannerTests
             money: 3000,
             designatedAwper: false,
             opponentEcoLikely: false);
+        Assert.NotEmpty(botCandidates);
 
         var plan = BoundedTeamBuyPlanner.Optimize(
             TeamSide.Terrorist,

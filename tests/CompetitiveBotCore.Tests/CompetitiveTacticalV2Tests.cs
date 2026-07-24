@@ -324,4 +324,44 @@ public sealed class CompetitiveTacticalV2Tests
 
         Assert.False(plan.ShouldRetreat);
     }
+
+    [Fact]
+    public void HumanCtNearContactTurnsResponderIntoReinforcement()
+    {
+        var contact = new CtContact(99, 10f, ContactConfidence.High, 100f, 200f, 300f)
+        {
+            Site = CtGambleSite.A,
+        };
+        var context = new CtTacticalContext(
+            new RoundContext(3, 1, 1, 2, false, 0, false, null, 5, 5, RoundPhase.Live)
+            {
+                CtBuyPhase = BuyPhase.FullBuy,
+                LastContact = contact,
+            },
+            new[] { new CtBotSnapshot(1, true, 0.8f, 0.8f, false) },
+            new Dictionary<int, CtRole> { [1] = CtRole.Rotator },
+            Array.Empty<CtDeathEvent>(),
+            new Dictionary<int, CtContact> { [1] = contact },
+            new Dictionary<int, float>(),
+            new Dictionary<int, float>(),
+            Now: 10.5f)
+        {
+            HumanPlayers =
+            [
+                new TacticalHumanSnapshot(
+                    10,
+                    TeamSide.CounterTerrorist,
+                    Alive: true,
+                    X: 100f,
+                    Y: 200f,
+                    Z: 300f,
+                    HasBomb: false),
+            ],
+        };
+
+        var decision = Assert.Single(CtTacticalDecisionPlanner.Plan(context));
+
+        Assert.Equal(CtTacticalState.Reinforce, decision.State);
+        Assert.Equal(CtGambleSite.A, decision.TargetSite);
+    }
 }

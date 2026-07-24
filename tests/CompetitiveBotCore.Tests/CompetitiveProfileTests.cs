@@ -364,10 +364,10 @@ public sealed class CompetitiveProfileTests
     }
 
     [Fact]
-    public void EconomyClassificationUsesRoundStartMoneyInsteadOfCurrentMoney()
+    public void EconomyClassificationUsesLiveCashEvenWhenRoundStartCashExists()
     {
         Assert.Equal(
-            new[] { 16000, 16000 },
+            new[] { 500, 500 },
             EconomySnapshotPolicy.ForPhaseClassification(
                 roundStartMoney: new[] { 16000, 16000 },
                 currentMoney: new[] { 500, 500 }));
@@ -379,7 +379,7 @@ public sealed class CompetitiveProfileTests
     }
 
     [Fact]
-    public void SuppressedNativeBuyKeepsOpeningMoneyForAwperCandidates()
+    public void SuppressedNativeBuyUsesLiveMoneyAfterAConcurrentPurchase()
     {
         int planningMoney = CompetitiveBuyBudgetPolicy.GetPlanningMoney(
             roundStartMoney: 8000,
@@ -397,14 +397,14 @@ public sealed class CompetitiveProfileTests
             currentHasHelmet: true,
             purchaseIntent: PurchaseIntent.Standard);
 
-        Assert.Equal(8000, planningMoney);
-        var executableWithOpeningBalance = CompetitiveBuyBudgetPolicy
+        Assert.Equal(4000, planningMoney);
+        var executableWithLiveBalance = CompetitiveBuyBudgetPolicy
             .FilterExecutablePlans(candidates, planningMoney);
         var executableAfterNativePurchase = CompetitiveBuyBudgetPolicy
             .FilterExecutablePlans(candidates, currentMoney: 4000);
 
-        Assert.Contains(
-            executableWithOpeningBalance,
+        Assert.DoesNotContain(
+            executableWithLiveBalance,
             plan => plan.PrimaryWeapon == "weapon_awp");
         Assert.DoesNotContain(
             executableAfterNativePurchase,
@@ -456,8 +456,35 @@ public sealed class CompetitiveProfileTests
     [Fact]
     public void ExecutionWindowStartsBeforeFreezeEnds()
     {
-        Assert.Equal(4.2f, FreezeBuyPolicy.ExecutionAt(0f, 5f), precision: 3);
+        Assert.Equal(4.1f, FreezeBuyPolicy.ExecutionAt(0f, 5f), precision: 3);
+        Assert.InRange(FreezeBuyPolicy.ExecutionWindowSeconds, 0.85f, 0.95f);
         Assert.Equal(5f, FreezeBuyPolicy.EndAt(0f, 5f), precision: 3);
+    }
+
+    [Fact]
+    public void ExecutionWindowCoversDispatchAndFullDeferredConfirmationChain()
+    {
+        float required = FreezeBuyPolicy.RequiredExecutionWindowSeconds(
+            maxConfirmationAttempts: 8,
+            maximumDispatchDelaySeconds: FreezeBuyPolicy.MaximumDispatchDelaySeconds,
+            safetyMarginSeconds: 0.10f);
+
+        Assert.Equal(0.75f, required, precision: 3);
+        Assert.True(FreezeBuyPolicy.ExecutionWindowSeconds >= required);
+    }
+
+    [Fact]
+    public void PendingTransferIsAbortedWhenExecutionWindowCloses()
+    {
+        Assert.True(FreezeBuyPolicy.ShouldAbortPendingTransfer(
+            executionOpen: false,
+            retryable: true));
+        Assert.False(FreezeBuyPolicy.ShouldAbortPendingTransfer(
+            executionOpen: true,
+            retryable: true));
+        Assert.False(FreezeBuyPolicy.ShouldAbortPendingTransfer(
+            executionOpen: false,
+            retryable: false));
     }
 
     [Fact]

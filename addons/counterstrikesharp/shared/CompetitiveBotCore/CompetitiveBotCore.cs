@@ -368,6 +368,8 @@ public static class DefuseDecisionPolicy
         bool hasDefuser,
         double randomRoll)
     {
+        if (profile == BotMatchProfile.Competitive)
+            return false;
         if (!hasLiveEnemy)
             return false;
 
@@ -598,6 +600,8 @@ public sealed record TeamEconomySnapshot(
     bool OpponentEcoLikely)
 {
     public bool IsOvertimeFirstRound { get; init; }
+    public IReadOnlyList<PlayerEquipmentSnapshot> Players { get; init; }
+        = Array.Empty<PlayerEquipmentSnapshot>();
 }
 
 public static class EconomySnapshotPolicy
@@ -605,10 +609,10 @@ public static class EconomySnapshotPolicy
     public static IReadOnlyList<int> ForPhaseClassification(
         IReadOnlyList<int> roundStartMoney,
         IReadOnlyList<int> currentMoney)
-        => roundStartMoney.Count > 0
-            && roundStartMoney.Count == currentMoney.Count
-            ? roundStartMoney
-            : currentMoney;
+        // Round-start cash is historical metadata. Phase classification must
+        // use the live wallet; equipment snapshots account for what was
+        // already converted into weapons/armor/utility.
+        => currentMoney;
 }
 
 public static class CompetitiveBuyBudgetPolicy
@@ -617,11 +621,10 @@ public static class CompetitiveBuyBudgetPolicy
         int roundStartMoney,
         int currentMoney,
         bool nativeBuySuppressed)
-        => Math.Max(
-            0,
-            nativeBuySuppressed
-                ? roundStartMoney
-                : currentMoney);
+        // Native suppression prevents a competing purchase path; it does not
+        // turn opening cash into a second wallet after a custom purchase or a
+        // human gift changes the live inventory.
+        => Math.Max(0, currentMoney);
 
     public static bool CanExecutePlan(
         PlayerBuyPlan plan,
@@ -727,6 +730,8 @@ public sealed record PlayerBuyPlan(
     // queue. Keeping the old weapon on the immutable plan prevents a direct
     // GiveNamedItem path from silently dropping it.
     public string? ReplacePrimaryWeapon { get; init; }
+    public string? EmptyPlanReason { get; init; }
+    public BuyRole Role { get; init; } = BuyRole.Auto;
 }
 
 public sealed record TeamBuyPlan(
@@ -793,6 +798,7 @@ public static class TeamTransferPlanner
                      .Where(participant => participant.IsBot
                          && participant.CurrentPrimary is null
                          && participant.Plan.ArmorLevel != ArmorLevel.None
+                         && participant.Plan.PrimaryWeapon != "weapon_awp"
                          && (participant.Plan.PrimaryWeapon is not null
                              || participant.Plan.AcceptsTeamPrimary))
                      .OrderByDescending(participant => participant.Plan.Tier)
@@ -1160,18 +1166,18 @@ public sealed record TeamPlanningMember(
 
 public static class BuyPlanner
 {
-    public const int KevlarPrice = 650;
-    public const int HelmetUpgradePrice = 350;
-    public const int DefuserPrice = 400;
-    public const int SmokePrice = 300;
-    public const int FlashPrice = 200;
-    public const int HePrice = 300;
-    public const int MolotovPrice = 400;
-    public const int IncendiaryPrice = 500;
-    public const int DeaglePrice = 700;
-    public const int P250Price = 300;
-    public const int Tec9Price = 500;
-    public const int FiveSevenPrice = 500;
+    public const int KevlarPrice = EquipmentEconomy.KevlarPrice;
+    public const int HelmetUpgradePrice = EquipmentEconomy.HelmetPrice;
+    public const int DefuserPrice = EquipmentEconomy.DefuserPrice;
+    public const int SmokePrice = EquipmentEconomy.SmokePrice;
+    public const int FlashPrice = EquipmentEconomy.FlashPrice;
+    public const int HePrice = EquipmentEconomy.HePrice;
+    public const int MolotovPrice = EquipmentEconomy.MolotovPrice;
+    public const int IncendiaryPrice = EquipmentEconomy.IncendiaryPrice;
+    public const int DeaglePrice = EquipmentEconomy.DeaglePrice;
+    public const int P250Price = EquipmentEconomy.P250Price;
+    public const int Tec9Price = EquipmentEconomy.Tec9Price;
+    public const int FiveSevenPrice = EquipmentEconomy.FiveSevenPrice;
 
     public static bool IsPrimaryWeapon(string? weapon)
         => weapon is not null
@@ -1195,28 +1201,14 @@ public static class BuyPlanner
         return plan.PrimaryWeapon == "weapon_awp" || plan.ArmorLevel != ArmorLevel.None;
     }
 
-    private const int AkPrice = 2700;
-    private const int GalilPrice = 1800;
-    private const int M4Price = 2900;
-    private const int FamasPrice = 1950;
-    private const int AwpPrice = 4750;
-
     public static int GetWeaponCost(string? weapon)
-        => weapon switch
-        {
-            "weapon_ak47" => AkPrice,
-            "weapon_galilar" => GalilPrice,
-            "weapon_m4a1" or "weapon_m4a1_silencer" => M4Price,
-            "weapon_famas" => FamasPrice,
-            "weapon_awp" => AwpPrice,
-            "weapon_mac10" => 1050,
-            "weapon_mp9" => 1250,
-            "weapon_deagle" => DeaglePrice,
-            "weapon_p250" => P250Price,
-            "weapon_tec9" => Tec9Price,
-            "weapon_fiveseven" => FiveSevenPrice,
-            _ => 0,
-        };
+        => EquipmentEconomy.GetWeaponPrice(weapon);
+
+    public static bool IsExplainableEmptyPlan(PlayerBuyPlan plan)
+        => plan.EstimatedCost > 0
+            || plan.EmptyPlanReason is "explicit-save"
+                or "already-equipped"
+                or "waiting-for-gift";
 
     public static int GetAssaultSuitPurchaseCost(ArmorLevel currentArmor)
         => currentArmor == ArmorLevel.None
@@ -1228,14 +1220,29 @@ public static class BuyPlanner
         if (snapshot.IsLastRound) return BuyPhase.LastRound;
         if (snapshot.IsPistolRound && !snapshot.IsOvertimeFirstRound) return BuyPhase.Pistol;
 
-        int rifleArmorCost = CoreRiflePrice(snapshot.Side) + KevlarPrice;
-        int fullBuyers = snapshot.Money.Count(money => money >= rifleArmorCost);
-        int teamSize = Math.Max(1, snapshot.Money.Count);
+        int fullBuyers;
+        int teamSize;
+        if (snapshot.Players.Count > 0)
+        {
+            teamSize = snapshot.Players.Count;
+            fullBuyers = snapshot.Players.Count(player =>
+                player.IsFullReady(snapshot.Side)
+                || player.CanReachFullBuy(snapshot.Side));
+        }
+        else
+        {
+            int rifleArmorCost = CoreRiflePrice(snapshot.Side) + KevlarPrice;
+            fullBuyers = snapshot.Money.Count(money => money >= rifleArmorCost);
+            teamSize = Math.Max(1, snapshot.Money.Count);
+        }
         int fullBuyThreshold = Math.Max(1, (int)Math.Ceiling(teamSize * 0.80d));
         int halfBuyThreshold = Math.Max(1, (int)Math.Ceiling(teamSize * 0.60d));
         if (fullBuyers >= fullBuyThreshold) return BuyPhase.FullBuy;
         if (fullBuyers >= halfBuyThreshold) return BuyPhase.HalfBuy;
-        if (snapshot.ForceBuySignal && snapshot.Money.Any(money => money >= KevlarPrice + 300))
+        bool forceEligible = snapshot.Players.Count > 0
+            ? snapshot.Players.Any(player => player.CurrentMoney >= KevlarPrice + 300)
+            : snapshot.Money.Any(money => money >= KevlarPrice + 300);
+        if (snapshot.ForceBuySignal && forceEligible)
             return BuyPhase.ForceBuy;
 
         return BuyPhase.Eco;
@@ -1324,6 +1331,7 @@ public static class BuyPlanner
                 : PurchaseIntent.Standard,
             AcceptsTeamPrimary = canReceivePrimary,
             RequestedPrimaryWeapon = canReceivePrimary ? preferredPrimary : null,
+            EmptyPlanReason = cost == 0 ? "waiting-for-gift" : null,
         };
     }
 
@@ -1340,7 +1348,8 @@ public static class BuyPlanner
         bool currentHasDefuser = false,
         IReadOnlyDictionary<string, int>? currentUtility = null,
         PurchaseIntent? purchaseIntent = null,
-        PistolBuyRole pistolRole = PistolBuyRole.Auto)
+        PistolBuyRole pistolRole = PistolBuyRole.Auto,
+        BuyRole role = BuyRole.Auto)
     {
         money = Math.Max(0, money);
         var intent = purchaseIntent ?? DefaultIntentForPhase(phase);
@@ -1368,24 +1377,92 @@ public static class BuyPlanner
                 currentHasDefuser,
                 intent)];
 
-        return DistinctPlans(SelectPackages(side, phase, money, designatedAwper, opponentEcoLikely)
-            .Select(package => BuildPlanFromPackage(
-                side,
-                phase,
-                money,
-                package,
-                opponentEcoLikely,
-                currentArmor,
-                currentPrimary,
-                currentSecondary,
-                currentHasHelmet,
-                currentHasDefuser,
-                currentUtility,
-                intent))
+        var candidates = DistinctPlans(TeamUtilityDemandPolicy.RolePackages(role, side)
+            .SelectMany(utilityPackage => SelectPackages(
+                    side,
+                    phase,
+                    money,
+                    designatedAwper,
+                    opponentEcoLikely)
+                .SelectMany(package =>
+                {
+                    bool[] defuserModes = side == TeamSide.CounterTerrorist
+                        && !currentHasDefuser
+                        ? [false, true]
+                        : [false];
+                    return defuserModes.Select(suppressDefuser => BuildPlanFromPackage(
+                        side,
+                        phase,
+                        money,
+                        package,
+                        opponentEcoLikely,
+                        currentArmor,
+                        currentPrimary,
+                        currentSecondary,
+                        currentHasHelmet,
+                        currentHasDefuser,
+                        currentUtility,
+                        intent,
+                        role,
+                        utilityPackage,
+                        suppressDefuser));
+                }))
             .Where(plan => ((intent is PurchaseIntent.Standard or PurchaseIntent.AllIn)
                     && (phase is BuyPhase.Eco or BuyPhase.Save))
-                || plan.EstimatedCost <= money));
+                || plan.EstimatedCost <= money)
+            .Where(IsExplainableEmptyPlan))
+            .ToArray();
+
+        // A FullBuy candidate set must not keep a FAMAS/Galil downgrade when
+        // this exact role can already afford the preferred rifle, effective
+        // armor and at least three role utilities. Leaving the downgrade in
+        // the frontier lets utility scoring accidentally beat the rifle goal.
+        if (phase == BuyPhase.FullBuy
+            && HasAffordablePreferredFullBuy(candidates, side))
+        {
+            candidates = candidates
+                .Where(plan => !IsRifleDowngrade(plan.PrimaryWeapon, side))
+                .ToArray();
+        }
+
+        if (phase is BuyPhase.HalfBuy or BuyPhase.ForceBuy
+            && pistolRole == PistolBuyRole.Auto
+            && EquipmentEconomy.IsLowTierPrimary(currentPrimary))
+        {
+            candidates = candidates
+                .Where(plan => plan.PrimaryWeapon != currentPrimary
+                    || plan.EstimatedCost == 0
+                    || !IsExpensivePistol(plan.SecondaryWeapon))
+                .ToArray();
+        }
+
+        return candidates;
     }
+
+    private static bool HasAffordablePreferredFullBuy(
+        IReadOnlyList<PlayerBuyPlan> candidates,
+        TeamSide side)
+    {
+        string preferred = side == TeamSide.Terrorist
+            ? "weapon_ak47"
+            : "weapon_m4a1";
+        return candidates.Any(plan =>
+            plan.PrimaryWeapon == preferred
+            && plan.ArmorLevel != ArmorLevel.None
+            && plan.Utility.Count >= 3);
+    }
+
+    private static bool IsRifleDowngrade(string? weapon, TeamSide side)
+        => side == TeamSide.Terrorist
+            ? weapon == "weapon_galilar"
+            : weapon == "weapon_famas";
+
+    private static bool IsExpensivePistol(string? weapon)
+        => weapon is "weapon_deagle"
+            or "weapon_fiveseven"
+            or "weapon_tec9"
+            or "weapon_cz75a"
+            or "weapon_revolver";
 
     private static PlayerBuyPlan BuildPlanFromPackage(
         TeamSide side,
@@ -1399,7 +1476,10 @@ public static class BuyPlanner
         bool currentHasHelmet,
         bool currentHasDefuser,
         IReadOnlyDictionary<string, int>? currentUtility,
-        PurchaseIntent purchaseIntent)
+        PurchaseIntent purchaseIntent,
+        BuyRole role,
+        IReadOnlyList<string> utilityPackage,
+        bool suppressDefuser)
         => BuildPlanFromTargets(
             side,
             phase,
@@ -1415,7 +1495,10 @@ public static class BuyPlanner
             currentHasHelmet,
             currentHasDefuser,
             currentUtility,
-            purchaseIntent);
+            purchaseIntent,
+            role,
+            utilityPackage,
+            suppressDefuser);
 
     private static IReadOnlyList<LoadoutPackage> SelectPackages(
         TeamSide side,
@@ -1465,7 +1548,13 @@ public static class BuyPlanner
         if (designatedAwper)
         {
             packages = packages
-                .Append(new LoadoutPackage(ArmorLevel.Full, "weapon_awp", null, KevlarPrice + HelmetUpgradePrice + AwpPrice, 110))
+                .Append(new LoadoutPackage(
+                    ArmorLevel.Full,
+                    "weapon_awp",
+                    null,
+                    KevlarPrice + HelmetUpgradePrice
+                        + EquipmentEconomy.GetWeaponPrice("weapon_awp"),
+                    110))
                 .ToArray();
         }
 
@@ -1745,7 +1834,10 @@ public static class BuyPlanner
         bool currentHasHelmet,
         bool currentHasDefuser,
         IReadOnlyDictionary<string, int>? currentUtility,
-        PurchaseIntent purchaseIntent = PurchaseIntent.Standard)
+        PurchaseIntent purchaseIntent = PurchaseIntent.Standard,
+        BuyRole role = BuyRole.Auto,
+        IReadOnlyList<string>? utilityPackageOverride = null,
+        bool suppressDefuser = false)
     {
         ArmorLevel requestedArmor = (ArmorLevel)Math.Max(
             (int)currentArmor,
@@ -1791,6 +1883,7 @@ public static class BuyPlanner
         remaining -= cost;
         bool isAllInPackage = purchaseIntent is PurchaseIntent.AllIn or PurchaseIntent.LastRound;
         bool buysDefuser = side == TeamSide.CounterTerrorist
+            && !suppressDefuser
             && !currentHasDefuser
             && primary is not null
             && remaining >= DefuserPrice
@@ -1802,13 +1895,40 @@ public static class BuyPlanner
         }
 
         var utility = new List<string>();
+        var plannedUtilityCounts = new Dictionary<string, int>(StringComparer.Ordinal);
         if (primary is not null
-            && (phase is BuyPhase.FullBuy or BuyPhase.LastRound || isAllInPackage))
+            && (phase is BuyPhase.FullBuy or BuyPhase.LastRound
+                || isAllInPackage
+                || (role != BuyRole.Auto
+                    && (phase is BuyPhase.HalfBuy or BuyPhase.ForceBuy))))
         {
-            AddUtility("smoke", SmokePrice, 1);
-            AddUtility("flash", FlashPrice, phase == BuyPhase.LastRound ? 2 : 1);
-            AddUtility("he", HePrice, 1);
-            AddUtility("molotov", side == TeamSide.Terrorist ? MolotovPrice : IncendiaryPrice, 1);
+            var utilityPackage = utilityPackageOverride
+                ?? TeamUtilityDemandPolicy.RolePackage(role, side);
+            int utilityLimit = isAllInPackage
+                ? 4
+                : phase switch
+                {
+                    BuyPhase.FullBuy or BuyPhase.LastRound => 4,
+                    BuyPhase.HalfBuy => 3,
+                    BuyPhase.ForceBuy => 2,
+                    _ => 1,
+                };
+            var plannedUtilityPackage = role == BuyRole.Auto && isAllInPackage
+                ? new[] { "smoke", "flash", "flash", "he", "molotov" }
+                : utilityPackage;
+            foreach (var utilityName in plannedUtilityPackage.Take(utilityLimit))
+            {
+                int price = utilityName == "molotov"
+                    ? side == TeamSide.Terrorist ? MolotovPrice : IncendiaryPrice
+                    : utilityName switch
+                    {
+                        "smoke" => SmokePrice,
+                        "flash" => FlashPrice,
+                        "he" => HePrice,
+                        _ => 0,
+                    };
+                AddUtility(utilityName, price, 1);
+            }
         }
 
         return new PlayerBuyPlan(
@@ -1823,6 +1943,12 @@ public static class BuyPlanner
         {
             Tier = GetTier(armor, primary, secondary),
             Intent = purchaseIntent,
+            Role = role,
+            EmptyPlanReason = cost == 0
+                ? primary is not null || secondary is not null || armor != currentArmor
+                    ? "already-equipped"
+                    : "explicit-save"
+                : null,
             ReplacePrimaryWeapon = shouldReplacePrimary && currentPrimary is not null
                 ? currentPrimary
                 : null,
@@ -1830,16 +1956,18 @@ public static class BuyPlanner
 
         void AddUtility(string name, int price, int targetCount)
         {
-            int alreadyOwned = currentUtility?.GetValueOrDefault(name) ?? 0;
             for (int i = 0; i < targetCount; i++)
             {
-                if (i >= alreadyOwned)
+                int desiredCount = plannedUtilityCounts.GetValueOrDefault(name) + 1;
+                int alreadyOwned = currentUtility?.GetValueOrDefault(name) ?? 0;
+                if (desiredCount > alreadyOwned)
                 {
                     if (remaining < price)
                         break;
                     remaining -= price;
                     cost += price;
                 }
+                plannedUtilityCounts[name] = desiredCount;
                 utility.Add(name);
             }
         }
@@ -1914,6 +2042,11 @@ public static class BuyPlanner
         {
             Tier = GetTier(currentArmor, currentPrimary, currentSecondary),
             Intent = purchaseIntent,
+            EmptyPlanReason = currentPrimary is not null
+                || currentSecondary is not null
+                || currentArmor != ArmorLevel.None
+                ? "already-equipped"
+                : "explicit-save",
         };
     }
 
@@ -1941,7 +2074,8 @@ public static class BuyPlanner
         };
 
     private static int CoreRiflePrice(TeamSide side)
-        => side == TeamSide.Terrorist ? AkPrice : M4Price;
+        => EquipmentEconomy.GetWeaponPrice(
+            side == TeamSide.Terrorist ? "weapon_ak47" : "weapon_m4a1");
 }
 
 public sealed class DefaultBuyPlanner : IBuyPlanner
@@ -2460,6 +2594,19 @@ public sealed record CtContact(
     public CtGambleSite Site { get; init; } = CtGambleSite.None;
 }
 
+// Human positions and carrier state are captured on the game thread and then
+// copied into the immutable tactical worker snapshot. The worker may use this
+// state to choose support/rotation decisions, but it never mutates or assigns
+// a human player's route.
+public sealed record TacticalHumanSnapshot(
+    int Slot,
+    TeamSide Side,
+    bool Alive,
+    float X,
+    float Y,
+    float Z,
+    bool HasBomb);
+
 public sealed record CtDeathEvent(
     int VictimSlot,
     CtRole VictimRole,
@@ -2491,6 +2638,7 @@ public sealed class CompetitiveTacticalRuntime
 
     private readonly Dictionary<int, CtRole> _roles = new();
     private readonly Dictionary<int, CtBotSnapshot> _bots = new();
+    private readonly Dictionary<int, TacticalHumanSnapshot> _humanPlayers = new();
     private readonly Dictionary<int, float> _probeStartedAt = new();
     private readonly Dictionary<int, float> _probeEndedAt = new();
     private readonly Dictionary<int, CtContact> _contactsByBot = new();
@@ -2509,6 +2657,7 @@ public sealed class CompetitiveTacticalRuntime
         _context = context;
         _roles.Clear();
         _bots.Clear();
+        _humanPlayers.Clear();
         _probeStartedAt.Clear();
         _probeEndedAt.Clear();
         _contactsByBot.Clear();
@@ -2583,6 +2732,13 @@ public sealed class CompetitiveTacticalRuntime
         _bots.Clear();
         foreach (var bot in bots.Where(bot => bot.Alive))
             _bots[bot.Slot] = bot;
+    }
+
+    public void UpdateHumanSnapshots(IReadOnlyList<TacticalHumanSnapshot> humans)
+    {
+        _humanPlayers.Clear();
+        foreach (var human in humans)
+            _humanPlayers[human.Slot] = human;
     }
 
     public void SetEconomy(
@@ -2790,7 +2946,10 @@ public sealed class CompetitiveTacticalRuntime
             new Dictionary<int, float>(_probeStartedAt),
             new Dictionary<int, float>(_probeEndedAt),
             now,
-            _ecoPlan);
+            _ecoPlan)
+        {
+            HumanPlayers = _humanPlayers.Values.ToArray(),
+        };
     }
 
     private void EnsureOpeningProbe(float now)
@@ -2868,6 +3027,9 @@ public sealed record CtTacticalContext(
     float Now,
     CtEcoPlan? EcoPlan = null)
 {
+    public IReadOnlyList<TacticalHumanSnapshot> HumanPlayers { get; init; }
+        = Array.Empty<TacticalHumanSnapshot>();
+
     public CtContact? ContactFor(int botSlot)
         => ContactsByBot.TryGetValue(botSlot, out var contact) ? contact : null;
 }
@@ -3088,6 +3250,11 @@ public sealed class CompetitiveTacticalDirector : ITacticalDirector
         var contact = context.ContactFor(bot.Slot);
         bool reliableContact = contact != null
             && contact.Confidence is ContactConfidence.Medium or ContactConfidence.High;
+        bool humanSupportsContact = reliableContact
+            && context.HumanPlayers.Any(human =>
+                human.Side == TeamSide.CounterTerrorist
+                && human.Alive
+                && DistanceSquared(human, contact!) <= 900f * 900f);
 
         if (context.Round.BombPlanted
             || context.Round.Phase is RoundPhase.BombPlanted or RoundPhase.Retake)
@@ -3286,8 +3453,17 @@ public sealed class CompetitiveTacticalDirector : ITacticalDirector
         {
             if (responderRole)
             {
-                return Decision(bot, role, CtTacticalState.Rotate, activeBudget,
-                    isActive: true, shouldRepath: true, shouldRun: true, "reliable-contact") with
+                return Decision(
+                    bot,
+                    role,
+                    humanSupportsContact ? CtTacticalState.Reinforce : CtTacticalState.Rotate,
+                    activeBudget,
+                    isActive: true,
+                    shouldRepath: true,
+                    shouldRun: true,
+                    humanSupportsContact
+                        ? "human-contact-reinforce"
+                        : "reliable-contact") with
                 {
                     TargetSite = contact?.Site ?? CtGambleSite.None,
                 };
@@ -3420,6 +3596,16 @@ public sealed class CompetitiveTacticalDirector : ITacticalDirector
         string reason)
         => new(bot.Slot, role, state, activeBudget, isActive,
             shouldRepath, shouldRun, reason);
+
+    private static float DistanceSquared(
+        TacticalHumanSnapshot human,
+        CtContact contact)
+    {
+        float dx = human.X - contact.X;
+        float dy = human.Y - contact.Y;
+        float dz = human.Z - contact.Z;
+        return dx * dx + dy * dy + dz * dz;
+    }
 
     private static int GetActiveBudget(RoundContext context, int aliveCount)
         => context.Phase switch

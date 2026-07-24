@@ -12,8 +12,24 @@ public static class FreezeBuyPolicy
 {
     public const float MinimumFreezeSeconds = 1f;
     public const float FinalCalibrationWindowSeconds = 1.5f;
-    public const float ExecutionWindowSeconds = 0.8f;
     public const float MaximumDispatchDelaySeconds = 0.30f;
+    public const float ConfirmationRetryIntervalSeconds = 0.05f;
+    public const float ExecutionSafetyMarginSeconds = 0.15f;
+    public const int MaximumDeferredConfirmationAttempts = 10;
+    public static readonly float ExecutionWindowSeconds =
+        RequiredExecutionWindowSeconds(
+            MaximumDeferredConfirmationAttempts,
+            MaximumDispatchDelaySeconds,
+            ExecutionSafetyMarginSeconds);
+
+    public static float RequiredExecutionWindowSeconds(
+        int maxConfirmationAttempts,
+        float maximumDispatchDelaySeconds,
+        float safetyMarginSeconds)
+        => Math.Max(0f, maximumDispatchDelaySeconds)
+            + Math.Max(0, maxConfirmationAttempts - 1)
+                * ConfirmationRetryIntervalSeconds
+            + Math.Max(0f, safetyMarginSeconds);
 
     public static float ExecutionAt(
         float roundStartAt,
@@ -63,4 +79,9 @@ public static class FreezeBuyPolicy
         float requiredSeconds)
         => freezeEndAt <= 0f
             || now + Math.Max(0f, requiredSeconds) < freezeEndAt;
+
+    public static bool ShouldAbortPendingTransfer(
+        bool executionOpen,
+        bool retryable)
+        => retryable && !executionOpen;
 }

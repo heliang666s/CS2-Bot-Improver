@@ -187,13 +187,15 @@ public sealed class MatchStatePolicyTests
         Assert.Contains("smoke", plan.Utility);
         Assert.Contains("flash", plan.Utility);
         Assert.Contains("he", plan.Utility);
-        Assert.Contains("molotov", plan.Utility);
+        Assert.Equal(4, plan.Utility.Count);
+        Assert.DoesNotContain("molotov", plan.Utility);
     }
 
     [Theory]
     [InlineData(0.40f, 5f, FreezeBuyStage.TemporaryPlan)]
     [InlineData(3.50f, 5f, FreezeBuyStage.FinalCalibration)]
     [InlineData(4.30f, 5f, FreezeBuyStage.Execution)]
+    [InlineData(4.60f, 5f, FreezeBuyStage.Execution)]
     [InlineData(5.00f, 5f, FreezeBuyStage.PostFreezeCheck)]
     public void FreezeWindowExposesAStableTwoPhaseExecutionBoundary(
         float elapsedSeconds,

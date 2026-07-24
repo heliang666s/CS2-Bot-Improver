@@ -177,7 +177,7 @@ foreach ($Plugin in $PluginTargets) {
     }
 }
 
-$BotControllerApiSourceDirectory = Join-Path $Root "addons/counterstrikesharp/shared/BotControllerApi/bin/Release"
+$BotControllerApiSourceDirectory = Join-Path $Root "addons/counterstrikesharp/shared/BotControllerApi/bin/Release/net10.0"
 $BotControllerApiDestinationDirectory = Join-Path $Staging "addons/counterstrikesharp/shared/BotControllerApi"
 Require-File (Join-Path $BotControllerApiSourceDirectory "BotControllerApi.dll")
 New-Item -ItemType Directory -Path $BotControllerApiDestinationDirectory -Force | Out-Null

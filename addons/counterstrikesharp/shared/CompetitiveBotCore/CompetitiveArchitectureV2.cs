@@ -353,6 +353,18 @@ public interface IInventoryPort
     bool TryRestore(InventorySnapshot snapshot);
 }
 
+public interface IDeferredInventoryConfirmation
+{
+    bool RequiresNextTickConfirmation { get; }
+}
+
+public interface IPendingInventoryPurchase
+{
+    bool IsPurchasePending(string itemName, int expectedCount);
+    void MarkPurchasePending(string itemName, int expectedCount);
+    void ClearPurchasePending(string itemName, int expectedCount);
+}
+
 public enum InventoryTransactionStage
 {
     Capture,
@@ -370,8 +382,17 @@ public readonly record struct InventoryTransactionResult(
     InventoryTransactionStage Stage,
     string Reason)
 {
+    public bool Retryable { get; init; }
+
     public static InventoryTransactionResult Success()
         => new(true, InventoryTransactionStage.Commit, "committed");
+}
+
+internal enum InventoryConfirmationStatus
+{
+    Confirmed,
+    Failed,
+    Pending,
 }
 
 public sealed class BuyExecutionTransaction
@@ -383,28 +404,51 @@ public sealed class BuyExecutionTransaction
         _port = port;
     }
 
+    // A deferred inventory port spends one call issuing each missing item and
+    // one additional call confirming the final item. The plugin uses this
+    // upper bound to keep retrying the same immutable plan until it commits.
+    public static int EstimateMaxConfirmationAttempts(PlayerBuyPlan plan)
+        => Math.Max(
+            1,
+            (plan.BuysArmor ? 1 : 0)
+            + (plan.BuysHelmet ? 1 : 0)
+            + (plan.PrimaryWeapon is not null ? 1 : 0)
+            + (plan.SecondaryWeapon is not null ? 1 : 0)
+            + (plan.BuysDefuser ? 1 : 0)
+            + plan.Utility.Count
+            + 1);
+
     public InventoryTransactionResult Execute(
         PlayerBuyPlan plan,
         TeamSide side,
         string? grantedPrimary = null)
     {
-        var before = _port.Capture();
+        // Only the core loadout is atomic. Team-critical and optional items
+        // are independently retryable after armor/primary/secondary commit.
+        var coreBefore = _port.Capture();
+        InventoryConfirmationStatus status;
         if (!BuyPlanner.IsCombatLegal(plan))
-            return Rollback(before, InventoryTransactionStage.Capture, "illegal-primary-without-armor");
+            return Rollback(coreBefore, InventoryTransactionStage.Capture, "illegal-primary-without-armor");
 
-        if (plan.BuysArmor && before.Armor == ArmorLevel.None)
+        if (plan.BuysArmor && coreBefore.Armor == ArmorLevel.None)
         {
             string armorItem = plan.ArmorLevel == ArmorLevel.Full
                 ? "item_assaultsuit"
                 : "item_kevlar";
-            if (!BuyAndConfirm(armorItem, snapshot => snapshot.Armor != ArmorLevel.None))
-                return Rollback(before, InventoryTransactionStage.Armor, "armor-purchase-failed");
+            status = BuyAndConfirm(armorItem, snapshot => snapshot.Armor != ArmorLevel.None);
+            if (status == InventoryConfirmationStatus.Pending)
+                return Pending(InventoryTransactionStage.Armor, "armor-confirmation-pending");
+            if (status == InventoryConfirmationStatus.Failed)
+                return Rollback(coreBefore, InventoryTransactionStage.Armor, "armor-purchase-failed");
         }
 
         if (plan.BuysHelmet && !_port.Capture().HasHelmet
-            && !BuyAndConfirm("item_assaultsuit", snapshot => snapshot.HasHelmet))
+            && (status = BuyAndConfirm("item_assaultsuit", snapshot => snapshot.HasHelmet))
+                != InventoryConfirmationStatus.Confirmed)
         {
-            return Rollback(before, InventoryTransactionStage.Helmet, "helmet-purchase-failed");
+            if (status == InventoryConfirmationStatus.Pending)
+                return Pending(InventoryTransactionStage.Helmet, "helmet-confirmation-pending");
+            return Rollback(coreBefore, InventoryTransactionStage.Helmet, "helmet-purchase-failed");
         }
 
         if (plan.PrimaryWeapon is { } primary)
@@ -417,18 +461,22 @@ public sealed class BuyExecutionTransaction
                     && !_port.TryRemove(replacement))
                 {
                     return Rollback(
-                        before,
+                        coreBefore,
                         InventoryTransactionStage.Primary,
                         "replacement-remove-failed");
                 }
 
                 bool granted = string.Equals(grantedPrimary, primary, StringComparison.Ordinal)
                     && _port.Contains(primary);
-                if (!granted && !BuyAndConfirm(
-                        primary,
-                        snapshot => string.Equals(snapshot.PrimaryWeapon, primary, StringComparison.Ordinal)))
+                if (!granted)
                 {
-                    return Rollback(before, InventoryTransactionStage.Primary, "primary-confirmation-failed");
+                    status = BuyAndConfirm(
+                        primary,
+                        snapshot => string.Equals(snapshot.PrimaryWeapon, primary, StringComparison.Ordinal));
+                    if (status == InventoryConfirmationStatus.Pending)
+                        return Pending(InventoryTransactionStage.Primary, "primary-confirmation-pending");
+                    if (status == InventoryConfirmationStatus.Failed)
+                        return Rollback(coreBefore, InventoryTransactionStage.Primary, "primary-confirmation-failed");
                 }
             }
         }
@@ -439,21 +487,32 @@ public sealed class BuyExecutionTransaction
             if (!string.Equals(current, secondary, StringComparison.Ordinal))
             {
                 if (current is not null && !_port.TryRemove(current))
-                    return Rollback(before, InventoryTransactionStage.Secondary, "default-pistol-removal-failed");
-                if (!BuyAndConfirm(
-                        secondary,
-                        snapshot => string.Equals(snapshot.SecondaryWeapon, secondary, StringComparison.Ordinal)))
+                    return Rollback(coreBefore, InventoryTransactionStage.Secondary, "default-pistol-removal-failed");
+                status = BuyAndConfirm(
+                    secondary,
+                    snapshot => string.Equals(snapshot.SecondaryWeapon, secondary, StringComparison.Ordinal));
+                if (status != InventoryConfirmationStatus.Confirmed)
                 {
-                    return Rollback(before, InventoryTransactionStage.Secondary, "secondary-confirmation-failed");
+                    if (status == InventoryConfirmationStatus.Pending)
+                        return Pending(InventoryTransactionStage.Secondary, "secondary-confirmation-pending");
+                    return Rollback(coreBefore, InventoryTransactionStage.Secondary, "secondary-confirmation-failed");
                 }
             }
         }
 
         if (plan.BuysDefuser && side == TeamSide.CounterTerrorist
-            && !_port.Capture().HasDefuser
-            && !BuyAndConfirm("item_defuser", snapshot => snapshot.HasDefuser))
+            && !_port.Capture().HasDefuser)
         {
-            return Rollback(before, InventoryTransactionStage.Defuser, "defuser-purchase-failed");
+            status = BuyAndConfirm("item_defuser", snapshot => snapshot.HasDefuser);
+            if (status != InventoryConfirmationStatus.Confirmed)
+            {
+                return status == InventoryConfirmationStatus.Pending
+                    ? Pending(InventoryTransactionStage.Defuser, "defuser-confirmation-pending")
+                    : new InventoryTransactionResult(
+                        false,
+                        InventoryTransactionStage.Defuser,
+                        "defuser-purchase-failed");
+            }
         }
 
         foreach (var utilityGroup in plan.Utility
@@ -464,19 +523,32 @@ public sealed class BuyExecutionTransaction
             string item = utilityGroup.Key;
             int currentCount = _port.Capture().Utility.Count(
                 owned => string.Equals(owned, item, StringComparison.Ordinal));
+            if (_port is IPendingInventoryPurchase pending
+                && currentCount > 0)
+            {
+                // A delayed item can arrive between transaction attempts.
+                // Clear every already-observed generation so the next
+                // quantity gets its own pending slot.
+                for (int confirmedCount = 1; confirmedCount <= currentCount; confirmedCount++)
+                    pending.ClearPurchasePending(item, confirmedCount);
+            }
             for (int index = currentCount; index < utilityGroup.Count(); index++)
             {
                 int expectedCount = index + 1;
-                if (!BuyAndConfirm(
+                status = BuyAndConfirm(
                         item,
                         snapshot => snapshot.Utility.Count(
                             owned => string.Equals(owned, item, StringComparison.Ordinal))
-                            >= expectedCount))
+                            >= expectedCount,
+                        expectedCount);
+                if (status != InventoryConfirmationStatus.Confirmed)
                 {
-                    return Rollback(
-                        before,
-                        InventoryTransactionStage.Utility,
-                        $"utility-purchase-failed:{item}");
+                    return status == InventoryConfirmationStatus.Pending
+                        ? Pending(InventoryTransactionStage.Utility, $"utility-confirmation-pending:{item}")
+                        : new InventoryTransactionResult(
+                            false,
+                            InventoryTransactionStage.Utility,
+                            $"utility-purchase-failed:{item}");
                 }
             }
         }
@@ -484,8 +556,49 @@ public sealed class BuyExecutionTransaction
         return InventoryTransactionResult.Success();
     }
 
-    private bool BuyAndConfirm(string itemName, Func<InventorySnapshot, bool> confirmation)
-        => _port.TryBuy(itemName) && confirmation(_port.Capture());
+    private InventoryConfirmationStatus BuyAndConfirm(
+        string itemName,
+        Func<InventorySnapshot, bool> confirmation,
+        int expectedCount = 1)
+    {
+        // Capture is the live inventory boundary. A retry entering this
+        // method after a delayed game tick sees the item and remains
+        // idempotent instead of charging it a second time.
+        if (confirmation(_port.Capture()))
+        {
+            if (_port is IPendingInventoryPurchase pending)
+                pending.ClearPurchasePending(itemName, expectedCount);
+            return InventoryConfirmationStatus.Confirmed;
+        }
+        if (_port is IPendingInventoryPurchase pendingPurchase
+            && pendingPurchase.IsPurchasePending(itemName, expectedCount))
+            return InventoryConfirmationStatus.Pending;
+        if (!_port.TryBuy(itemName))
+            return InventoryConfirmationStatus.Failed;
+
+        // The live CSS inventory is updated on a later game tick. Do not
+        // interpret a same-call snapshot as a failed purchase and do not buy
+        // the same item again while the engine is settling the transaction.
+        if (_port is IDeferredInventoryConfirmation { RequiresNextTickConfirmation: true })
+        {
+            if (_port is IPendingInventoryPurchase pending)
+                pending.MarkPurchasePending(itemName, expectedCount);
+            return InventoryConfirmationStatus.Pending;
+        }
+
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            if (confirmation(_port.Capture()))
+                return InventoryConfirmationStatus.Confirmed;
+        }
+
+        return InventoryConfirmationStatus.Failed;
+    }
+
+    private static InventoryTransactionResult Pending(
+        InventoryTransactionStage stage,
+        string reason)
+        => new(false, stage, reason) { Retryable = true };
 
     private InventoryTransactionResult Rollback(
         InventorySnapshot before,
@@ -517,6 +630,25 @@ public sealed class WeaponGrantTransaction
 {
     private readonly IInventoryPort _donor;
     private readonly IInventoryPort _recipient;
+    private GrantStage _stage = GrantStage.DonorPurchase;
+    private bool _started;
+    private bool _recipientGrantIssued;
+    private bool _donorRearmIssued;
+    private bool _finished;
+    private bool _aborted;
+    private string? _weapon;
+    private string? _donorRearmWeapon;
+    private int _expectedCost;
+    private InventorySnapshot _donorBefore;
+    private InventorySnapshot _recipientBefore;
+
+    private enum GrantStage
+    {
+        DonorPurchase,
+        DonorRemoval,
+        RecipientGrant,
+        DonorRearm,
+    }
 
     public WeaponGrantTransaction(IInventoryPort donor, IInventoryPort recipient)
     {
@@ -529,44 +661,184 @@ public sealed class WeaponGrantTransaction
         int expectedCost,
         string? donorRearmWeapon = null)
     {
-        var donorBefore = _donor.Capture();
-        var recipientBefore = _recipient.Capture();
-        if (!BuyPlanner.IsPrimaryWeapon(weapon)
-            || BuyPlanner.GetWeaponCost(weapon) != expectedCost)
+        if (!_started)
         {
-            return new(false, InventoryTransactionStage.Primary, "invalid-transfer-item");
+            if (!BuyPlanner.IsPrimaryWeapon(weapon)
+                || BuyPlanner.GetWeaponCost(weapon) != expectedCost)
+            {
+                return new(false, InventoryTransactionStage.Primary, "invalid-transfer-item");
+            }
+            if (donorRearmWeapon is not null
+                && (!BuyPlanner.IsPrimaryWeapon(donorRearmWeapon)
+                    || BuyPlanner.GetWeaponCost(donorRearmWeapon) <= 0))
+            {
+                return new(false, InventoryTransactionStage.Primary, "invalid-donor-rearm-item");
+            }
+
+            _started = true;
+            _weapon = weapon;
+            _expectedCost = expectedCost;
+            _donorRearmWeapon = donorRearmWeapon;
+            _donorBefore = _donor.Capture();
+            _recipientBefore = _recipient.Capture();
         }
-        if (donorRearmWeapon is not null
-            && (!BuyPlanner.IsPrimaryWeapon(donorRearmWeapon)
-                || BuyPlanner.GetWeaponCost(donorRearmWeapon) <= 0))
+        else if (!string.Equals(_weapon, weapon, StringComparison.Ordinal)
+            || _expectedCost != expectedCost
+            || !string.Equals(_donorRearmWeapon, donorRearmWeapon, StringComparison.Ordinal))
         {
-            return new(false, InventoryTransactionStage.Primary, "invalid-donor-rearm-item");
+            return new(false, InventoryTransactionStage.Primary, "transfer-arguments-changed");
         }
 
-        if (!_donor.TryBuy(weapon) || !_donor.Contains(weapon))
-            return Rollback(donorBefore, recipientBefore, "donor-purchase-failed");
-        if (!_donor.TryRemove(weapon))
-            return Rollback(donorBefore, recipientBefore, "donor-removal-failed");
-        if (!_recipient.TryGrant(weapon) || !_recipient.Contains(weapon))
-            return Rollback(donorBefore, recipientBefore, "recipient-confirmation-failed");
-        if (donorRearmWeapon is not null
-            && (!_donor.TryBuy(donorRearmWeapon)
-                || !_donor.Contains(donorRearmWeapon)))
-        {
-            return Rollback(donorBefore, recipientBefore, "donor-rearm-failed");
-        }
+        if (_finished)
+            return _aborted
+                ? new(false, InventoryTransactionStage.Primary, "transfer-aborted")
+                : InventoryTransactionResult.Success();
 
-        return InventoryTransactionResult.Success();
+        while (true)
+        {
+            switch (_stage)
+            {
+                case GrantStage.DonorPurchase:
+                    if (_donor.Contains(_weapon!))
+                    {
+                        ClearPending(_donor, _weapon!);
+                        _stage = GrantStage.DonorRemoval;
+                        continue;
+                    }
+                    if (IsPending(_donor, _weapon!))
+                        return Pending("donor-purchase-confirmation-pending");
+                    if (!_donor.TryBuy(_weapon!))
+                        return Rollback("donor-purchase-failed");
+                    if (!_donor.Contains(_weapon!))
+                    {
+                        MarkPending(_donor, _weapon!);
+                        return Pending("donor-purchase-confirmation-pending");
+                    }
+                    _stage = GrantStage.DonorRemoval;
+                    continue;
+
+                case GrantStage.DonorRemoval:
+                    if (!_donor.Contains(_weapon!))
+                    {
+                        _stage = GrantStage.RecipientGrant;
+                        continue;
+                    }
+                    if (!_donor.TryRemove(_weapon!))
+                        return Rollback("donor-removal-failed");
+                    _stage = GrantStage.RecipientGrant;
+                    continue;
+
+                case GrantStage.RecipientGrant:
+                    if (_recipient.Contains(_weapon!))
+                    {
+                        if (!_recipientGrantIssued)
+                            return CancelForExternalRecipient();
+                        ClearPending(_recipient, _weapon!);
+                        _stage = GrantStage.DonorRearm;
+                        continue;
+                    }
+                    if (!_recipientGrantIssued)
+                    {
+                        if (!_recipient.TryGrant(_weapon!))
+                            return Rollback("recipient-grant-failed");
+                        _recipientGrantIssued = true;
+                    }
+                    if (!_recipient.Contains(_weapon!))
+                    {
+                        MarkPending(_recipient, _weapon!);
+                        return Pending("recipient-grant-confirmation-pending");
+                    }
+                    ClearPending(_recipient, _weapon!);
+                    _stage = GrantStage.DonorRearm;
+                    continue;
+
+                case GrantStage.DonorRearm:
+                    if (_donorRearmWeapon is null)
+                    {
+                        _finished = true;
+                        return InventoryTransactionResult.Success();
+                    }
+                    if (_donor.Contains(_donorRearmWeapon))
+                    {
+                        ClearPending(_donor, _donorRearmWeapon);
+                        _finished = true;
+                        return InventoryTransactionResult.Success();
+                    }
+                    if (IsPending(_donor, _donorRearmWeapon))
+                        return Pending("donor-rearm-confirmation-pending");
+                    if (!_donorRearmIssued)
+                    {
+                        if (!_donor.TryBuy(_donorRearmWeapon))
+                            return Rollback("donor-rearm-failed");
+                        _donorRearmIssued = true;
+                    }
+                    if (!_donor.Contains(_donorRearmWeapon))
+                    {
+                        MarkPending(_donor, _donorRearmWeapon);
+                        return Pending("donor-rearm-confirmation-pending");
+                    }
+                    _finished = true;
+                    return InventoryTransactionResult.Success();
+            }
+        }
     }
 
-    private InventoryTransactionResult Rollback(
-        InventorySnapshot donorBefore,
-        InventorySnapshot recipientBefore,
-        string reason)
+    public void Abort()
     {
-        _donor.TryRestore(donorBefore);
-        _recipient.TryRestore(recipientBefore);
+        if (!_started || _finished)
+            return;
+
+        ClearPending(_donor, _weapon!);
+        if (_donorRearmWeapon is not null)
+            ClearPending(_donor, _donorRearmWeapon);
+        ClearPending(_recipient, _weapon!);
+        _donor.TryRestore(_donorBefore);
+        _recipient.TryRestore(_recipientBefore);
+        _aborted = true;
+        _finished = true;
+    }
+
+    private InventoryTransactionResult Pending(string reason)
+        => new(false, InventoryTransactionStage.Primary, reason) { Retryable = true };
+
+    private static bool IsPending(IInventoryPort port, string itemName)
+        => port is IPendingInventoryPurchase pending
+            && pending.IsPurchasePending(itemName, expectedCount: 1);
+
+    private static void MarkPending(IInventoryPort port, string itemName)
+    {
+        if (port is IPendingInventoryPurchase pending)
+            pending.MarkPurchasePending(itemName, expectedCount: 1);
+    }
+
+    private static void ClearPending(IInventoryPort port, string itemName)
+    {
+        if (port is IPendingInventoryPurchase pending)
+            pending.ClearPurchasePending(itemName, expectedCount: 1);
+    }
+
+    private InventoryTransactionResult Rollback(string reason)
+    {
+        ClearPending(_donor, _weapon!);
+        if (_donorRearmWeapon is not null)
+            ClearPending(_donor, _donorRearmWeapon);
+        ClearPending(_recipient, _weapon!);
+        _donor.TryRestore(_donorBefore);
+        _recipient.TryRestore(_recipientBefore);
+        _finished = true;
         return new(false, InventoryTransactionStage.Primary, reason);
+    }
+
+    private InventoryTransactionResult CancelForExternalRecipient()
+    {
+        ClearPending(_donor, _weapon!);
+        if (_donorRearmWeapon is not null)
+            ClearPending(_donor, _donorRearmWeapon);
+        ClearPending(_recipient, _weapon!);
+        _donor.TryRestore(_donorBefore);
+        _aborted = true;
+        _finished = true;
+        return new(false, InventoryTransactionStage.Primary, "recipient-external-weapon");
     }
 }
 
@@ -636,9 +908,11 @@ public readonly record struct BoundedPlannerOptions(
     int MaxFrontierStates = 256,
     int HardBudgetMilliseconds = 5)
 {
-    public int CandidateLimit => Math.Max(1, MaxCandidatesPerBot);
-    public int FrontierLimit => Math.Max(1, MaxFrontierStates);
-    public int BudgetMilliseconds => Math.Max(1, HardBudgetMilliseconds);
+    // A record struct's parameterless constructor zero-initializes fields,
+    // so preserve the documented defaults when callers use new().
+    public int CandidateLimit => MaxCandidatesPerBot > 0 ? MaxCandidatesPerBot : 6;
+    public int FrontierLimit => MaxFrontierStates > 0 ? MaxFrontierStates : 256;
+    public int BudgetMilliseconds => HardBudgetMilliseconds > 0 ? HardBudgetMilliseconds : 5;
 }
 
 public readonly record struct BoundedPlannerDiagnostics(
@@ -684,7 +958,12 @@ public static class BoundedTeamBuyPlanner
         int PreferredRifleCount,
         int LimitedSmgCount,
         int UtilityCoverage,
-        int DefuserCount);
+        int SmokeCount,
+        int FlashCount,
+        int HeCount,
+        int FireCount,
+        int DefuserCount,
+        int PersonalUtilityCoverage);
 
     public static BoundedTeamBuyResult Optimize(
         TeamSide side,
@@ -708,15 +987,41 @@ public static class BoundedTeamBuyPlanner
         var humanObservations = members
             .Where(member => !member.IsBot && member.Candidates.Count > 0)
             .ToDictionary(member => member.Slot, member => member.Candidates[0]);
+        var humanPlans = humanObservations.Values.ToArray();
+        int initialMinTier = humanPlans.Select(plan => plan.Tier)
+            .DefaultIfEmpty(int.MaxValue)
+            .Min();
+        int initialMaxTier = humanPlans.Select(plan => plan.Tier)
+            .DefaultIfEmpty(int.MinValue)
+            .Max();
+        int initialTierSum = humanPlans.Sum(plan => plan.Tier);
+        int initialAwpCount = humanPlans.Count(plan => plan.PrimaryWeapon == "weapon_awp");
+        int initialPreferredRifleCount = humanPlans.Count(plan =>
+            IsPreferredRifle(plan.PrimaryWeapon, side));
+        int initialLimitedSmgCount = humanPlans.Count(plan =>
+            IsLimitedSmg(plan.PrimaryWeapon));
+        int initialUtilityCoverage = humanPlans.Sum(GetUtilityCoverage);
+        int initialSmokeCount = humanPlans.Sum(plan => CountUtility(plan, "smoke"));
+        int initialFlashCount = humanPlans.Sum(plan => CountUtility(plan, "flash"));
+        int initialHeCount = humanPlans.Sum(plan => CountUtility(plan, "he"));
+        int initialFireCount = humanPlans.Sum(plan => CountUtility(plan, "fire"));
+        var memberDefuserSlots = members
+            .Where(member => member.IsDefuser)
+            .Select(member => member.Slot)
+            .ToHashSet();
+        int initialDefuserCount = memberDefuserSlots.Count
+            + humanObservations.Count(entry =>
+                !memberDefuserSlots.Contains(entry.Key)
+                && entry.Value.BuysDefuser);
         var bots = members
             .Where(member => member.IsBot && member.Candidates.Count > 0)
             .OrderBy(member => member.Slot)
             .Select(member => new CandidateMember(member, TrimCandidates(member, limits.CandidateLimit)))
             .Where(member => member.Candidates.Count > 0)
             .ToArray();
-        bool preferredRifleExists = side == TeamSide.CounterTerrorist
-            ? bots.Any(member => member.Candidates.Any(candidate => IsPreferredRifle(candidate.PrimaryWeapon, side)))
-            : bots.Any(member => member.Candidates.Any(candidate => IsPreferredRifle(candidate.PrimaryWeapon, side)));
+        bool preferredRifleExists = initialPreferredRifleCount > 0
+            || bots.Any(member => member.Candidates.Any(candidate =>
+                IsPreferredRifle(candidate.PrimaryWeapon, side)));
 
         if (bots.Length == 0)
         {
@@ -724,8 +1029,8 @@ public static class BoundedTeamBuyPlanner
                 new TeamBuyPlan(
                     new Dictionary<int, PlayerBuyPlan>(),
                     humanObservations,
-                    0,
-                    0)
+                    humanPlans.Select(plan => plan.Tier).DefaultIfEmpty(0).Min(),
+                    humanPlans.Select(plan => plan.Tier).DefaultIfEmpty(0).Max())
                 {
                     Intent = purchaseIntent,
                     BuyMode = buyMode,
@@ -735,10 +1040,36 @@ public static class BoundedTeamBuyPlanner
         }
 
         int teamBudget = bots.Sum(member => Math.Max(0, member.Member.Money));
-        int utilityCoverageTarget = Math.Max(3, bots.Length * 3);
+        var utilityDemand = TeamUtilityDemandPolicy.ForPhase(
+            phase,
+            Math.Max(1, members.Count),
+            buyMode == TeamBuyMode.MustWin);
+        int personalUtilityCoverageTarget = utilityDemand.PersonalUtilityTarget
+            * Math.Max(1, bots.Length);
+        int utilityCoverageTarget = Math.Max(
+            3,
+            utilityDemand.Smoke
+                + utilityDemand.Flash
+                + utilityDemand.He
+                + utilityDemand.Fire);
         var frontier = new List<FrontierState>
         {
-            new(Array.Empty<int>(), 0, int.MaxValue, int.MinValue, 0, 0, 0, 0, 0, 0),
+            new(
+                Array.Empty<int>(),
+                0,
+                initialMinTier,
+                initialMaxTier,
+                initialTierSum,
+                initialAwpCount,
+                initialPreferredRifleCount,
+                initialLimitedSmgCount,
+                initialUtilityCoverage,
+                initialSmokeCount,
+                initialFlashCount,
+                initialHeCount,
+                initialFireCount,
+                initialDefuserCount,
+                0),
         };
 
         for (int memberIndex = 0; memberIndex < bots.Length; memberIndex++)
@@ -791,14 +1122,26 @@ public static class BoundedTeamBuyPlanner
                             + (IsPreferredRifle(candidate.PrimaryWeapon, side) ? 1 : 0),
                         state.LimitedSmgCount + (IsLimitedSmg(candidate.PrimaryWeapon) ? 1 : 0),
                         state.UtilityCoverage + GetUtilityCoverage(candidate),
-                        state.DefuserCount + (candidate.BuysDefuser ? 1 : 0)));
+                        state.SmokeCount + CountUtility(candidate, "smoke"),
+                        state.FlashCount + CountUtility(candidate, "flash"),
+                        state.HeCount + CountUtility(candidate, "he"),
+                        state.FireCount + CountUtility(candidate, "fire"),
+                        state.DefuserCount + (candidate.BuysDefuser ? 1 : 0),
+                        state.PersonalUtilityCoverage + Math.Min(
+                            candidate.Utility.Count,
+                            utilityDemand.PersonalUtilityTarget)));
                 }
 
                 if (timedOut)
                     break;
             }
 
-            frontier = Prune(next, limits.FrontierLimit, utilityCoverageTarget);
+            frontier = Prune(
+                next,
+                limits.FrontierLimit,
+                utilityCoverageTarget,
+                utilityDemand,
+                personalUtilityCoverageTarget);
             maxFrontier = Math.Max(maxFrontier, frontier.Count);
             if (frontier.Count == 0 || timedOut)
                 break;
@@ -806,12 +1149,35 @@ public static class BoundedTeamBuyPlanner
 
         bool usedFallback = timedOut || frontier.Count == 0;
         FrontierState? chosen = usedFallback
-            ? BuildFallbackState(bots, teamBudget, side, buyMode, preferredRifleExists)
+            ? BuildFallbackState(
+                bots,
+                teamBudget,
+                side,
+                buyMode,
+                preferredRifleExists,
+                initialMinTier,
+                initialMaxTier,
+                initialTierSum,
+                initialAwpCount,
+                initialPreferredRifleCount,
+                initialLimitedSmgCount,
+                initialUtilityCoverage,
+                initialSmokeCount,
+                initialFlashCount,
+                initialHeCount,
+                initialFireCount,
+                initialDefuserCount,
+                utilityDemand.PersonalUtilityTarget,
+                utilityDemand.Defuser,
+                utilityDemand.Fire)
             : frontier
                 .OrderByDescending(state => state.MinTier >= currentMinTier)
+                .ThenByDescending(state => HasDesignatedAwpPlan(state, bots))
                 .ThenByDescending(state => FrontierQualityScore(
                     state,
-                    utilityCoverageTarget))
+                    utilityCoverageTarget,
+                    utilityDemand,
+                    personalUtilityCoverageTarget))
                 .ThenByDescending(state => state.MinTier)
                 .ThenByDescending(state => state.TierSum)
                 // Keep the one-AWP structure when it does not lower the
@@ -832,8 +1198,8 @@ public static class BoundedTeamBuyPlanner
                 new TeamBuyPlan(
                     new Dictionary<int, PlayerBuyPlan>(),
                     humanObservations,
-                    0,
-                    0)
+                    humanPlans.Select(plan => plan.Tier).DefaultIfEmpty(0).Min(),
+                    humanPlans.Select(plan => plan.Tier).DefaultIfEmpty(0).Max())
                 {
                     Intent = purchaseIntent,
                     BuyMode = buyMode,
@@ -901,10 +1267,10 @@ public static class BoundedTeamBuyPlanner
             .ToArray();
         transfers = TeamTransferPlanner.BuildTransfers(transferParticipants);
         ApplyTransferredLoadouts(botPlans, transfers);
-        var ordinaryPlans = botPlans.Values
+        var balancePlans = botPlans.Values
             .Where(plan => plan.PrimaryWeapon != "weapon_awp")
+            .Concat(humanObservations.Values)
             .ToArray();
-        var balancePlans = ordinaryPlans.Length > 0 ? ordinaryPlans : botPlans.Values.ToArray();
         int min = balancePlans.Select(plan => plan.Tier).DefaultIfEmpty(0).Min();
         int max = balancePlans.Select(plan => plan.Tier).DefaultIfEmpty(0).Max();
         var purchaseCosts = BuildPurchaseCosts(bots, botPlans, transfers);
@@ -923,7 +1289,23 @@ public static class BoundedTeamBuyPlanner
                         member.Member.IsPlanter,
                         member.Member.IsDefuser,
                         Math.Max(member.Member.SavedTier, selectedPlan.Tier));
-                }).ToArray(),
+                })
+                .Concat(members
+                    .Where(member => !member.IsBot && member.Candidates.Count > 0)
+                    .Select(member =>
+                    {
+                        var observed = member.Candidates[0];
+                        return new ScenarioParticipant(
+                            member.Slot,
+                            side,
+                            Math.Max(0, member.Money),
+                            observed,
+                            member.Kills,
+                            member.IsPlanter,
+                            member.IsDefuser,
+                            Math.Max(member.SavedTier, observed.Tier));
+                    }))
+                .ToArray(),
                 rewards,
                 consecutiveLosses,
                 members.Count,
@@ -948,11 +1330,21 @@ public static class BoundedTeamBuyPlanner
                 Stopwatch.GetTimestamp() - started));
     }
 
+    private static bool HasDesignatedAwpPlan(
+        FrontierState state,
+        IReadOnlyList<CandidateMember> members)
+        => members
+            .Select((member, index) => index < state.CandidateIndexes.Length
+                ? (member, Candidate: member.Candidates[state.CandidateIndexes[index]])
+                : (member, Candidate: (PlayerBuyPlan?)null))
+            .Any(entry => entry.member.Member.IsAwper
+                && entry.Candidate?.PrimaryWeapon == "weapon_awp");
+
     private static IReadOnlyList<PlayerBuyPlan> TrimCandidates(
         TeamPlanningMember member,
         int limit)
     {
-        var ordered = member.Candidates
+        IReadOnlyList<PlayerBuyPlan> ordered = member.Candidates
             .Where(BuyPlanner.IsCombatLegal)
             .OrderByDescending(plan => PlanQualityScore(plan, member.IsAwper))
             .ThenByDescending(plan => plan.Tier)
@@ -961,6 +1353,64 @@ public static class BoundedTeamBuyPlanner
             .ThenBy(plan => plan.PrimaryWeapon, StringComparer.Ordinal)
             .Take(limit)
             .ToArray();
+        var fireCandidate = member.Candidates.Any(candidate => candidate.Role != BuyRole.Auto)
+            ? member.Candidates
+                .Where(BuyPlanner.IsCombatLegal)
+                .Where(candidate => CountUtility(candidate, "fire") > 0)
+                .OrderByDescending(candidate => candidate.Tier)
+                .ThenBy(candidate => candidate.EstimatedCost)
+                .FirstOrDefault()
+            : null;
+        if (fireCandidate is not null
+            && !ordered.Any(candidate => CountUtility(candidate, "fire") > 0))
+        {
+            ordered = ordered
+                .Take(Math.Max(0, limit - 1))
+                .Append(fireCandidate)
+                .ToArray();
+        }
+        var noDefuserCandidate = member.Candidates
+            .Where(candidate => !candidate.BuysDefuser)
+            .Where(candidate => candidate.PrimaryWeapon is not null)
+            .Where(BuyPlanner.IsCombatLegal)
+            .OrderByDescending(candidate => CountUtility(candidate, "fire"))
+            .ThenByDescending(candidate => candidate.Tier)
+            .ThenByDescending(GetUtilityCoverage)
+            .ThenBy(candidate => candidate.EstimatedCost)
+            .FirstOrDefault();
+        if (noDefuserCandidate is not null
+            && !ordered.Any(candidate => !candidate.BuysDefuser
+                && candidate.PrimaryWeapon == noDefuserCandidate.PrimaryWeapon
+                && candidate.ArmorLevel != ArmorLevel.None))
+        {
+            ordered = ordered
+                .Take(Math.Max(0, limit - 1))
+                .Append(noDefuserCandidate)
+                .ToArray();
+        }
+        var defuserCandidate = member.Candidates
+            .Where(candidate => candidate.BuysDefuser)
+            .Where(BuyPlanner.IsCombatLegal)
+            .OrderByDescending(candidate => CountUtility(candidate, "fire"))
+            .ThenByDescending(candidate => candidate.Tier)
+            .ThenByDescending(GetUtilityCoverage)
+            .ThenBy(candidate => candidate.EstimatedCost)
+            .FirstOrDefault();
+        if (defuserCandidate is not null
+            && !ordered.Any(candidate => candidate.BuysDefuser))
+        {
+            ordered = ordered
+                .Take(Math.Max(0, limit - 1))
+                .Append(defuserCandidate)
+                .ToArray();
+        }
+        var requiredCandidates = new[]
+        {
+            fireCandidate,
+            noDefuserCandidate,
+            defuserCandidate,
+        };
+        ordered = KeepRequiredCandidates(ordered, requiredCandidates, limit);
         if (!member.IsAwper)
         {
             var recipient = member.Candidates
@@ -972,10 +1422,10 @@ public static class BoundedTeamBuyPlanner
             if (recipient is null || ordered.Any(candidate => candidate.AcceptsTeamPrimary))
                 return ordered;
 
-            return ordered
-                .Take(Math.Max(0, limit - 1))
-                .Append(recipient)
-                .ToArray();
+            return KeepRequiredCandidates(
+                ordered.Append(recipient),
+                requiredCandidates.Append(recipient),
+                limit);
         }
 
         var designatedAwp = member.Candidates
@@ -988,17 +1438,39 @@ public static class BoundedTeamBuyPlanner
             || ordered.Any(plan => plan.PrimaryWeapon == "weapon_awp"))
             return ordered;
 
-        return ordered
-            .Where(plan => plan.PrimaryWeapon != "weapon_awp")
-            .Take(Math.Max(0, limit - 1))
-            .Append(designatedAwp)
+        return KeepRequiredCandidates(
+            ordered
+                .Where(plan => plan.PrimaryWeapon != "weapon_awp")
+                .Append(designatedAwp),
+            requiredCandidates.Append(designatedAwp),
+            limit);
+    }
+
+    private static IReadOnlyList<PlayerBuyPlan> KeepRequiredCandidates(
+        IEnumerable<PlayerBuyPlan> candidates,
+        IEnumerable<PlayerBuyPlan?> required,
+        int limit)
+    {
+        var requiredCandidates = required
+            .Where(candidate => candidate is not null)
+            .Select(candidate => candidate!)
+            .Distinct()
+            .Take(limit)
+            .ToArray();
+        var requiredSet = requiredCandidates.ToHashSet();
+        return candidates
+            .Where(candidate => !requiredSet.Contains(candidate))
+            .Take(Math.Max(0, limit - requiredCandidates.Length))
+            .Concat(requiredCandidates)
             .ToArray();
     }
 
     private static List<FrontierState> Prune(
         List<FrontierState> states,
         int limit,
-        int utilityCoverageTarget)
+        int utilityCoverageTarget,
+        TeamUtilityDemand utilityDemand,
+        int personalUtilityCoverageTarget)
     {
         var result = new List<FrontierState>(Math.Min(limit, states.Count));
         foreach (var state in states
@@ -1008,7 +1480,9 @@ public static class BoundedTeamBuyPlanner
                      // consume the bounded slot budget.
                      .OrderByDescending(state => FrontierQualityScore(
                          state,
-                         utilityCoverageTarget))
+                         utilityCoverageTarget,
+                         utilityDemand,
+                         personalUtilityCoverageTarget))
                      .ThenByDescending(state => state.MinTier)
                      .ThenByDescending(state => state.TierSum)
                      .ThenByDescending(state => state.PreferredRifleCount)
@@ -1021,7 +1495,12 @@ public static class BoundedTeamBuyPlanner
                 && existing.TierSum >= state.TierSum
                 && existing.PreferredRifleCount >= state.PreferredRifleCount
                 && existing.UtilityCoverage >= state.UtilityCoverage
+                && existing.SmokeCount >= state.SmokeCount
+                && existing.FlashCount >= state.FlashCount
+                && existing.HeCount >= state.HeCount
+                && existing.FireCount >= state.FireCount
                 && existing.DefuserCount >= state.DefuserCount
+                && existing.PersonalUtilityCoverage >= state.PersonalUtilityCoverage
                 && existing.MaxTier - existing.MinTier <= state.MaxTier - state.MinTier
                 // AWP and rifle structures are intentionally separate Pareto
                 // dimensions. A cheaper M4 must not erase the designated AWP
@@ -1041,7 +1520,9 @@ public static class BoundedTeamBuyPlanner
 
     private static int FrontierQualityScore(
         FrontierState state,
-        int utilityCoverageTarget)
+        int utilityCoverageTarget,
+        TeamUtilityDemand utilityDemand,
+        int personalUtilityCoverageTarget)
     {
         int utility = DiminishingCoverageScore(
             state.UtilityCoverage,
@@ -1050,9 +1531,34 @@ public static class BoundedTeamBuyPlanner
             excessPenalty: 2);
         int defusers = DiminishingCoverageScore(
             state.DefuserCount,
-            target: 1,
+            target: utilityDemand.Defuser,
             usefulWeight: 24,
             excessPenalty: 8);
+        int personalUtility = DiminishingCoverageScore(
+            state.PersonalUtilityCoverage,
+            personalUtilityCoverageTarget,
+            usefulWeight: 5,
+            excessPenalty: 1);
+        int typedUtility = DiminishingCoverageScore(
+                state.SmokeCount,
+                utilityDemand.Smoke,
+                usefulWeight: 14,
+                excessPenalty: 3)
+            + DiminishingCoverageScore(
+                state.FlashCount,
+                utilityDemand.Flash,
+                usefulWeight: 10,
+                excessPenalty: 2)
+            + DiminishingCoverageScore(
+                state.HeCount,
+                utilityDemand.He,
+                usefulWeight: 10,
+                excessPenalty: 2)
+            + DiminishingCoverageScore(
+                state.FireCount,
+                utilityDemand.Fire,
+                usefulWeight: 10,
+                excessPenalty: 2);
         int spreadPenalty = Math.Max(0, state.MaxTier - state.MinTier) * 14;
         int limitedSmgPenalty = state.LimitedSmgCount * 8;
         return state.MinTier * 1000
@@ -1060,7 +1566,9 @@ public static class BoundedTeamBuyPlanner
             + state.PreferredRifleCount * 28
             + state.AwpCount * 18
             + utility
+            + typedUtility
             + defusers
+            + personalUtility
             - spreadPenalty
             - limitedSmgPenalty;
     }
@@ -1150,18 +1658,38 @@ public static class BoundedTeamBuyPlanner
         int teamBudget,
         TeamSide side,
         TeamBuyMode buyMode,
-        bool preferredRifleExists)
+        bool preferredRifleExists,
+        int initialMinTier,
+        int initialMaxTier,
+        int initialTierSum,
+        int initialAwpCount,
+        int initialPreferredRifleCount,
+        int initialLimitedSmgCount,
+        int initialUtilityCoverage,
+        int initialSmokeCount,
+        int initialFlashCount,
+        int initialHeCount,
+        int initialFireCount,
+        int initialDefuserCount,
+        int personalUtilityTarget,
+        int defuserTarget,
+        int fireTarget)
     {
         var indexes = new int[members.Count];
         int totalCost = 0;
-        int minTier = int.MaxValue;
-        int maxTier = int.MinValue;
-        int tierSum = 0;
-        int awpCount = 0;
-        int preferredRifleCount = 0;
-        int limitedSmgCount = 0;
-        int utilityCoverage = 0;
-        int defuserCount = 0;
+        int minTier = initialMinTier;
+        int maxTier = initialMaxTier;
+        int tierSum = initialTierSum;
+        int awpCount = initialAwpCount;
+        int preferredRifleCount = initialPreferredRifleCount;
+        int limitedSmgCount = initialLimitedSmgCount;
+        int utilityCoverage = initialUtilityCoverage;
+        int smokeCount = initialSmokeCount;
+        int flashCount = initialFlashCount;
+        int heCount = initialHeCount;
+        int fireCount = initialFireCount;
+        int defuserCount = initialDefuserCount;
+        int personalUtilityCoverage = 0;
 
         for (int i = 0; i < members.Count; i++)
         {
@@ -1184,8 +1712,25 @@ public static class BoundedTeamBuyPlanner
                     .Select(entry => (int?)entry.candidateIndex)
                     .FirstOrDefault()
                 : null;
-            int? index = designatedAwpIndex ?? allowedCandidates
-                .OrderByDescending(entry => entry.candidate.Tier)
+            bool needDefuser = defuserCount < defuserTarget;
+            bool needFire = fireCount < fireTarget;
+            var quotaCandidates = allowedCandidates
+                .Where(entry => !needDefuser || entry.candidate.BuysDefuser)
+                .Where(entry => !needFire || CountUtility(entry.candidate, "fire") > 0)
+                .ToArray();
+            var selectionCandidates = quotaCandidates.Length > 0
+                ? quotaCandidates
+                : allowedCandidates;
+            int? index = designatedAwpIndex ?? selectionCandidates
+                .OrderByDescending(entry => entry.candidate.BuysDefuser
+                    ? defuserCount < defuserTarget
+                    : defuserCount >= defuserTarget)
+                .ThenByDescending(entry => CountUtility(entry.candidate, "fire") > 0
+                    && fireCount < fireTarget)
+                .ThenByDescending(entry => PlanQualityScore(
+                    entry.candidate,
+                    members[i].Member.IsAwper))
+                .ThenByDescending(entry => entry.candidate.Tier)
                 .ThenBy(entry => entry.candidate.EstimatedCost)
                 .Select(entry => (int?)entry.candidateIndex)
                 .FirstOrDefault();
@@ -1201,7 +1746,14 @@ public static class BoundedTeamBuyPlanner
             preferredRifleCount += IsPreferredRifle(selected.PrimaryWeapon, side) ? 1 : 0;
             limitedSmgCount += IsLimitedSmg(selected.PrimaryWeapon) ? 1 : 0;
             utilityCoverage += GetUtilityCoverage(selected);
+            smokeCount += CountUtility(selected, "smoke");
+            flashCount += CountUtility(selected, "flash");
+            heCount += CountUtility(selected, "he");
+            fireCount += CountUtility(selected, "fire");
             defuserCount += selected.BuysDefuser ? 1 : 0;
+            personalUtilityCoverage += Math.Min(
+                selected.Utility.Count,
+                personalUtilityTarget);
         }
 
         return new FrontierState(
@@ -1214,7 +1766,12 @@ public static class BoundedTeamBuyPlanner
             preferredRifleCount,
             limitedSmgCount,
             utilityCoverage,
-            defuserCount);
+            smokeCount,
+            flashCount,
+            heCount,
+            fireCount,
+            defuserCount,
+            personalUtilityCoverage);
     }
 
     private static bool IsTeamWeaponAllowed(
@@ -1238,9 +1795,7 @@ public static class BoundedTeamBuyPlanner
     }
 
     private static bool IsPreferredRifle(string? weapon, TeamSide side)
-        => side == TeamSide.CounterTerrorist
-            ? weapon is "weapon_m4a1" or "weapon_m4a1_silencer"
-            : weapon == "weapon_ak47";
+        => EquipmentEconomy.IsPreferredRifle(weapon);
 
     private static bool IsLimitedSmg(string? weapon)
         => weapon is "weapon_mp9" or "weapon_mac10";
@@ -1256,6 +1811,17 @@ public static class BoundedTeamBuyPlanner
                 _ => 0,
             })
             .Sum();
+
+    private static int CountUtility(PlayerBuyPlan plan, string utility)
+        => plan.Utility.Count(item => utility switch
+        {
+            "smoke" => item is "smoke" or "weapon_smokegrenade",
+            "flash" => item is "flash" or "weapon_flashbang",
+            "he" => item is "he" or "weapon_hegrenade",
+            "fire" => item is "molotov" or "weapon_molotov"
+                or "weapon_incgrenade" or "incendiary",
+            _ => false,
+        });
 
     private static int PlanQualityScore(PlayerBuyPlan plan, bool designatedAwper)
     {

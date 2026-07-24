@@ -5,9 +5,9 @@ namespace CompetitiveBotCore.Tests;
 public sealed class DefusePolicyTests
 {
     [Theory]
-    [InlineData(BotMatchProfile.Competitive, true, true, 0.05, true)]
+    [InlineData(BotMatchProfile.Competitive, true, true, 0.05, false)]
     [InlineData(BotMatchProfile.Competitive, true, true, 0.10, false)]
-    [InlineData(BotMatchProfile.Competitive, true, false, 0.65, true)]
+    [InlineData(BotMatchProfile.Competitive, true, false, 0.65, false)]
     [InlineData(BotMatchProfile.Competitive, true, false, 0.66, false)]
     [InlineData(BotMatchProfile.Competitive, false, true, 0.0, false)]
     [InlineData(BotMatchProfile.Arcade, true, true, 0.05, true)]
