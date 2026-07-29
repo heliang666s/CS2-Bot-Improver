@@ -202,7 +202,6 @@ public class BotState : BasePlugin
     private string? _lastTPostPlantReason;
     private TPrePlantDecision? _lastTPrePlantDecision;
     private Vector? _ctRetreatTarget;
-    private bool _ctGambleFallbackLogged;
     private readonly HashSet<int> _saveModeSlots = new();
     private bool _tacticalRolesInitialized;
     private bool _tacticalDebug;
@@ -1758,7 +1757,6 @@ public class BotState : BasePlugin
         _ctThreatEvaluation = default;
         _nextCtThreatDecayAt = 0f;
         _ctRetreatTarget = null;
-        _ctGambleFallbackLogged = false;
         _lastTacticalGoalWrite.Clear();
         _tPrePlantTargets.Clear();
         _lastTPrePlantGoalWrite.Clear();
@@ -2376,7 +2374,7 @@ public class BotState : BasePlugin
             return true;
         }
 
-        anchor = default;
+        anchor = new Vector();
         return false;
     }
 
@@ -2842,7 +2840,7 @@ public class BotState : BasePlugin
 
             TPostPlantAction action = decision.Action;
             if (bombTimerKnown
-                && pawn.AbsOrigin is { } currentOrigin
+                && pawn?.AbsOrigin is { } currentOrigin
                 && _tPostPlantRetreatTargets.TryGetValue(player.Slot, out var safeTarget)
                 && TPostPlantPlanner.ShouldRetreat(
                     MathF.Sqrt(DistanceSquared(currentOrigin, safeTarget)) / 250f,
@@ -2931,7 +2929,7 @@ public class BotState : BasePlugin
                 _tacticalTerroristScratch.Add(player);
         }
         IReadOnlyList<CCSPlayerController> terrorists = _tacticalTerroristScratch;
-        if (terrorists.Length == 0)
+        if (terrorists.Count == 0)
             return;
 
         bool bombPlanted = _tPostPlantActive
@@ -2950,7 +2948,7 @@ public class BotState : BasePlugin
                 ContactConfirmed: false,
                 SiteBlocked: false,
                 AggressivePack: false,
-                AliveT: terrorists.Length,
+                AliveT: terrorists.Count,
                 AliveCt: players.Count(player =>
                     player.Team == CsTeam.CounterTerrorist && player.PawnIsAlive)));
             return;
@@ -2980,7 +2978,7 @@ public class BotState : BasePlugin
             ContactConfirmed: contactConfirmed,
             SiteBlocked: _tPrePlantRouteBlocked || contactConfirmed && !siteKnown,
             AggressivePack: aggressivePack,
-            AliveT: terrorists.Length,
+            AliveT: terrorists.Count,
             AliveCt: players.Count(player =>
                 player.Team == CsTeam.CounterTerrorist && player.PawnIsAlive)));
 
@@ -4599,7 +4597,6 @@ public class BotState : BasePlugin
         _bombBlowAt = 0f;
         _cachedBombEntity = null;
         _cachedBombOrigin = null;
-        _ctGambleFallbackLogged = false;
         _lastTacticalGoalWrite.Clear();
         _tPrePlantTargets.Clear();
         _lastTPrePlantGoalWrite.Clear();
@@ -4754,7 +4751,6 @@ public class BotState : BasePlugin
             _tacticalSiteDeviationTargetsInitialized = false;
             _ctEcoTargets.Clear();
             _ctRetreatTarget = null;
-            _ctGambleFallbackLogged = false;
             _lastTacticalGoalWrite.Clear();
             _tPrePlantTargets.Clear();
             _lastTPrePlantGoalWrite.Clear();
