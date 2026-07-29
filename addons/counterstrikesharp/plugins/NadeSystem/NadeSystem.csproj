@@ -19,6 +19,9 @@
   <ItemGroup>
     <ProjectReference Include="../../shared/CompetitiveBotCore/CompetitiveBotCore.csproj" />
     <ProjectReference Include="../../shared/BotControllerApi/BotControllerApi.csproj" />
+    <ProjectReference Include="../../shared/CompetitiveTacticalApi/CompetitiveTacticalApi.csproj">
+      <Private>false</Private>
+    </ProjectReference>
   </ItemGroup>
 
 </Project>

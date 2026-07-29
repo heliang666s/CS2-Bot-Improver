@@ -975,7 +975,8 @@ public static class BoundedTeamBuyPlanner
         int opponentPlayerCount = 0,
         PurchaseIntent purchaseIntent = PurchaseIntent.Standard,
         BoundedPlannerOptions? options = null,
-        TeamBuyMode buyMode = TeamBuyMode.Full)
+        TeamBuyMode buyMode = TeamBuyMode.Full,
+        TeamUtilityDemand? tacticalUtilityDemand = null)
     {
         var limits = options ?? new BoundedPlannerOptions();
         long started = Stopwatch.GetTimestamp();
@@ -1040,10 +1041,12 @@ public static class BoundedTeamBuyPlanner
         }
 
         int teamBudget = bots.Sum(member => Math.Max(0, member.Member.Money));
-        var utilityDemand = TeamUtilityDemandPolicy.ForPhase(
+        var utilityDemand = tacticalUtilityDemand ?? TeamUtilityDemandPolicy.ForPhase(
             phase,
             Math.Max(1, members.Count),
             buyMode == TeamBuyMode.MustWin);
+        bool hasHardTacticalDemand = tacticalUtilityDemand is { IsHardRequirement: true }
+            && utilityDemand.HasAnyRequirement;
         int personalUtilityCoverageTarget = utilityDemand.PersonalUtilityTarget
             * Math.Max(1, bots.Length);
         int utilityCoverageTarget = Math.Max(
@@ -1147,7 +1150,14 @@ public static class BoundedTeamBuyPlanner
                 break;
         }
 
-        bool usedFallback = timedOut || frontier.Count == 0;
+        var hardDemandFrontier = hasHardTacticalDemand
+            ? frontier.Where(state => MeetsUtilityDemand(state, utilityDemand)).ToArray()
+            : Array.Empty<FrontierState>();
+        IReadOnlyList<FrontierState> selectableFrontier = hasHardTacticalDemand
+            && hardDemandFrontier.Length > 0
+            ? hardDemandFrontier
+            : frontier;
+        bool usedFallback = timedOut || selectableFrontier.Count == 0;
         FrontierState? chosen = usedFallback
             ? BuildFallbackState(
                 bots,
@@ -1170,7 +1180,7 @@ public static class BoundedTeamBuyPlanner
                 utilityDemand.PersonalUtilityTarget,
                 utilityDemand.Defuser,
                 utilityDemand.Fire)
-            : frontier
+            : selectableFrontier
                 .OrderByDescending(state => state.MinTier >= currentMinTier)
                 .ThenByDescending(state => HasDesignatedAwpPlan(state, bots))
                 .ThenByDescending(state => FrontierQualityScore(
@@ -1212,6 +1222,8 @@ public static class BoundedTeamBuyPlanner
                     Stopwatch.GetTimestamp() - started));
         }
 
+        bool tacticalDemandSatisfied = !hasHardTacticalDemand
+            || MeetsUtilityDemand(chosen, utilityDemand);
         var botPlans = new Dictionary<int, PlayerBuyPlan>(bots.Length);
         foreach (var (member, index) in bots.Select((member, index) => (member, index)))
         {
@@ -1318,6 +1330,7 @@ public static class BoundedTeamBuyPlanner
             HumanTierPenalty = humanTierPenalty,
             Intent = purchaseIntent,
             BuyMode = buyMode,
+            TacticalDemandSatisfied = tacticalDemandSatisfied,
             Reason = usedFallback ? "bounded-timeout-fallback" : "bounded-frontier",
         };
 
@@ -1572,6 +1585,15 @@ public static class BoundedTeamBuyPlanner
             - spreadPenalty
             - limitedSmgPenalty;
     }
+
+    private static bool MeetsUtilityDemand(
+        FrontierState state,
+        TeamUtilityDemand demand)
+        => state.SmokeCount >= demand.Smoke
+            && state.FlashCount >= demand.Flash
+            && state.HeCount >= demand.He
+            && state.FireCount >= demand.Fire
+            && state.DefuserCount >= demand.Defuser;
 
     private static int DiminishingCoverageScore(
         int coverage,

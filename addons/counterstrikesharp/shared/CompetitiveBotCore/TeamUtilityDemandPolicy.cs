@@ -17,7 +17,16 @@ public readonly record struct TeamUtilityDemand(
     int He,
     int Fire,
     int Defuser,
-    int PersonalUtilityTarget);
+    int PersonalUtilityTarget)
+{
+    // Phase policy demands are scoring targets. Tactical plan demands can opt
+    // into hard validation so BotBuy can reject an otherwise attractive plan
+    // instead of silently starting it with missing utility.
+    public bool IsHardRequirement { get; init; }
+
+    public bool HasAnyRequirement
+        => Smoke > 0 || Flash > 0 || He > 0 || Fire > 0 || Defuser > 0;
+}
 
 public static class TeamUtilityDemandPolicy
 {

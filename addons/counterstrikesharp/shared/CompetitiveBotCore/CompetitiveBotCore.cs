@@ -746,6 +746,7 @@ public sealed record TeamBuyPlan(
     public IReadOnlyList<TransferPlan> Transfers { get; init; } = Array.Empty<TransferPlan>();
     public IReadOnlyList<NextRoundScenarioPrediction> Forecasts { get; init; } = Array.Empty<NextRoundScenarioPrediction>();
     public int HumanTierPenalty { get; init; }
+    public bool TacticalDemandSatisfied { get; init; } = true;
     public string Reason { get; init; } = string.Empty;
     public PurchaseIntent Intent { get; init; } = PurchaseIntent.Standard;
 }
@@ -1162,7 +1163,9 @@ public sealed record TeamPlanningMember(
     int SavedTier,
     int Kills = 0,
     bool IsPlanter = false,
-    bool IsDefuser = false);
+    bool IsDefuser = false,
+    BuyRole TacticalRole = BuyRole.Auto,
+    IReadOnlyList<string>? TacticalRequiredUtility = null);
 
 public static class BuyPlanner
 {
@@ -1349,7 +1352,8 @@ public static class BuyPlanner
         IReadOnlyDictionary<string, int>? currentUtility = null,
         PurchaseIntent? purchaseIntent = null,
         PistolBuyRole pistolRole = PistolBuyRole.Auto,
-        BuyRole role = BuyRole.Auto)
+        BuyRole role = BuyRole.Auto,
+        IReadOnlyList<string>? tacticalUtilityPackage = null)
     {
         money = Math.Max(0, money);
         var intent = purchaseIntent ?? DefaultIntentForPhase(phase);
@@ -1377,7 +1381,10 @@ public static class BuyPlanner
                 currentHasDefuser,
                 intent)];
 
-        var candidates = DistinctPlans(TeamUtilityDemandPolicy.RolePackages(role, side)
+        var rolePackages = tacticalUtilityPackage is null
+            ? TeamUtilityDemandPolicy.RolePackages(role, side)
+            : new[] { tacticalUtilityPackage };
+        var candidates = DistinctPlans(rolePackages
             .SelectMany(utilityPackage => SelectPackages(
                     side,
                     phase,
@@ -1913,6 +1920,8 @@ public static class BuyPlanner
                     BuyPhase.ForceBuy => 2,
                     _ => 1,
                 };
+            if (utilityPackageOverride is { Count: > 0 })
+                utilityLimit = Math.Min(4, Math.Max(utilityLimit, utilityPackageOverride.Count));
             var plannedUtilityPackage = role == BuyRole.Auto && isAllInPackage
                 ? new[] { "smoke", "flash", "flash", "he", "molotov" }
                 : utilityPackage;

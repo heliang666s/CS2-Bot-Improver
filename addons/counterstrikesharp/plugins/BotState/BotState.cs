@@ -10,8 +10,8 @@ using CounterStrikeSharp.API.Core.Capabilities;
 using RayTraceAPI;
 using BotControllerApi;
 using CompetitiveBotCore;
+using CompetitiveTacticalApi;
 using System;
-using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 
 namespace BotState;
@@ -68,6 +68,18 @@ public class BotState : BasePlugin
     // Flashbang avoidance via Ray-Trace
     private static readonly PluginCapability<CRayTraceInterface> RayTraceCap =
         new("raytrace:craytraceinterface");
+    private static readonly PluginCapability<ICompetitiveRoundPlanApi> RoundPlanCapability =
+        new("competitive:round-plan");
+    private static readonly PluginCapability<ICompetitiveLineupCatalogApi> LineupCatalogCapability =
+        new("competitive:lineup-catalog");
+    private readonly CompetitiveRoundPlanStore _roundPlanStore = new();
+    private ICompetitiveLineupCatalogApi? _lineupCatalog;
+    private CompetitiveRoundPlanSnapshot? _activeTacticalPlan;
+    private readonly Queue<TTacticalIntent> _previousTacticalIntents = new();
+    private readonly HashSet<string> _handledTacticalUtilityFailures = new(StringComparer.Ordinal);
+    private bool _tacticalHumanDeviationHandled;
+    private string? _lastTacticalReplanSignature;
+    private int _tacticalBlockedGroup = -1;
     private CRayTraceInterface? _rayTrace;
     private Vector? _scratchEye;
 
@@ -91,6 +103,10 @@ public class BotState : BasePlugin
     }
     private readonly Dictionary<(int bot, uint flash), FlashDecision> _flashDecisions = new();
     private readonly HashSet<(int bot, uint flash)> _flashRejectLogged = new();
+    private readonly List<(uint idx, Vector pos, float detonateAt)> _liveFlashScratch = new();
+    private readonly HashSet<uint> _liveFlashIdsScratch = new();
+    private readonly List<uint> _staleFlashScratch = new();
+    private readonly List<(int bot, uint flash)> _flashDecisionScratch = new();
     private float _nextFlashScanAt;
 
     // Debug logging (toggle with `css_botstate_flashdebug`)
@@ -103,6 +119,7 @@ public class BotState : BasePlugin
     private readonly Dictionary<int, float> _lastTacticalRepath = new();
     private readonly Dictionary<int, float> _lastTacticalGoalWrite = new();
     private readonly Dictionary<int, Vector> _lastTacticalPosition = new();
+    private TacticalPlanStage? _lastReportedTacticalPlanStage;
     private readonly Dictionary<int, float> _tacticalStuckSince = new();
     private readonly Dictionary<CtGambleSite, Vector> _ctGambleTargets = new();
     private readonly Dictionary<CtGambleSite, Vector> _ctEntryTargets = new();
@@ -111,9 +128,9 @@ public class BotState : BasePlugin
     private Vector? _ctTacticalSpawn;
     private readonly Dictionary<int, Vector> _ctEcoTargets = new();
     private readonly Dictionary<int, CCSPlayerController> _competitiveBotPlayers = new();
-    private readonly ConcurrentQueue<PlanningResult<CtEcoPlan>> _ctEcoPlanResults = new();
+    private readonly BoundedResultQueue<PlanningResult<CtEcoPlan>> _ctEcoPlanResults = new(8);
     private readonly LatestOnlyPlanningWorker<CtEcoPlanningContext, CtEcoPlan> _ctEcoPlanningWorker;
-    private readonly ConcurrentQueue<PlanningResult<IReadOnlyList<CtTacticalDecision>>> _ctDecisionResults = new();
+    private readonly BoundedResultQueue<PlanningResult<IReadOnlyList<CtTacticalDecision>>> _ctDecisionResults = new(8);
     private readonly LatestOnlyPlanningWorker<CtTacticalContext, IReadOnlyList<CtTacticalDecision>> _ctDecisionPlanningWorker;
     private long _ctEcoSnapshotValue;
     private long _ctEcoPlanValue;
@@ -131,8 +148,44 @@ public class BotState : BasePlugin
     private readonly Dictionary<int, Vector> _tPostPlantRetreatTargets = new();
     private readonly Dictionary<int, Vector> _tPostPlantWatchTargets = new();
     private readonly Dictionary<int, Vector> _tPrePlantTargets = new();
+    private readonly List<CCSPlayerController> _competitivePlayersScratch = new();
+    private readonly List<CCSPlayerController> _tacticalTerroristScratch = new();
+    private readonly List<TacticalUtilityResult> _failedUtilityScratch = new();
+    private readonly RoundWorkScheduler _roundWorkScheduler = new();
+    private readonly List<CCSPlayerController> _roundActivationPlayers = new();
+    private int _roundActivationCursor;
+    private float _nextRoundWorkAt;
+    private const int RoundActivationBatchSize = 2;
+    private const float RoundWorkIntervalSeconds = 0.05f;
+    private readonly Dictionary<CtGambleSite, Vector> _tacticalSiteDeviationTargets = new();
+    private bool _tacticalSiteDeviationTargetsInitialized;
     private readonly Dictionary<int, float> _lastTPrePlantGoalWrite = new();
     private readonly Dictionary<int, float> _lastTPostPlantLook = new();
+    private bool _tacticalRouteDirty = true;
+    private string? _tacticalRoutePlanId;
+    private TPrePlantStage _tacticalRouteStage;
+    private int _tacticalRouteCarrierSlot = -1;
+    private int _tacticalRouteBotCount = -1;
+    private float _nextTacticalRouteRetryAt;
+    private int _tacticalGoalBatchCursor;
+    private readonly Queue<TacticalRouteBuildItem> _tacticalRouteBuildQueue = new();
+    private bool _tacticalRouteBuildInProgress;
+    private bool _tacticalRouteBuildFailed;
+    private int _tacticalRouteBuildExpectedCount;
+    private const int TacticalGoalBatchSize = 2;
+    private int _ctGoalBatchCursor;
+    private const int CtGoalBatchSize = 2;
+    private const int TacticalRouteBuildBatchSize = 2;
+    private const float TacticalRouteRetrySeconds = 1.0f;
+
+    private sealed record TacticalRouteBuildItem(
+        int Slot,
+        Vector Anchor,
+        Vector RouteOrigin,
+        string Role,
+        int Group,
+        int Index,
+        CtGambleSite Site);
     private float _nextTPostPlantTargetRefreshAt;
     private float _nextTPostPlantRetreatRefreshAt;
     private bool _tPrePlantRouteBlocked;
@@ -183,15 +236,30 @@ public class BotState : BasePlugin
     {
         _ctEcoPlanningWorker = new LatestOnlyPlanningWorker<CtEcoPlanningContext, CtEcoPlan>(
             CtEcoTacticalPlanner.Plan,
-            result => _ctEcoPlanResults.Enqueue(result));
+            result =>
+            {
+                _ctEcoPlanResults.Enqueue(result);
+                _performance.Set(
+                    PerformanceCounter.TacticalQueueLength,
+                    _ctEcoPlanResults.Count + _ctDecisionResults.Count);
+            });
         _ctDecisionPlanningWorker = new LatestOnlyPlanningWorker<CtTacticalContext, IReadOnlyList<CtTacticalDecision>>(
             CtTacticalDecisionPlanner.Plan,
-            result => _ctDecisionResults.Enqueue(result));
+            result =>
+            {
+                _ctDecisionResults.Enqueue(result);
+                _performance.Set(
+                    PerformanceCounter.TacticalQueueLength,
+                    _ctEcoPlanResults.Count + _ctDecisionResults.Count);
+            });
     }
     //---------------------------------------------------------------------------------------
     // Registers game events and the per-tick bot behavior listener
     public override void Load(bool hotReload)
     {
+        Capabilities.RegisterPluginCapability(
+            RoundPlanCapability,
+            () => _roundPlanStore);
         RegisterFakeConVars(this);
         _profile = ProfilePolicy.Resolve(
             ProfileConfig.Load(ProfileConfig.DefaultPath(Server.GameDirectory)),
@@ -207,6 +275,31 @@ public class BotState : BasePlugin
             _matchState.ResetForMapOrHotReload();
             _tacticalRoundNumber = 0;
             _tacticalRoundKey = -1;
+            _roundWorkScheduler.Reset(-1);
+            _roundActivationPlayers.Clear();
+            _roundActivationCursor = 0;
+            _nextRoundWorkAt = 0f;
+            _roundPlanStore.Reset();
+            _activeTacticalPlan = null;
+            _lastReportedTacticalPlanStage = null;
+            _tacticalRouteDirty = true;
+            _tacticalRoutePlanId = null;
+            _tacticalRouteCarrierSlot = -1;
+            _tacticalRouteBotCount = -1;
+            _nextTacticalRouteRetryAt = 0f;
+            _tacticalGoalBatchCursor = 0;
+            _tacticalRouteBuildQueue.Clear();
+            _tacticalRouteBuildInProgress = false;
+            _tacticalRouteBuildFailed = false;
+            _tacticalRouteBuildExpectedCount = 0;
+            _ctGoalBatchCursor = 0;
+            _tacticalSiteDeviationTargets.Clear();
+            _tacticalSiteDeviationTargetsInitialized = false;
+            _previousTacticalIntents.Clear();
+            _handledTacticalUtilityFailures.Clear();
+            _tacticalHumanDeviationHandled = false;
+            _lastTacticalReplanSignature = null;
+            _tacticalBlockedGroup = -1;
             _isTacticalPistolRound = false;
             _latestRoundSnapshot = null;
             _competitiveBotPlayers.Clear();
@@ -253,6 +346,9 @@ public class BotState : BasePlugin
         try { _botController = BotControllerBridge.TryGet(); } catch { _botController = null; }
         if (_botController == null)
             Console.WriteLine("[Smarter-Bot] BotController API not available");
+
+        try { _lineupCatalog = LineupCatalogCapability.Get(); }
+        catch { _lineupCatalog = null; }
 
         if (hotReload && IsCompetitiveProfile())
         {
@@ -317,12 +413,42 @@ public class BotState : BasePlugin
             _performance.FormatSnapshot(PerformancePhase.NormalTick),
             _performance.FormatSnapshot(PerformancePhase.FlashDetection),
             _performance.FormatSnapshot(PerformancePhase.BombPlanted),
+            _performance.FormatSnapshot(PerformancePhase.TacticPlanning),
+            _performance.FormatSnapshot(PerformancePhase.RouteBuild),
+            _performance.FormatSnapshot(PerformancePhase.NavQuery),
+            _performance.FormatSnapshot(PerformancePhase.GoalRepath),
+            _performance.FormatSnapshot(PerformancePhase.Replan),
             _performance.FormatSnapshot(PerformancePhase.CtTacticalPlanning),
             _performance.FormatSnapshot(PerformancePhase.TPostPlantPlanning),
+            _performance.FormatSnapshot(
+                PerformancePhase.TacticPlanning,
+                PerformanceWindow.Startup),
+            _performance.FormatSnapshot(
+                PerformancePhase.TacticPlanning,
+                PerformanceWindow.Stable),
+            FormatMemorySnapshot(),
+            $"counters entityScans={_performance.ReadCounter(PerformanceCounter.EntityScans)} "
+                + $"navQueries={_performance.ReadCounter(PerformanceCounter.NavQueries)} "
+                + $"goalWrites={_performance.ReadCounter(PerformanceCounter.GoalWrites)}",
         };
         foreach (string line in lines)
             command.ReplyToCommand($"[Smarter-Bot] {line}");
         Console.WriteLine($"[Smarter-Bot] perf\n{string.Join('\n', lines)}");
+    }
+
+    private string FormatMemorySnapshot()
+    {
+        var start = _performance.RoundStartMemory;
+        var latest = _performance.LatestMemory;
+        var startup = _performance.MemorySnapshot(PerformanceWindow.Startup);
+        var endgame = _performance.MemorySnapshot(PerformanceWindow.Endgame);
+        return $"memory managed={latest.ManagedHeapBytes}B "
+            + $"rss={latest.WorkingSetBytes}B "
+            + $"deltaManaged={latest.ManagedHeapBytes - start.ManagedHeapBytes}B "
+            + $"deltaRss={latest.WorkingSetBytes - start.WorkingSetBytes}B "
+            + $"gc={latest.Gen0Collections}/{latest.Gen1Collections}/{latest.Gen2Collections} "
+            + $"startupPeakRss={startup.PeakWorkingSetBytes}B "
+            + $"endgameSamples={endgame.Samples}";
     }
 
     // Server stdout + every connected human's console. Use only for debug-gated lines
@@ -551,9 +677,17 @@ public class BotState : BasePlugin
     {
         _ctEcoPlanningWorker.Dispose();
         _ctDecisionPlanningWorker.Dispose();
+        _roundWorkScheduler.Clear();
+        _roundActivationPlayers.Clear();
+        _ctEcoPlanResults.Clear();
+        _ctDecisionResults.Clear();
+        _competitivePlayersScratch.Clear();
+        _tacticalTerroristScratch.Clear();
+        _failedUtilityScratch.Clear();
         ReleaseKnifeLocks();
         SetSmokeVisibility(NormalSmokeLength);
         _defuseSmokeTimer?.Kill();
+        _defuseSmokeTimer = null;
     }
     // Spam smoke when an enemy is defusing the bomb
     private HookResult OnBombAbortDefuse(EventBombAbortdefuse @event, GameEventInfo info)
@@ -759,22 +893,148 @@ public class BotState : BasePlugin
     [GameEventHandler]
     public HookResult OnRoundFreezeEnd(EventRoundFreezeEnd @event, GameEventInfo info)
     {
+        long startedAt = _performance.Start();
+        _performance.CaptureMemorySnapshot(PerformanceWindow.Startup);
         _isFreezeTime = false;
         _tacticalLiveStartedAt = Server.CurrentTime;
-        foreach (var player in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller"))
+        if (!IsCompetitiveProfile())
         {
-            if (!player.IsValid || !player.IsBot) continue;
-            ApplyBotState(player);
+            foreach (var player in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller"))
+            {
+                if (!player.IsValid || !player.IsBot) continue;
+                ApplyBotState(player);
+            }
         }
+        else
+        {
+            _roundActivationPlayers.Clear();
+            foreach (var player in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>(
+                         "cs_player_controller"))
+            {
+                if (player.IsValid && player.IsBot)
+                    _roundActivationPlayers.Add(player);
+            }
 
-        if (IsCompetitiveProfile())
-        {
-            _tacticalRuntime.SetPhase(RoundPhase.Live, Server.CurrentTime);
-            ConfigureTacticalEconomy();
-            InitializeTacticalRoles();
+            _roundActivationCursor = 0;
+            _roundWorkScheduler.Schedule(
+                _tacticalRoundKey,
+                RoundWorkItem.ActivateRoutes,
+                Server.CurrentTime);
         }
+        _performance.Stop(PerformancePhase.RoundFreezeEnd, startedAt);
         return HookResult.Continue;
     }
+
+    private void ProcessRoundWork(float now)
+    {
+        if (_tacticalRoundKey < 0 || now < _nextRoundWorkAt)
+            return;
+
+        _nextRoundWorkAt = now + RoundWorkIntervalSeconds;
+        if (!_roundWorkScheduler.TryDequeue(
+                _tacticalRoundKey,
+                now,
+                out var work))
+            return;
+
+        switch (work)
+        {
+            case RoundWorkItem.DraftPlan:
+                PublishTacticalRoundCandidates(includeLineupCoverage: false);
+                if (_isFreezeTime)
+                {
+                    _roundWorkScheduler.Schedule(
+                        _tacticalRoundKey,
+                        RoundWorkItem.ReconcileInventory,
+                        now + 10f);
+                }
+                break;
+            case RoundWorkItem.ReconcileInventory:
+                if (_isFreezeTime
+                    && !_roundPlanStore.TryGetRoundPlan(
+                        _tacticalRoundKey,
+                        out _))
+                {
+                    PublishTacticalRoundCandidates(includeLineupCoverage: true);
+                }
+                break;
+            case RoundWorkItem.ActivateRoutes:
+                ProcessRoundActivationBatch(now);
+                break;
+            case RoundWorkItem.PrepareTactical:
+                // Keep the authoritative inventory/economy reconciliation out
+                // of the final route activation batch. The live tactical phase
+                // is intentionally not opened until roles have been initialized
+                // in the later work item below.
+                ConfigureTacticalEconomy();
+                _roundWorkScheduler.Schedule(
+                    _tacticalRoundKey,
+                    RoundWorkItem.LockPlan,
+                    now + RoundWorkIntervalSeconds);
+                break;
+            case RoundWorkItem.LockPlan:
+                TryActivateTacticalPlan();
+                _roundWorkScheduler.Schedule(
+                    _tacticalRoundKey,
+                    RoundWorkItem.InitializeTactical,
+                    now + RoundWorkIntervalSeconds);
+                break;
+            case RoundWorkItem.InitializeTactical:
+                InitializeTacticalRoles();
+                _tacticalRuntime.SetPhase(RoundPhase.Live, Server.CurrentTime);
+                break;
+        }
+    }
+
+    private void ProcessRoundActivationBatch(float now)
+    {
+        int end = Math.Min(
+            _roundActivationCursor + RoundActivationBatchSize,
+            _roundActivationPlayers.Count);
+        while (_roundActivationCursor < end)
+        {
+            var player = _roundActivationPlayers[_roundActivationCursor++];
+            if (player.IsValid && player.IsBot)
+                ApplyBotState(player);
+        }
+
+        if (_roundActivationCursor < _roundActivationPlayers.Count)
+        {
+            _roundWorkScheduler.Schedule(
+                _tacticalRoundKey,
+                RoundWorkItem.ActivateRoutes,
+                now + RoundWorkIntervalSeconds);
+            return;
+        }
+
+        _roundActivationPlayers.Clear();
+        _roundActivationCursor = 0;
+        _roundWorkScheduler.Schedule(
+            _tacticalRoundKey,
+            RoundWorkItem.PrepareTactical,
+            now + RoundWorkIntervalSeconds);
+    }
+
+    private PerformanceWindow ResolvePerformanceWindow(float now)
+    {
+        if (_isFreezeTime)
+            return PerformanceWindow.FreezeBuy;
+        if (_tacticalLiveStartedAt is { } liveStartedAt
+            && now - liveStartedAt < 2f)
+            return PerformanceWindow.Startup;
+
+        int alive = 0;
+        foreach (var player in _competitiveBotPlayers.Values)
+        {
+            if (player.IsValid && player.PawnIsAlive)
+                alive++;
+        }
+
+        return alive > 0 && alive <= 2
+            ? PerformanceWindow.Endgame
+            : PerformanceWindow.Stable;
+    }
+
     //---------------------------------------------------------------------------------------
     private void OnTick()
     {
@@ -785,9 +1045,16 @@ public class BotState : BasePlugin
         {
             long flashStartedAt = _performance.Start();
             ProcessFlashbangAvoidance();
-            _performance.Stop(PerformancePhase.FlashDetection, flashStartedAt);
-            _nextFlashScanAt = now + (_flashThrownAt.Count > 0 ? 0.05f : 0.20f);
+            _performance.Stop(
+                PerformancePhase.FlashDetection,
+                ResolvePerformanceWindow(now),
+                flashStartedAt);
+            _nextFlashScanAt = now + FlashScanPolicy.NextInterval(
+                _flashThrownAt.Count > 0);
         }
+
+        if (IsCompetitiveProfile())
+            ProcessRoundWork(now);
 
         if (IsCompetitiveProfile())
         {
@@ -800,7 +1067,15 @@ public class BotState : BasePlugin
                 ApplyReadyCtEcoPlan();
                 long tacticalStartedAt = _performance.Start();
                 ApplyCompetitiveTacticalActions(now);
-                _performance.Stop(PerformancePhase.CtTacticalPlanning, tacticalStartedAt);
+                var window = ResolvePerformanceWindow(now);
+                _performance.Stop(
+                    PerformancePhase.TacticPlanning,
+                    window,
+                    tacticalStartedAt);
+                _performance.Stop(
+                    PerformancePhase.CtTacticalPlanning,
+                    window,
+                    tacticalStartedAt);
             }
         }
 
@@ -1254,7 +1529,10 @@ public class BotState : BasePlugin
             }
         }
 
-        _performance.Stop(PerformancePhase.NormalTick, tickStartedAt);
+        _performance.Stop(
+            PerformancePhase.NormalTick,
+            ResolvePerformanceWindow(now),
+            tickStartedAt);
     }
 
     private void ProcessWeaponSwitchRequests()
@@ -1484,6 +1762,20 @@ public class BotState : BasePlugin
         _lastTacticalGoalWrite.Clear();
         _tPrePlantTargets.Clear();
         _lastTPrePlantGoalWrite.Clear();
+        _tacticalRouteDirty = true;
+        _tacticalRoutePlanId = null;
+        _tacticalRouteStage = default;
+        _tacticalRouteCarrierSlot = -1;
+        _tacticalRouteBotCount = -1;
+        _nextTacticalRouteRetryAt = 0f;
+        _tacticalGoalBatchCursor = 0;
+        _tacticalRouteBuildQueue.Clear();
+        _tacticalRouteBuildInProgress = false;
+        _tacticalRouteBuildFailed = false;
+        _tacticalRouteBuildExpectedCount = 0;
+        _ctGoalBatchCursor = 0;
+        _tacticalSiteDeviationTargets.Clear();
+        _tacticalSiteDeviationTargetsInitialized = false;
         _tPrePlantRouteBlocked = false;
         _tPrePlantBlockedSite = CtGambleSite.None;
         _lastTacticalPosition.Clear();
@@ -1504,6 +1796,11 @@ public class BotState : BasePlugin
         _lastTPostPlantReason = null;
         var phase = ResolveTacticalRoundPhaseFromGameState();
         _tacticalRoundKey = ResolveTacticalRoundKey();
+        _activeTacticalPlan = null;
+        _handledTacticalUtilityFailures.Clear();
+        _tacticalHumanDeviationHandled = false;
+        _lastTacticalReplanSignature = null;
+        _tacticalBlockedGroup = -1;
         _matchState.UpdateFormat(new MatchFormatSnapshot(
             ReadMaxRounds(),
             ReadOvertimeEnabled(),
@@ -1531,8 +1828,206 @@ public class BotState : BasePlugin
             ConfigureTacticalEconomy(captureRoundFlags: true);
         else
             ConfigureTacticalEconomy();
-        if (!_isFreezeTime)
-            InitializeTacticalRoles();
+        if (IsCompetitiveProfile())
+        {
+            _roundWorkScheduler.Reset(_tacticalRoundKey);
+            _roundWorkScheduler.Schedule(
+                _tacticalRoundKey,
+                RoundWorkItem.DraftPlan,
+                Server.CurrentTime + 0.10f);
+            if (!_isFreezeTime)
+            {
+                _roundWorkScheduler.Schedule(
+                    _tacticalRoundKey,
+                    RoundWorkItem.ActivateRoutes,
+                    Server.CurrentTime + 0.25f);
+            }
+        }
+    }
+
+    private void PublishTacticalRoundCandidates(bool includeLineupCoverage)
+    {
+        if (!IsCompetitiveProfile() || _tacticalRoundKey < 0)
+            return;
+
+        var players = Utilities
+            .FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
+            .Where(player => player.IsValid && player.Team == CsTeam.Terrorist)
+            .ToArray();
+        var bots = players
+            .Where(player => player.IsBot)
+            .Select(player => (int)player.Index)
+            .OrderBy(slot => slot)
+            .ToArray();
+        if (bots.Length == 0)
+            return;
+
+        var sites = Utilities
+            .FindAllEntitiesByDesignerName<CBombTarget>("func_bomb_target")
+            .Where(target => target.IsValid)
+            .Select(target => target.IsBombSiteB ? CtGambleSite.B : CtGambleSite.A)
+            .Distinct()
+            .ToArray();
+        int? humanCarrier = players
+            .FirstOrDefault(player => !player.IsBot && HasBomb(player))?.Slot;
+        int? currentAwper = players
+            .FirstOrDefault(player => player.IsBot
+                && CurrentTacticalPrimary(player) == "weapon_awp")?.Slot;
+        var context = new TacticalRoundPlanContext(
+            _tacticalRoundKey,
+            Server.MapName,
+            sites.Contains(CtGambleSite.A) && sites.Contains(CtGambleSite.B),
+            _tacticalEconomy.IsCaptured
+                ? _tacticalEconomy.OpponentPhase
+                : _tacticalRuntime.Context.OpponentBuyPhase,
+            players.Count(player => player.PawnIsAlive),
+            Utilities.GetPlayers().Count(player =>
+                player.Team == CsTeam.CounterTerrorist && player.PawnIsAlive),
+            bots,
+            humanCarrier,
+            currentAwper,
+            _previousTacticalIntents.ToArray(),
+            AvailableSites: sites.ToHashSet());
+        var coreCandidates = TacticalRoundPlanner.BuildCandidates(context);
+        if (includeLineupCoverage)
+        {
+            var lineupCapableCandidates = coreCandidates
+                .Where(HasRequiredLineupCoverage)
+                .ToArray();
+            if (lineupCapableCandidates.Length > 0)
+                coreCandidates = lineupCapableCandidates;
+        }
+        int planSeed = unchecked(_tacticalRoundKey * 1103515245 + StableTextSeed(Server.MapName));
+        var preferredCandidate = TacticalRoundPlanner.SelectPlan(coreCandidates, planSeed);
+        var candidates = new[] { preferredCandidate }
+            .Concat(coreCandidates.Where(candidate =>
+                !string.Equals(candidate.PlanId, preferredCandidate.PlanId, StringComparison.Ordinal)))
+            .Select(ToTacticalApiSnapshot)
+            .ToArray();
+        _roundPlanStore.PublishCandidates(_tacticalRoundKey, candidates);
+        _lastReportedTacticalPlanStage = null;
+        Server.PrintToConsole(
+            $"[TacticalPlan] round={_tacticalRoundKey} candidates={candidates.Length} "
+            + $"map={Server.MapName} sites={sites.Length} history={_previousTacticalIntents.Count}");
+    }
+
+    private static CompetitiveRoundPlanSnapshot ToTacticalApiSnapshot(
+        TacticalRoundPlan plan)
+        => new(
+            plan.RoundKey,
+            Version: 1,
+            plan.PlanId,
+            Side: "T",
+            Tactic: plan.Intent.ToString(),
+            PrimarySite: plan.PrimarySite.ToString(),
+            FallbackSite: plan.FallbackSite.ToString(),
+            Stage: plan.Stage.ToString(),
+            plan.RoleAssignments
+                .Select(assignment => new TacticalRoleAssignmentSnapshot(
+                    assignment.Slot,
+                    assignment.Role.ToString(),
+                    assignment.Group,
+                    assignment.Site.ToString(),
+                    assignment.IsCarrierSupport,
+                    assignment.IsHumanDependent))
+                .ToArray(),
+            plan.RequiredUtility
+                .Select(requirement => new TacticalUtilityRequirementSnapshot(
+                    requirement.Slot,
+                    requirement.UtilityType.ToString(),
+                    requirement.RequiredCount,
+                    requirement.OptionalCount,
+                    requirement.Stage.ToString(),
+                    requirement.TargetSite.ToString()))
+                .ToArray(),
+            plan.RoleAssignments
+                .SelectMany(assignment => RoleUtilityRequirements(assignment))
+                .ToArray(),
+            plan.RequiredLineupRequests
+                .Select(request => new TacticalUtilityRequestSnapshot(
+                    request.RequestId,
+                    request.Slot,
+                    request.UtilityType.ToString(),
+                    request.Stage.ToString(),
+                    request.TargetSite.ToString(),
+                    request.Required))
+                .ToArray(),
+            plan.PlanSeed,
+            plan.IsFallback);
+
+    private static IEnumerable<TacticalUtilityRequirementSnapshot> RoleUtilityRequirements(
+        TacticalRoleAssignment assignment)
+    {
+        IReadOnlyList<(TacticalUtilityType Type, int Count)> package = assignment.Role switch
+        {
+            TTacticalRole.Entry => [(TacticalUtilityType.Smoke, 1), (TacticalUtilityType.Flash, 2), (TacticalUtilityType.He, 1)],
+            TTacticalRole.Support => [(TacticalUtilityType.Smoke, 1), (TacticalUtilityType.Flash, 2), (TacticalUtilityType.Fire, 1)],
+            TTacticalRole.Lurk => [(TacticalUtilityType.Smoke, 1), (TacticalUtilityType.Flash, 1), (TacticalUtilityType.Fire, 1), (TacticalUtilityType.He, 1)],
+            TTacticalRole.AWPer => [(TacticalUtilityType.Smoke, 1), (TacticalUtilityType.Flash, 2), (TacticalUtilityType.He, 1)],
+            TTacticalRole.CarrierSupport => [(TacticalUtilityType.Smoke, 1), (TacticalUtilityType.Flash, 1), (TacticalUtilityType.Fire, 1)],
+            TTacticalRole.LateRotator => [(TacticalUtilityType.Smoke, 1), (TacticalUtilityType.Flash, 1), (TacticalUtilityType.He, 1)],
+            _ => Array.Empty<(TacticalUtilityType, int)>(),
+        };
+        return package.Select(item => new TacticalUtilityRequirementSnapshot(
+            assignment.Slot,
+            item.Type.ToString(),
+            item.Count,
+            0,
+            TacticalPlanStage.Execute.ToString(),
+            assignment.Site.ToString()));
+    }
+
+    private static int StableTextSeed(string value)
+    {
+        unchecked
+        {
+            int hash = 17;
+            foreach (char character in value)
+                hash = hash * 31 + character;
+            return hash;
+        }
+    }
+
+    private bool HasRequiredLineupCoverage(TacticalRoundPlan plan)
+    {
+        if (_lineupCatalog is null)
+            return true;
+        return plan.RequiredLineupRequests.All(request =>
+            _lineupCatalog.TryGetCoverage(
+                Server.MapName,
+                request.UtilityType.ToString(),
+                request.TargetSite.ToString(),
+                out var coverage)
+            && coverage.HasReachableCandidate);
+    }
+
+    private bool TryActivateTacticalPlan()
+    {
+        if (_roundPlanStore.TryGetRoundPlan(_tacticalRoundKey, out var selected))
+        {
+            if (!string.Equals(
+                    _activeTacticalPlan?.PlanId,
+                    selected.PlanId,
+                    StringComparison.Ordinal))
+                _tacticalRouteDirty = true;
+            _activeTacticalPlan = selected;
+            Server.PrintToConsole(
+                $"[TacticalPlan] commit plan={selected.PlanId} tactic={selected.Tactic} source=botbuy");
+            return true;
+        }
+
+        var candidates = _roundPlanStore.GetCandidatePlans(_tacticalRoundKey);
+        var fallback = candidates.FirstOrDefault();
+        if (fallback is null || !_roundPlanStore.CommitSelectedPlan(
+                _tacticalRoundKey,
+                fallback.PlanId))
+            return false;
+
+        _roundPlanStore.TryGetRoundPlan(_tacticalRoundKey, out _activeTacticalPlan);
+        _tacticalRouteDirty = true;
+        Server.PrintToConsole(
+            $"[TacticalPlan] commit plan={fallback.PlanId} tactic={fallback.Tactic} source=runtime-fallback");
+        return _activeTacticalPlan is not null;
     }
 
     private int ResolveTacticalRoundKey()
@@ -1591,7 +2086,13 @@ public class BotState : BasePlugin
         var bots = BuildCtBotSnapshots();
         if (bots.Count == 0) return;
 
-        ConfigureTacticalEconomy();
+        // RoundFreezeEnd already reconciles economy from the authoritative
+        // inventory snapshot. Re-running it here used to perform a second
+        // player/equipment/entity pass in the same callback and was visible as
+        // a freeze-end hitch on 1v9. Hot-reload/late initialization still
+        // computes it when no snapshot has been captured yet.
+        if (_latestRoundSnapshot is null)
+            ConfigureTacticalEconomy();
         _tacticalRuntime.AssignCtRoles(bots);
         ResolveCtTacticalAnchors();
         QueueCtEcoPlan(bots);
@@ -1681,6 +2182,9 @@ public class BotState : BasePlugin
                     + $"assignments={plan.Assignments.Count} targets={_ctEcoTargets.Count} reason={plan.Reason}");
             }
         }
+        _performance.Set(
+            PerformanceCounter.TacticalQueueLength,
+            _ctEcoPlanResults.Count + _ctDecisionResults.Count);
     }
 
     private void QueueCtDecisionPlan(float now)
@@ -1708,6 +2212,9 @@ public class BotState : BasePlugin
             _latestCtDecisions = result.Result;
             _ctDecisionDirty = false;
         }
+        _performance.Set(
+            PerformanceCounter.TacticalQueueLength,
+            _ctEcoPlanResults.Count + _ctDecisionResults.Count);
     }
 
     private MatchPressureResult EvaluateCtMatchPressure()
@@ -1945,11 +2452,18 @@ public class BotState : BasePlugin
     private static bool IsEconomicCtPhase(BuyPhase phase)
         => phase is BuyPhase.Pistol or BuyPhase.Eco or BuyPhase.HalfBuy or BuyPhase.ForceBuy;
 
+    private static bool HasCtTacticalGoal(CtTacticalDecision decision)
+        => decision.ShouldMoveToRetreat
+            || decision.ShouldMoveToGambleSite
+            || (decision.State is CtTacticalState.Rotate or CtTacticalState.Reinforce
+                && decision.TargetSite != CtGambleSite.None);
+
     private bool TryApplyTacticalGoal(
         CCSPlayerPawn pawn,
         CCSBot bot,
         CtTacticalDecision decision,
-        float now)
+        float now,
+        bool allowGoalWrite = true)
     {
         Vector? target = null;
         if (decision.ShouldMoveToRetreat)
@@ -2021,6 +2535,9 @@ public class BotState : BasePlugin
 
         ref bool isRunning = ref bot.IsRunning;
         isRunning = true;
+
+        if (!allowGoalWrite)
+            return true;
 
         float lastWrite = _lastTacticalGoalWrite.GetValueOrDefault(decision.Slot, -999f);
         if (now - lastWrite < 0.50f)
@@ -2214,14 +2731,23 @@ public class BotState : BasePlugin
             : _ctGambleTargets.ContainsKey(_tPostPlantSite);
     }
 
-    private static CCSPlayerController[] FindValidMatchPlayers()
-        => Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>(
-                "cs_player_controller")
-            .Where(player => player.IsValid
+    private IReadOnlyList<CCSPlayerController> FindValidMatchPlayers()
+    {
+        _competitivePlayersScratch.Clear();
+        foreach (var player in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>(
+                     "cs_player_controller"))
+        {
+            if (player.IsValid
                 && player.Team is CsTeam.Terrorist or CsTeam.CounterTerrorist)
-            .ToArray();
+                _competitivePlayersScratch.Add(player);
+        }
 
-    private void RunCompetitiveTPostPlantTick(float now)
+        return _competitivePlayersScratch;
+    }
+
+    private void RunCompetitiveTPostPlantTick(
+        float now,
+        IReadOnlyList<CCSPlayerController> players)
     {
         long startedAt = _performance.Start();
         var bomb = _cachedBombEntity;
@@ -2262,7 +2788,6 @@ public class BotState : BasePlugin
             _tPostPlantAssignmentsDirty = false;
         }
 
-        var players = FindValidMatchPlayers();
         var roster = PostPlantRosterPolicy.Summarize(
             players.Select(player => new PostPlantPlayerSnapshot(
                 player.Team == CsTeam.Terrorist
@@ -2388,7 +2913,9 @@ public class BotState : BasePlugin
         _performance.Stop(PerformancePhase.TPostPlantPlanning, startedAt);
     }
 
-    private void RunCompetitiveTPrePlantTick(float now)
+    private void RunCompetitiveTPrePlantTick(
+        float now,
+        IReadOnlyList<CCSPlayerController> players)
     {
         if (_isFreezeTime
             || _tacticalRuntime.Context.Phase != RoundPhase.Live)
@@ -2397,10 +2924,13 @@ public class BotState : BasePlugin
             return;
         }
 
-        var players = FindValidMatchPlayers();
-        var terrorists = players
-            .Where(player => player.Team == CsTeam.Terrorist && player.PawnIsAlive)
-            .ToArray();
+        _tacticalTerroristScratch.Clear();
+        foreach (var player in players)
+        {
+            if (player.Team == CsTeam.Terrorist && player.PawnIsAlive)
+                _tacticalTerroristScratch.Add(player);
+        }
+        IReadOnlyList<CCSPlayerController> terrorists = _tacticalTerroristScratch;
         if (terrorists.Length == 0)
             return;
 
@@ -2426,17 +2956,17 @@ public class BotState : BasePlugin
             return;
         }
 
-        bool hasHumanCarrier = terrorists.Where(player => !player.IsBot).Any(HasBomb);
-        bool hasBotCarrier = terrorists.Where(player => player.IsBot).Any(HasBomb);
-        var knownBombTargets = Utilities
-            .FindAllEntitiesByDesignerName<CBombTarget>("func_bomb_target")
-            .Where(target => target.IsValid)
-            .ToArray();
+        if (_activeTacticalPlan is not null)
+        {
+            RunSelectedTacticalPlanTick(now, players, terrorists);
+            return;
+        }
+
+        bool hasHumanCarrier = terrorists.Any(player => !player.IsBot && HasBomb(player));
+        bool hasBotCarrier = terrorists.Any(player => player.IsBot && HasBomb(player));
+        EnsureTacticalSiteDeviationTargets();
         bool siteKnown = CtMapProfileCatalog.IsKnown(Server.MapName)
-            && knownBombTargets
-                .Select(target => target.IsBombSiteB ? CtGambleSite.B : CtGambleSite.A)
-                .Distinct()
-                .Count() >= 2;
+            && _tacticalSiteDeviationTargets.Count >= 2;
         bool probeComplete = _tacticalLiveStartedAt is { } startedAt
             && now - startedAt >= 1.5f;
         bool contactConfirmed = _ctThreatEvaluation.ConfirmedSite != CtGambleSite.None;
@@ -2466,10 +2996,39 @@ public class BotState : BasePlugin
                     + $"rotate={(decision.ShouldRotate ? 1 : 0)} reason={decision.Reason}");
             }
             _lastTPrePlantDecision = decision;
+            ReportTacticalPlanStage(ToTacticalPlanStage(decision.Stage));
         }
 
+        int carrierSlot = terrorists
+            .FirstOrDefault(HasBomb)?.Slot ?? -1;
+        int botCount = terrorists.Count(player => player.IsBot);
+        bool routeIdentityChanged = TacticalRouteSchedulingPolicy.ShouldRebuild(
+            planChanged: _tacticalRoutePlanId is not null,
+            carrierChanged: _tacticalRouteCarrierSlot != carrierSlot,
+            rosterChanged: _tacticalRouteStage != decision.Stage
+                || _tacticalRouteBotCount != botCount,
+            routeFailed: _tacticalRouteDirty,
+            forced: false);
         bool routeTargetsReady = decision.Stage is not TPrePlantStage.Stage
-            && TryBuildTPrePlantTargets(decision, terrorists);
+            && _tPrePlantTargets.Count == botCount
+            && botCount > 0;
+        if (decision.Stage is not TPrePlantStage.Stage
+            && routeIdentityChanged
+            && now >= _nextTacticalRouteRetryAt)
+        {
+            long routeStartedAt = _performance.Start();
+            routeTargetsReady = TryBuildTPrePlantTargets(decision, terrorists);
+            _performance.Stop(PerformancePhase.RouteBuild, routeStartedAt);
+            _tacticalRoutePlanId = null;
+            _tacticalRouteStage = decision.Stage;
+            _tacticalRouteCarrierSlot = carrierSlot;
+            _tacticalRouteBotCount = botCount;
+            _tacticalRouteDirty = !routeTargetsReady;
+            _nextTacticalRouteRetryAt = routeTargetsReady
+                ? 0f
+                : now + TacticalRouteRetrySeconds;
+            _tacticalGoalBatchCursor = 0;
+        }
         if (TPrePlantTacticalPolicy.ShouldMarkRouteBlocked(
             siteKnown,
             routeTargetsReady,
@@ -2525,21 +3084,44 @@ public class BotState : BasePlugin
         IReadOnlyList<CCSPlayerController> terrorists)
     {
         _tPrePlantTargets.Clear();
+        _lastTPrePlantGoalWrite.Clear();
         if (!CtMapProfileCatalog.IsKnown(Server.MapName))
             return false;
 
-        var siteTargets = Utilities
-            .FindAllEntitiesByDesignerName<CBombTarget>("func_bomb_target")
-            .Where(target => target.IsValid && target.AbsOrigin is not null)
-            .Select(target => new
+        var siteTargets = new Dictionary<CtGambleSite, Vector>(_ctGambleTargets);
+        if (siteTargets.Count < 2)
+        {
+            _performance.Increment(PerformanceCounter.EntityScans);
+            foreach (var target in Utilities
+                         .FindAllEntitiesByDesignerName<CBombTarget>("func_bomb_target"))
             {
-                Site = target.IsBombSiteB ? CtGambleSite.B : CtGambleSite.A,
-                Origin = target.AbsOrigin!,
-            })
-            .GroupBy(target => target.Site)
-            .Select(group => group.First())
-            .ToArray();
-        if (siteTargets.Length == 0)
+                if (!target.IsValid
+                    || target.AbsOrigin is not { } origin)
+                    continue;
+
+                CtGambleSite site = target.IsBombSiteB
+                    ? CtGambleSite.B
+                    : CtGambleSite.A;
+                if (siteTargets.ContainsKey(site))
+                    continue;
+
+                long navStartedAt = _performance.Start();
+                _performance.Increment(PerformanceCounter.NavQueries);
+                var navArea = CCSNavArea.GetClosestNavArea(origin, 2500f);
+                _performance.Stop(PerformancePhase.NavQuery, navStartedAt);
+                if (navArea is not null)
+                {
+                    var anchor = new Vector(
+                        navArea.Center.X,
+                        navArea.Center.Y,
+                        navArea.Center.Z);
+                    siteTargets[site] = anchor;
+                    _ctGambleTargets.TryAdd(site, anchor);
+                }
+            }
+        }
+
+        if (siteTargets.Count == 0)
             return false;
 
         Vector? spawn = _ctTacticalSpawn ?? ResolveSpawnAnchor("info_player_terrorist");
@@ -2554,27 +3136,18 @@ public class BotState : BasePlugin
             _tPrePlantBlockedSite is CtGambleSite.A or CtGambleSite.B
                 ? _tPrePlantBlockedSite
                 : _ctThreatEvaluation.ConfirmedSite,
-            siteTargets.Select(target => target.Site).ToArray());
+            siteTargets.Keys.ToArray());
 
         for (int index = 0; index < bots.Length; index++)
         {
             if (!routeAssignments.TryGetValue((int)bots[index].Index, out var routeSite)
                 || routeSite == CtGambleSite.None)
                 continue;
-            var site = siteTargets.FirstOrDefault(target => target.Site == routeSite);
-            if (site is null)
+            if (!siteTargets.TryGetValue(routeSite, out var anchor))
             {
                 _tPrePlantBlockedSite = routeSite;
                 continue;
             }
-            var siteArea = CCSNavArea.GetClosestNavArea(site.Origin, 2500f);
-            if (siteArea == null)
-            {
-                _tPrePlantBlockedSite = routeSite;
-                continue;
-            }
-
-            Vector anchor = new(siteArea.Center.X, siteArea.Center.Y, siteArea.Center.Z);
             Vector routeOrigin = spawn ?? anchor;
             float dx = anchor.X - routeOrigin.X;
             float dy = anchor.Y - routeOrigin.Y;
@@ -2603,7 +3176,10 @@ public class BotState : BasePlugin
                     anchor.X - forwardX * backoff + rightX * lateral,
                     anchor.Y - forwardY * backoff + rightY * lateral,
                     anchor.Z);
+            long navStartedAt = _performance.Start();
+            _performance.Increment(PerformanceCounter.NavQueries);
             var navArea = CCSNavArea.GetClosestNavArea(desired, 1800f);
+            _performance.Stop(PerformancePhase.NavQuery, navStartedAt);
             if (navArea == null)
             {
                 _tPrePlantBlockedSite = routeSite;
@@ -2619,6 +3195,579 @@ public class BotState : BasePlugin
         }
 
         return bots.Length == 0 || _tPrePlantTargets.Count == bots.Length;
+    }
+
+    private void RunSelectedTacticalPlanTick(
+        float now,
+        IReadOnlyList<CCSPlayerController> players,
+        IReadOnlyList<CCSPlayerController> terrorists)
+    {
+        bool hasHumanCarrier = terrorists.Any(player => !player.IsBot && HasBomb(player));
+        bool hasBotCarrier = terrorists.Any(player => player.IsBot && HasBomb(player));
+        bool probeComplete = _tacticalLiveStartedAt is { } startedAt
+            && now - startedAt >= 1.5f;
+        bool contactConfirmed = _ctThreatEvaluation.ConfirmedSite != CtGambleSite.None;
+        var intent = Enum.TryParse<TTacticalIntent>(
+            _activeTacticalPlan!.Tactic,
+            ignoreCase: true,
+            out var parsedIntent)
+            ? parsedIntent
+            : TTacticalIntent.DefaultSplit;
+        _failedUtilityScratch.Clear();
+        foreach (var result in _roundPlanStore.GetRecentUtilityResults(_tacticalRoundKey))
+        {
+            if ((result.Outcome is TacticalUtilityOutcome.Failed
+                    or TacticalUtilityOutcome.TimedOut)
+                && !_handledTacticalUtilityFailures.Contains(result.RequestId))
+            {
+                _failedUtilityScratch.Add(result);
+            }
+        }
+        bool humanDeviation = probeComplete
+            && !_tacticalHumanDeviationHandled
+            && DetectTacticalHumanDeviation(_activeTacticalPlan, terrorists);
+        var replan = TacticalReplanPolicy.Resolve(new TacticalReplanContext(
+            HasCarrier: hasHumanCarrier || hasBotCarrier,
+            CarrierIsHuman: hasHumanCarrier,
+            ContactConfirmed: contactConfirmed,
+            RouteFailed: _tacticalBlockedGroup >= 0,
+            FailedGroup: _tacticalBlockedGroup,
+            RequiredUtilityFailed: _failedUtilityScratch.Count > 0,
+            HumanDeviation: humanDeviation,
+            AliveT: terrorists.Count,
+            AliveCt: players.Count(player =>
+                player.Team == CsTeam.CounterTerrorist && player.PawnIsAlive),
+            CurrentIntent: intent));
+
+        if (replan.Action == TacticalReplanAction.FallbackTactic
+            && replan.FallbackIntent is { } fallbackIntent)
+        {
+            foreach (var result in _failedUtilityScratch)
+                _handledTacticalUtilityFailures.Add(result.RequestId);
+
+            if (TryCommitTacticalFallback(fallbackIntent, replan.Reason))
+                return;
+        }
+
+        if (replan.Action == TacticalReplanAction.DegradeForHumanDeviation)
+        {
+            _tacticalHumanDeviationHandled = true;
+            if (replan.FallbackIntent is { } humanFallback
+                && TryCommitTacticalFallback(humanFallback, replan.Reason))
+                return;
+        }
+
+        if (!humanDeviation)
+            _tacticalHumanDeviationHandled = false;
+
+        if (replan.Action == TacticalReplanAction.NoChange)
+            _lastTacticalReplanSignature = null;
+
+        if (replan.Action == TacticalReplanAction.HoldStageSearch)
+        {
+            // A dropped C4 is a search/stage condition, not a failed route. Do
+            // not poison the next tick with SiteBlocked and do not rotate the
+            // whole team away from the recoverable bomb.
+            _tPrePlantTargets.Clear();
+            _tPrePlantRouteBlocked = false;
+            _tPrePlantBlockedSite = CtGambleSite.None;
+            _lastTPrePlantDecision = new TPrePlantDecision(
+                TPrePlantStage.Stage,
+                SplitRoutes: true,
+                UsesSharedTarget: false,
+                ShouldRotate: false,
+                "search-or-wait-for-bomb");
+            ReportTacticalPlanStage(TacticalPlanStage.Stage);
+            ApplyTacticalPlanGoals(now, terrorists);
+            return;
+        }
+
+        TPrePlantStage stage = replan.Action switch
+        {
+            TacticalReplanAction.RotateAffectedGroup => TPrePlantStage.Rotate,
+            TacticalReplanAction.DegradeForHumanDeviation => TPrePlantStage.Split,
+            TacticalReplanAction.Execute => TPrePlantStage.Execute,
+            _ when !probeComplete => TPrePlantStage.Probe,
+            _ => intent switch
+            {
+                TTacticalIntent.FakeThenHit when !contactConfirmed => TPrePlantStage.Fake,
+                TTacticalIntent.FastExecute when contactConfirmed => TPrePlantStage.Execute,
+                TTacticalIntent.ContactExplode when contactConfirmed => TPrePlantStage.Execute,
+                TTacticalIntent.LateRotate when contactConfirmed => TPrePlantStage.Rotate,
+                _ => TPrePlantStage.Split,
+            },
+        };
+        bool splitRoutes = HasMultipleTacticalGroups(_activeTacticalPlan.RoleAssignments);
+        _lastTPrePlantDecision = new TPrePlantDecision(
+            stage,
+            SplitRoutes: splitRoutes,
+            UsesSharedTarget: false,
+            ShouldRotate: stage == TPrePlantStage.Rotate,
+            $"plan={_activeTacticalPlan.PlanId} replan={replan.Action}:{replan.Reason}");
+        ReportTacticalPlanStage(ToTacticalPlanStage(stage));
+
+        if (replan.Action is TacticalReplanAction.RotateAffectedGroup
+            or TacticalReplanAction.DegradeForHumanDeviation
+            or TacticalReplanAction.Execute)
+        {
+            ReportTacticalReplan(replan);
+        }
+
+        int carrierSlot = terrorists
+            .FirstOrDefault(HasBomb)?.Slot ?? -1;
+        int botCount = terrorists.Count(player => player.IsBot);
+        bool routeIdentityChanged = TacticalRouteSchedulingPolicy.ShouldRebuild(
+            planChanged: !string.Equals(
+                _tacticalRoutePlanId,
+                _activeTacticalPlan.PlanId,
+                StringComparison.Ordinal),
+            carrierChanged: _tacticalRouteCarrierSlot != carrierSlot,
+            rosterChanged: _tacticalRouteStage != stage
+                || _tacticalRouteBotCount != botCount,
+            routeFailed: _tacticalRouteDirty,
+            forced: false);
+        bool routeTargetsReady = botCount == 0
+            || _tPrePlantTargets.Count == botCount;
+        if (routeIdentityChanged
+            && (_tacticalRouteBuildInProgress
+                || now >= _nextTacticalRouteRetryAt))
+        {
+            long routeStartedAt = _performance.Start();
+            routeTargetsReady = TryBuildTacticalPlanTargets(
+                _activeTacticalPlan,
+                terrorists,
+                stage,
+                carrierSlot);
+            _performance.Stop(PerformancePhase.RouteBuild, routeStartedAt);
+            _tacticalRoutePlanId = _activeTacticalPlan.PlanId;
+            _tacticalRouteStage = stage;
+            _tacticalRouteCarrierSlot = carrierSlot;
+            _tacticalRouteBotCount = botCount;
+            _tacticalRouteDirty = !routeTargetsReady;
+            _nextTacticalRouteRetryAt = routeTargetsReady
+                ? 0f
+                : _tacticalRouteBuildInProgress
+                    ? now
+                    : now + TacticalRouteRetrySeconds;
+            if (!_tacticalRouteBuildInProgress)
+                _tacticalGoalBatchCursor = 0;
+        }
+        if (!routeTargetsReady
+            && !_tacticalRouteBuildInProgress
+            && _tPrePlantTargets.Count == 0)
+        {
+            _tPrePlantRouteBlocked = true;
+            return;
+        }
+
+        ApplyTacticalPlanGoals(now, terrorists);
+        if (_tacticalDebug)
+        {
+            BroadcastDebug(
+                $"[Smarter-Bot/Tactical] plan={_activeTacticalPlan.PlanId} "
+                + $"stage={stage} routes={_tPrePlantTargets.Count}/{terrorists.Count(player => player.IsBot)} "
+                + $"blockedGroup={_tacticalBlockedGroup}");
+        }
+    }
+
+    private bool TryCommitTacticalFallback(
+        TTacticalIntent fallbackIntent,
+        string reason)
+    {
+        string oldPlanId = _activeTacticalPlan?.PlanId ?? "none";
+        var candidate = _roundPlanStore
+            .GetCandidatePlans(_tacticalRoundKey)
+            .FirstOrDefault(plan =>
+                !string.Equals(plan.PlanId, _activeTacticalPlan?.PlanId, StringComparison.Ordinal)
+                && Enum.TryParse<TTacticalIntent>(
+                    plan.Tactic,
+                    ignoreCase: true,
+                    out var candidateIntent)
+                && candidateIntent == fallbackIntent);
+        if (candidate is null
+            || !_roundPlanStore.CommitSelectedPlan(_tacticalRoundKey, candidate.PlanId)
+            || !_roundPlanStore.TryGetRoundPlan(_tacticalRoundKey, out var selected))
+            return false;
+
+        _activeTacticalPlan = selected;
+        _tacticalRouteDirty = true;
+        _tacticalBlockedGroup = -1;
+        _tPrePlantRouteBlocked = false;
+        _tPrePlantBlockedSite = CtGambleSite.None;
+        Server.PrintToConsole(
+            $"[TacticalReplan] round={_tacticalRoundKey} old={oldPlanId} "
+            + $"new={selected.PlanId} reason={reason}");
+        _lastTacticalReplanSignature = null;
+        _roundPlanStore.ReportTacticalEvent(new TacticalEventSnapshot(
+            _tacticalRoundKey,
+            -1,
+            "replan-fallback",
+            selected.PrimarySite,
+            0f,
+            0f,
+            0f,
+            Server.CurrentTime,
+            1f));
+        return true;
+    }
+
+    private void ReportTacticalReplan(TacticalReplanDecision decision)
+    {
+        string signature = $"{_activeTacticalPlan?.PlanId}:{decision.Action}:"
+            + $"{decision.AffectedGroup}:{decision.Reason}";
+        if (string.Equals(signature, _lastTacticalReplanSignature, StringComparison.Ordinal))
+            return;
+
+        _lastTacticalReplanSignature = signature;
+        Server.PrintToConsole(
+            $"[TacticalReplan] round={_tacticalRoundKey} plan={_activeTacticalPlan?.PlanId} "
+            + $"action={decision.Action} group={decision.AffectedGroup} reason={decision.Reason}");
+        _roundPlanStore.ReportTacticalEvent(new TacticalEventSnapshot(
+            _tacticalRoundKey,
+            -1,
+            $"replan-{decision.Action}",
+            _activeTacticalPlan?.PrimarySite ?? "none",
+            0f,
+            0f,
+            0f,
+            Server.CurrentTime,
+            1f));
+    }
+
+    private bool DetectTacticalHumanDeviation(
+        CompetitiveRoundPlanSnapshot plan,
+        IReadOnlyList<CCSPlayerController> terrorists)
+    {
+        var carrier = terrorists.FirstOrDefault(player => !player.IsBot && HasBomb(player));
+        var carrierOrigin = carrier?.PlayerPawn?.Value?.AbsOrigin;
+        if (carrierOrigin is null)
+            return false;
+
+        EnsureTacticalSiteDeviationTargets();
+        var primary = ParseTacticalSite(plan.PrimarySite);
+        var fallback = ParseTacticalSite(plan.FallbackSite);
+        if (!_tacticalSiteDeviationTargets.TryGetValue(primary, out var primaryOrigin)
+            || !_tacticalSiteDeviationTargets.TryGetValue(fallback, out var fallbackOrigin))
+            return false;
+
+        // A spawn position is intentionally not considered a deviation. Only
+        // treat a carrier as having chosen the other site after it has clearly
+        // committed to that side of the map.
+        float primaryDistance = DistanceSquared(carrierOrigin, primaryOrigin);
+        float fallbackDistance = DistanceSquared(carrierOrigin, fallbackOrigin);
+        const float DeviationMargin = 700f;
+        return fallbackDistance + DeviationMargin * DeviationMargin < primaryDistance;
+    }
+
+    private void EnsureTacticalSiteDeviationTargets()
+    {
+        if (_tacticalSiteDeviationTargetsInitialized)
+            return;
+
+        _tacticalSiteDeviationTargetsInitialized = true;
+        _performance.Increment(PerformanceCounter.EntityScans);
+        foreach (var target in Utilities
+                     .FindAllEntitiesByDesignerName<CBombTarget>("func_bomb_target"))
+        {
+            if (!target.IsValid || target.AbsOrigin is not { } origin)
+                continue;
+
+            _tacticalSiteDeviationTargets.TryAdd(
+                target.IsBombSiteB ? CtGambleSite.B : CtGambleSite.A,
+                new Vector(origin.X, origin.Y, origin.Z));
+        }
+    }
+
+    private bool TryBuildTacticalPlanTargets(
+        CompetitiveRoundPlanSnapshot plan,
+        IReadOnlyList<CCSPlayerController> terrorists,
+        TPrePlantStage stage,
+        int carrierSlot)
+    {
+        int botCount = terrorists.Count(player => player.IsBot);
+        if (botCount == 0)
+        {
+            _tPrePlantTargets.Clear();
+            _tacticalRouteBuildQueue.Clear();
+            _tacticalRouteBuildInProgress = false;
+            _tacticalRouteBuildFailed = false;
+            _tacticalRouteBuildExpectedCount = 0;
+            return true;
+        }
+
+        bool continueBuild = _tacticalRouteBuildInProgress
+            && string.Equals(_tacticalRoutePlanId, plan.PlanId, StringComparison.Ordinal)
+            && _tacticalRouteStage == stage
+            && _tacticalRouteCarrierSlot == carrierSlot;
+        if (!continueBuild)
+        {
+            _tPrePlantTargets.Clear();
+            _lastTPrePlantGoalWrite.Clear();
+            _tacticalRouteBuildQueue.Clear();
+            _tacticalRouteBuildFailed = false;
+            _tacticalRouteBuildExpectedCount = 0;
+
+            var siteTargets = new Dictionary<CtGambleSite, Vector>(_ctGambleTargets);
+            if (siteTargets.Count < 2)
+            {
+                _performance.Increment(PerformanceCounter.EntityScans);
+                foreach (var target in Utilities
+                             .FindAllEntitiesByDesignerName<CBombTarget>("func_bomb_target"))
+                {
+                    if (!target.IsValid
+                        || target.AbsOrigin is not { } origin)
+                        continue;
+
+                    CtGambleSite site = target.IsBombSiteB
+                        ? CtGambleSite.B
+                        : CtGambleSite.A;
+                    if (siteTargets.ContainsKey(site))
+                        continue;
+
+                    long navStartedAt = _performance.Start();
+                    _performance.Increment(PerformanceCounter.NavQueries);
+                    var navArea = CCSNavArea.GetClosestNavArea(origin, 2500f);
+                    _performance.Stop(PerformancePhase.NavQuery, navStartedAt);
+                    if (navArea is not null)
+                    {
+                        var anchor = new Vector(
+                            navArea.Center.X,
+                            navArea.Center.Y,
+                            navArea.Center.Z);
+                        siteTargets[site] = anchor;
+                        _ctGambleTargets.TryAdd(site, anchor);
+                    }
+                }
+            }
+
+            if (siteTargets.Count == 0)
+            {
+                _tacticalRouteBuildFailed = true;
+                _tacticalRouteBuildInProgress = false;
+                return false;
+            }
+
+            Vector? spawn = _ctTacticalSpawn ?? ResolveSpawnAnchor("info_player_terrorist");
+            var bots = terrorists
+                .Where(player => player.IsBot)
+                .OrderByDescending(HasBomb)
+                .ThenBy(player => (int)player.Index)
+                .ToArray();
+            for (int index = 0; index < bots.Length; index++)
+            {
+                int slot = (int)bots[index].Index;
+                var assignment = plan.RoleAssignments.FirstOrDefault(
+                    candidate => candidate.Slot == slot);
+                if (assignment is null)
+                {
+                    _tacticalRouteBuildFailed = true;
+                    continue;
+                }
+
+                var routeSite = ParseTacticalSite(assignment.Site);
+                if (routeSite is not (CtGambleSite.A or CtGambleSite.B))
+                {
+                    _tacticalRouteBuildFailed = true;
+                    continue;
+                }
+                if (_tacticalBlockedGroup == assignment.Group
+                    && routeSite == _tPrePlantBlockedSite)
+                {
+                    routeSite = ParseTacticalSite(plan.FallbackSite);
+                }
+                if (!siteTargets.TryGetValue(routeSite, out var anchor))
+                {
+                    _tacticalBlockedGroup = assignment.Group;
+                    _tPrePlantBlockedSite = routeSite;
+                    _tacticalRouteBuildFailed = true;
+                    continue;
+                }
+
+                _tacticalRouteBuildQueue.Enqueue(new TacticalRouteBuildItem(
+                    slot,
+                    anchor,
+                    spawn ?? anchor,
+                    assignment.Role,
+                    assignment.Group,
+                    index,
+                    routeSite));
+                _tacticalRouteBuildExpectedCount++;
+            }
+
+            _tacticalRouteBuildInProgress = _tacticalRouteBuildQueue.Count > 0;
+            if (!_tacticalRouteBuildInProgress)
+                return !_tacticalRouteBuildFailed && bots.Length == 0;
+        }
+
+        int processed = 0;
+        while (_tacticalRouteBuildQueue.Count > 0
+            && processed < TacticalRouteBuildBatchSize)
+        {
+            var item = _tacticalRouteBuildQueue.Dequeue();
+            float dx = item.Anchor.X - item.RouteOrigin.X;
+            float dy = item.Anchor.Y - item.RouteOrigin.Y;
+            float distance = MathF.Sqrt(dx * dx + dy * dy);
+            if (distance < 1f)
+            {
+                dx = 1f;
+                dy = 0f;
+                distance = 1f;
+            }
+            float forwardX = dx / distance;
+            float forwardY = dy / distance;
+            float rightX = -forwardY;
+            float rightY = forwardX;
+            float backoff = item.Role is "Entry" or "CarrierSupport"
+                ? 120f
+                : 280f + item.Index * 45f;
+            float lateral = item.Group == 0
+                ? (item.Index % 2 == 0 ? 1f : -1f) * Math.Min(260f, 90f + item.Index * 35f)
+                : (item.Index % 2 == 0 ? -1f : 1f) * Math.Min(300f, 140f + item.Index * 35f);
+            Vector desired = new(
+                item.Anchor.X - forwardX * backoff + rightX * lateral,
+                item.Anchor.Y - forwardY * backoff + rightY * lateral,
+                item.Anchor.Z);
+            long navStartedAt = _performance.Start();
+            _performance.Increment(PerformanceCounter.NavQueries);
+            var navArea = CCSNavArea.GetClosestNavArea(desired, 1800f);
+            _performance.Stop(PerformancePhase.NavQuery, navStartedAt);
+            if (navArea is null)
+            {
+                _tacticalBlockedGroup = item.Group;
+                _tPrePlantBlockedSite = item.Site;
+                _tacticalRouteBuildFailed = true;
+            }
+            else
+            {
+                _tPrePlantTargets[item.Slot] = new Vector(
+                    navArea.Center.X,
+                    navArea.Center.Y,
+                    navArea.Center.Z);
+            }
+            processed++;
+        }
+
+        _tacticalRouteBuildInProgress = _tacticalRouteBuildQueue.Count > 0;
+        if (_tacticalRouteBuildInProgress)
+            return false;
+
+        return !_tacticalRouteBuildFailed
+            && _tacticalRouteBuildExpectedCount == _tacticalRouteBuildQueue.Count + _tPrePlantTargets.Count
+            && _tPrePlantTargets.Count == _tacticalRouteBuildExpectedCount
+            && _tacticalRouteBuildExpectedCount == botCount;
+    }
+
+    private static CtGambleSite ParseTacticalSite(string? site)
+        => site?.ToUpperInvariant() switch
+        {
+            "A" => CtGambleSite.A,
+            "B" => CtGambleSite.B,
+            _ => CtGambleSite.None,
+        };
+
+    private static TacticalPlanStage ToTacticalPlanStage(TPrePlantStage stage)
+        => stage switch
+        {
+            TPrePlantStage.Probe => TacticalPlanStage.Probe,
+            TPrePlantStage.Execute => TacticalPlanStage.Execute,
+            TPrePlantStage.Split => TacticalPlanStage.Split,
+            TPrePlantStage.Fake => TacticalPlanStage.Stage,
+            TPrePlantStage.Rotate => TacticalPlanStage.Rotate,
+            _ => TacticalPlanStage.Stage,
+        };
+
+    private void ReportTacticalPlanStage(TacticalPlanStage stage)
+    {
+        if (_lastReportedTacticalPlanStage == stage)
+            return;
+
+        _lastReportedTacticalPlanStage = stage;
+        _roundPlanStore.ReportRoundStage(
+            _tacticalRoundKey,
+            stage.ToString());
+    }
+
+    private static bool HasMultipleTacticalGroups(
+        IReadOnlyList<TacticalRoleAssignmentSnapshot> assignments)
+    {
+        int firstGroup = int.MinValue;
+        foreach (var assignment in assignments)
+        {
+            if (firstGroup == int.MinValue)
+            {
+                firstGroup = assignment.Group;
+                continue;
+            }
+
+            if (assignment.Group != firstGroup)
+                return true;
+        }
+
+        return false;
+    }
+
+    private void ApplyTacticalPlanGoals(
+        float now,
+        IReadOnlyList<CCSPlayerController> terrorists)
+    {
+        int eligibleCount = 0;
+        foreach (var player in terrorists)
+        {
+            if (player.IsBot && _tPrePlantTargets.ContainsKey(player.Slot))
+                eligibleCount++;
+        }
+        int batchStart = eligibleCount == 0
+            ? 0
+            : _tacticalGoalBatchCursor % eligibleCount;
+        int batchSize = Math.Min(TacticalGoalBatchSize, eligibleCount);
+        int eligibleIndex = 0;
+        long startedAt = _performance.Start();
+        foreach (var player in terrorists)
+        {
+            if (!player.IsBot)
+                continue;
+            var pawn = player.PlayerPawn?.Value;
+            var bot = pawn?.IsValid == true ? pawn.Bot : null;
+            if (bot == null || player.HasBeenControlledByPlayerThisRound)
+                continue;
+            if (!bot.AllowActive)
+            {
+                ref bool allowActive = ref bot.AllowActive;
+                allowActive = true;
+            }
+            if (!bot.IsRunning)
+            {
+                ref bool isRunning = ref bot.IsRunning;
+                isRunning = true;
+            }
+            if (!_tPrePlantTargets.TryGetValue(player.Slot, out var target))
+                continue;
+
+            bool inBatch = batchSize > 0
+                && (eligibleIndex - batchStart + eligibleCount) % eligibleCount
+                    < batchSize;
+            eligibleIndex++;
+            if (!inBatch)
+                continue;
+
+            float lastWrite = _lastTPrePlantGoalWrite.GetValueOrDefault(player.Slot, -999f);
+            if (now - lastWrite < 0.35f)
+                continue;
+            Schema.SetSchemaValue(bot.Handle, "CCSBot", "m_goalPosition", target);
+            _lastTPrePlantGoalWrite[player.Slot] = now;
+            CountdownTimer repath = bot.RepathTimer;
+            ref float duration = ref repath.Duration;
+            duration = 0f;
+            ref float timestamp = ref repath.Timestamp;
+            timestamp = now;
+            ref float timescale = ref repath.Timescale;
+            timescale = 1f;
+            _performance.Increment(PerformanceCounter.GoalWrites);
+        }
+
+        if (eligibleCount > 0)
+            _tacticalGoalBatchCursor = (batchStart + batchSize) % eligibleCount;
+        _performance.Stop(PerformancePhase.GoalRepath, startedAt);
     }
 
     private void ApplyTPostPlantAttention(
@@ -2670,17 +3819,24 @@ public class BotState : BasePlugin
     private void ApplyCompetitiveTacticalActions(float now)
     {
         if (!IsCompetitiveProfile()) return;
+        _performance.Increment(PerformanceCounter.EntityScans);
+        var players = FindValidMatchPlayers();
         // Refresh only the immutable human state on the game thread. The
         // worker receives these positions/carrier flags with its next
         // versioned snapshot; it never writes goals for human players.
         _tacticalRuntime.UpdateHumanSnapshots(
-            BuildTacticalHumanSnapshots(FindValidMatchPlayers()));
+            BuildTacticalHumanSnapshots(players));
         RefreshCtThreatDecay(now);
-        RunCompetitiveTPrePlantTick(now);
-        RunCompetitiveTPostPlantTick(now);
+        RunCompetitiveTPrePlantTick(now, players);
+        RunCompetitiveTPostPlantTick(now, players);
         if (!_tacticalRolesInitialized)
         {
-            if (!_isFreezeTime) InitializeTacticalRoles();
+            // Normal startup is staged through RoundWorkScheduler. Keep this
+            // fallback for late/hot-reloaded states, but do not run it while
+            // the tactical runtime is still in its freeze bootstrap phase.
+            if (!_isFreezeTime
+                && _tacticalRuntime.Context.Phase != RoundPhase.Freeze)
+                InitializeTacticalRoles();
             return;
         }
 
@@ -2697,6 +3853,12 @@ public class BotState : BasePlugin
         QueueCtDecisionPlan(now);
         var decisions = _latestCtDecisions;
         int activeCount = decisions.Count(decision => decision.IsActive);
+        int goalCount = decisions.Count(HasCtTacticalGoal);
+        int goalBatchStart = goalCount == 0
+            ? 0
+            : _ctGoalBatchCursor % goalCount;
+        int goalBatchSize = Math.Min(CtGoalBatchSize, goalCount);
+        int goalOrdinal = 0;
 
         foreach (var decision in decisions)
         {
@@ -2727,13 +3889,19 @@ public class BotState : BasePlugin
             var bot = pawn.Bot;
             if (bot == null) continue;
 
-            bool hasTacticalGoal = decision.ShouldMoveToRetreat
-                || decision.ShouldMoveToGambleSite
-                || (decision.State is CtTacticalState.Rotate or CtTacticalState.Reinforce
-                    && decision.TargetSite != CtGambleSite.None);
+            bool hasTacticalGoal = HasCtTacticalGoal(decision);
             if (hasTacticalGoal)
             {
-                bool hasGoal = TryApplyTacticalGoal(pawn, bot, decision, now);
+                bool writeThisBatch = goalBatchSize > 0
+                    && (goalOrdinal - goalBatchStart + goalCount) % goalCount
+                        < goalBatchSize;
+                goalOrdinal++;
+                bool hasGoal = TryApplyTacticalGoal(
+                    pawn,
+                    bot,
+                    decision,
+                    now,
+                    writeThisBatch);
                 ref bool goalAllowActive = ref bot.AllowActive;
                 goalAllowActive = hasGoal
                     ? CtTacticalExecutionPolicy.ShouldAllowNativeActive(decision)
@@ -2816,6 +3984,9 @@ public class BotState : BasePlugin
                 timescale = 1.0f;
             }
         }
+
+        if (goalCount > 0)
+            _ctGoalBatchCursor = (goalBatchStart + goalBatchSize) % goalCount;
     }
 
     private List<CtBotSnapshot> BuildCtBotSnapshots()
@@ -3406,8 +4577,12 @@ public class BotState : BasePlugin
     // Clears per-round state and releases elimination knife locks
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
+        _performance.Reset();
+        _performance.CaptureRoundStartMemory();
         ClearSaveMode();
         _ctGambleTargets.Clear();
+        _tacticalSiteDeviationTargets.Clear();
+        _tacticalSiteDeviationTargetsInitialized = false;
         _ctEcoTargets.Clear();
         _ctEcoSnapshotValue = 0;
         _ctEcoPlanValue = 0;
@@ -3426,6 +4601,20 @@ public class BotState : BasePlugin
         _cachedBombOrigin = null;
         _ctGambleFallbackLogged = false;
         _lastTacticalGoalWrite.Clear();
+        _tPrePlantTargets.Clear();
+        _lastTPrePlantGoalWrite.Clear();
+        _tacticalRouteDirty = true;
+        _tacticalRoutePlanId = null;
+        _tacticalRouteStage = default;
+        _tacticalRouteCarrierSlot = -1;
+        _tacticalRouteBotCount = -1;
+        _nextTacticalRouteRetryAt = 0f;
+        _tacticalGoalBatchCursor = 0;
+        _tacticalRouteBuildQueue.Clear();
+        _tacticalRouteBuildInProgress = false;
+        _tacticalRouteBuildFailed = false;
+        _tacticalRouteBuildExpectedCount = 0;
+        _ctGoalBatchCursor = 0;
         ReleaseKnifeLocks();
         StopDefuseSmoke();
         _isSmokeExpanded = false;
@@ -3433,6 +4622,8 @@ public class BotState : BasePlugin
         _isFreezeTime = true;
         _tacticalRoundNumber++;
         _tacticalRoundKey = ResolveTacticalRoundKey();
+        _activeTacticalPlan = null;
+        _tacticalBlockedGroup = -1;
         _matchState.UpdateFormat(new MatchFormatSnapshot(
             ReadMaxRounds(),
             ReadOvertimeEnabled(),
@@ -3469,12 +4660,18 @@ public class BotState : BasePlugin
         _lastTPostPlantAction = null;
         _lastTPostPlantReason = null;
         _lastTPrePlantDecision = null;
+        _lastReportedTacticalPlanStage = null;
         _tacticalEconomy.Reset();
         if (IsCompetitiveProfile())
         {
             _tacticalRuntime.Reset(CreateTacticalRoundContext(RoundPhase.Freeze));
             ConfigureTacticalEconomy(captureRoundFlags: true);
             CaptureTacticalEconomyCheckpoint();
+            _roundWorkScheduler.Reset(_tacticalRoundKey);
+            _roundWorkScheduler.Schedule(
+                _tacticalRoundKey,
+                RoundWorkItem.DraftPlan,
+                Server.CurrentTime + 0.10f);
         }
 
         // Per-round transient state keyed by player index. Indices are reused by
@@ -3524,8 +4721,22 @@ public class BotState : BasePlugin
     [GameEventHandler]
     private HookResult OnRoundEnd(EventRoundEnd @event, GameEventInfo info)
     {
+        _performance.CaptureMemorySnapshot(PerformanceWindow.Endgame);
         if (IsCompetitiveProfile())
         {
+            _roundWorkScheduler.Clear();
+            _roundActivationPlayers.Clear();
+            _roundActivationCursor = 0;
+            if (_activeTacticalPlan is { } completedPlan
+                && Enum.TryParse<TTacticalIntent>(
+                    completedPlan.Tactic,
+                    ignoreCase: true,
+                    out var completedIntent))
+            {
+                _previousTacticalIntents.Enqueue(completedIntent);
+                while (_previousTacticalIntents.Count > 4)
+                    _previousTacticalIntents.Dequeue();
+            }
             TeamSide? winner = ResolveRoundWinner(@event);
             bool authoritativeScore = SynchronizeCompetitiveScore();
             if (winner.HasValue && !authoritativeScore)
@@ -3539,12 +4750,28 @@ public class BotState : BasePlugin
             _latestCtDecisions = Array.Empty<CtTacticalDecision>();
             while (_ctDecisionResults.TryDequeue(out _)) { }
             _ctGambleTargets.Clear();
+            _tacticalSiteDeviationTargets.Clear();
+            _tacticalSiteDeviationTargetsInitialized = false;
             _ctEcoTargets.Clear();
             _ctRetreatTarget = null;
             _ctGambleFallbackLogged = false;
             _lastTacticalGoalWrite.Clear();
             _tPrePlantTargets.Clear();
             _lastTPrePlantGoalWrite.Clear();
+            _tacticalRouteDirty = true;
+            _tacticalRoutePlanId = null;
+            _tacticalRouteStage = default;
+            _tacticalRouteCarrierSlot = -1;
+            _tacticalRouteBotCount = -1;
+            _nextTacticalRouteRetryAt = 0f;
+            _tacticalGoalBatchCursor = 0;
+            _tacticalRouteBuildQueue.Clear();
+            _tacticalRouteBuildInProgress = false;
+            _tacticalRouteBuildFailed = false;
+            _tacticalRouteBuildExpectedCount = 0;
+            _ctGoalBatchCursor = 0;
+            _competitivePlayersScratch.Clear();
+            _tacticalTerroristScratch.Clear();
             _tPrePlantRouteBlocked = false;
             _tPrePlantBlockedSite = CtGambleSite.None;
             _lastTacticalPosition.Clear();
@@ -3563,6 +4790,7 @@ public class BotState : BasePlugin
             _lastTPostPlantAction = null;
             _lastTPostPlantReason = null;
             _lastTPrePlantDecision = null;
+            _lastReportedTacticalPlanStage = null;
         }
 
         return HookResult.Continue;
@@ -4204,7 +5432,7 @@ public class BotState : BasePlugin
 
         float now = Server.CurrentTime;
 
-        var live = new List<(uint idx, Vector pos, float detonateAt)>();
+        _liveFlashScratch.Clear();
         foreach (var ent in Utilities.FindAllEntitiesByDesignerName<CBaseEntity>("flashbang_projectile"))
         {
             if (!ent.IsValid) continue;
@@ -4219,20 +5447,33 @@ public class BotState : BasePlugin
                 if (_debugFlash)
                     BroadcastDebug($"[Smarter-Bot/Flash] new flash#{eidx} at ({pos.X:F0},{pos.Y:F0},{pos.Z:F0}) fuse={FlashFuseSeconds:F2}s");
             }
-            live.Add((eidx, pos, _flashThrownAt[eidx] + FlashFuseSeconds));
+            _liveFlashScratch.Add((eidx, pos, _flashThrownAt[eidx] + FlashFuseSeconds));
         }
 
         // Drop tracking for flashes that no longer exist (detonated / round end). Decisions
         // linger for 2 seconds past detonation so OnPlayerBlind can still match them.
-        if (_flashThrownAt.Count > live.Count)
+        if (_flashThrownAt.Count > _liveFlashScratch.Count)
         {
-            var alive = new HashSet<uint>(live.Select(f => f.idx));
-            var stale = _flashThrownAt.Keys.Where(k => !alive.Contains(k)).ToList();
-            foreach (var k in stale)
+            _liveFlashIdsScratch.Clear();
+            foreach (var flash in _liveFlashScratch)
+                _liveFlashIdsScratch.Add(flash.idx);
+            _staleFlashScratch.Clear();
+            foreach (var key in _flashThrownAt.Keys)
+            {
+                if (!_liveFlashIdsScratch.Contains(key))
+                    _staleFlashScratch.Add(key);
+            }
+            foreach (var k in _staleFlashScratch)
             {
                 if (_debugFlash)
                 {
-                    foreach (var key in _flashDecisions.Keys.Where(p => p.flash == k).ToList())
+                    _flashDecisionScratch.Clear();
+                    foreach (var key in _flashDecisions.Keys)
+                    {
+                        if (key.flash == k)
+                            _flashDecisionScratch.Add(key);
+                    }
+                    foreach (var key in _flashDecisionScratch)
                     {
                         var d = _flashDecisions[key];
                         BroadcastDebug(
@@ -4248,13 +5489,17 @@ public class BotState : BasePlugin
         // Expire stale decisions (2s past their detonation) so we don't leak across rounds.
         if (_flashDecisions.Count > 0)
         {
-            var expired = _flashDecisions.Where(kvp => now - kvp.Value.DetonateAt > 2f)
-                                          .Select(kvp => kvp.Key)
-                                          .ToList();
-            foreach (var k in expired) _flashDecisions.Remove(k);
+            _flashDecisionScratch.Clear();
+            foreach (var entry in _flashDecisions)
+            {
+                if (now - entry.Value.DetonateAt > 2f)
+                    _flashDecisionScratch.Add(entry.Key);
+            }
+            foreach (var k in _flashDecisionScratch)
+                _flashDecisions.Remove(k);
         }
 
-        if (live.Count == 0) return;
+        if (_liveFlashScratch.Count == 0) return;
 
         foreach (var bot in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller"))
         {
@@ -4271,7 +5516,7 @@ public class BotState : BasePlugin
                 _flashRolledByBot[bidx] = rolled;
             }
 
-            foreach (var (fidx, fpos, detonateAt) in live)
+            foreach (var (fidx, fpos, detonateAt) in _liveFlashScratch)
             {
                 if (now > detonateAt) continue;
 

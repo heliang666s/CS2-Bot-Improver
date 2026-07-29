@@ -19,6 +19,7 @@ using System.Runtime.CompilerServices;
 using RayTraceAPI;
 using BotControllerApi;
 using CompetitiveBotCore;
+using CompetitiveTacticalApi;
 
 namespace NadeSystem;
 
@@ -98,6 +99,165 @@ public class RoundCounter
     public int Molotov { get; set; }
 }
 
+// The JSON files are physical throw trajectories, not tactical scripts. This
+// small runtime index exposes only coverage to the tactical planner and keeps
+// all entity/nav types inside NadeSystem.
+internal sealed class TacticalLineupCatalog : ICompetitiveLineupCatalogApi
+{
+    private readonly object _gate = new();
+    private Dictionary<(string Map, string Type, string Site), int> _counts = new();
+    private readonly PlanningResultCache<string, MapCapabilitySnapshot> _capabilityCache = new(4);
+
+    public int AbiVersion => 1;
+
+    public void Rebuild(string mapName, IReadOnlyList<GrenadeData> entries)
+    {
+        var targets = new List<(string Site, Vector Origin)>();
+        foreach (var target in Utilities
+                     .FindAllEntitiesByDesignerName<CBombTarget>("func_bomb_target"))
+        {
+            if (target.IsValid && target.AbsOrigin is { } origin)
+                targets.Add((target.IsBombSiteB ? "B" : "A", origin));
+        }
+        var next = new Dictionary<(string Map, string Type, string Site), int>();
+        foreach (var entry in entries)
+        {
+            string type = NormalizeType(entry.GrenadeType);
+            string site = targets.Count == 0
+                ? string.Empty
+                : FindNearestSite(targets, entry.LandingPosition);
+            var key = (mapName.ToLowerInvariant(), type, site);
+            next[key] = next.GetValueOrDefault(key) + 1;
+        }
+        lock (_gate)
+        {
+            _counts = next;
+            _capabilityCache.Clear();
+        }
+    }
+
+    public bool TryGetCoverage(
+        string mapName,
+        string utilityType,
+        string targetSite,
+        out LineupCoverageSnapshot coverage)
+    {
+        string map = mapName.ToLowerInvariant();
+        string type = NormalizeType(utilityType);
+        string site = targetSite.ToUpperInvariant();
+        lock (_gate)
+        {
+            int count = _counts.GetValueOrDefault((map, type, site));
+            coverage = new LineupCoverageSnapshot(
+                mapName,
+                utilityType,
+                site,
+                count,
+                HasReachableCandidate: count > 0,
+                HasRequiredType: count > 0);
+            return count > 0;
+        }
+    }
+
+    public MapCapabilitySnapshot GetMapCapabilities(string mapName)
+    {
+        string map = mapName.ToLowerInvariant();
+        if (_capabilityCache.TryGet(map, out var cached))
+            return cached;
+
+        lock (_gate)
+        {
+            if (_capabilityCache.TryGet(map, out cached))
+                return cached;
+
+            var entries = _counts
+                .Where(entry => entry.Key.Map == map)
+                .ToArray();
+            int sites = entries
+                .Select(entry => entry.Key.Site)
+                .Where(site => site.Length > 0)
+                .Distinct(StringComparer.Ordinal)
+                .Count();
+            int utilityTypes = entries
+                .Select(entry => entry.Key.Type)
+                .Distinct(StringComparer.Ordinal)
+                .Count();
+            int lineupCount = entries.Sum(entry => entry.Value);
+            var bombTargets = Utilities
+                .FindAllEntitiesByDesignerName<CBombTarget>("func_bomb_target")
+                .Where(target => target.IsValid && target.AbsOrigin is not null)
+                .ToArray();
+            bool hasNav = bombTargets.Any(target =>
+                CCSNavArea.GetClosestNavArea(target.AbsOrigin!, 2500f) is not null);
+            var snapshot = new MapCapabilitySnapshot(
+                mapName,
+                sites,
+                hasNav,
+                HasTwoReachableGroups: sites >= 2 && hasNav,
+                lineupCount,
+                utilityTypes,
+                sites >= 2 && hasNav && lineupCount > 0
+                    ? "Tier1"
+                    : sites >= 2 && hasNav
+                        ? "Tier2"
+                        : sites >= 1
+                            ? "Tier3"
+                            : "Tier4");
+            _capabilityCache.Set(map, snapshot);
+            return snapshot;
+        }
+    }
+
+    private static string NormalizeType(string? type)
+        => type?.ToLowerInvariant() switch
+        {
+            "fire" or "molotov" or "incendiary" or "incgrenade" => "fire",
+            "flash" or "flashbang" => "flash",
+            "he" or "grenade" or "hegrenade" => "he",
+            "smoke" or "smokegrenade" => "smoke",
+            _ => type?.ToLowerInvariant() ?? string.Empty,
+        };
+
+    private static float DistanceSquared(
+        float ax,
+        float ay,
+        float az,
+        float bx,
+        float by,
+        float bz)
+    {
+        float dx = ax - bx;
+        float dy = ay - by;
+        float dz = az - bz;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static string FindNearestSite(
+        IReadOnlyList<(string Site, Vector Origin)> targets,
+        Vec3 landing)
+    {
+        string nearestSite = string.Empty;
+        float nearestDistance = float.MaxValue;
+        foreach (var target in targets)
+        {
+            float distance = DistanceSquared(
+                target.Origin.X,
+                target.Origin.Y,
+                target.Origin.Z,
+                landing.X,
+                landing.Y,
+                landing.Z);
+            if (distance >= nearestDistance)
+                continue;
+
+            nearestDistance = distance;
+            nearestSite = target.Site;
+        }
+
+        return nearestSite;
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Plugin
 // ═══════════════════════════════════════════════════════════════
@@ -112,6 +272,10 @@ public class NadeSystemPlugin : BasePlugin
     private string DataDir => Path.Combine(ModuleDirectory, "grenades");
     // precache all the nades on this map
     private List<GrenadeData> _mapNades = new();
+    private readonly Dictionary<string, GrenadeData> _mapNadeById = new(StringComparer.Ordinal);
+    private readonly SpatialLineupIndex<GrenadeData> _zoneIndex = new(512f);
+    private readonly List<GrenadeData> _zoneCandidatesScratch = new();
+    private float _maxZoneRadius;
     private string _botNadesMode = "normal"; // "off" | "normal" | "more" | "max"
     private BotMatchProfile _profile = BotMatchProfile.Competitive;
     // Competitive throws use the bot's real inventory only when the optional
@@ -125,9 +289,28 @@ public class NadeSystemPlugin : BasePlugin
     private const float RealThrowLateConfirmationProbeDelay = 0.25f;
     private const int RealThrowConfirmationRetryCount = 6;
     private object? _botController;
+    private static readonly PluginCapability<ICompetitiveRoundPlanApi> RoundPlanCapability =
+        new("competitive:round-plan");
+    private static readonly PluginCapability<ICompetitiveLineupCatalogApi> LineupCatalogCapability =
+        new("competitive:lineup-catalog");
+    private ICompetitiveRoundPlanApi? _tacticalPlans;
+    private readonly TacticalLineupCatalog _lineupCatalog = new();
+    private readonly Dictionary<string, string> _lineupSiteById = new(StringComparer.Ordinal);
+    private readonly Dictionary<(string Type, string Site), GrenadeData[]> _tacticalLineupIndex = new();
+    private readonly Dictionary<int, TacticalUtilityRequestSnapshot[]> _tacticalRequestsBySlot = new();
+    private readonly List<CCSPlayerController> _controllerScratch = new();
+    private readonly Dictionary<int, string> _pendingTacticalRequests = new();
+    private readonly Dictionary<int, float> _pendingTacticalRequestStartedAt = new();
+    private readonly List<int> _expiredTacticalBotScratch = new();
+    private readonly HashSet<string> _timedOutTacticalRequests = new(StringComparer.Ordinal);
     private readonly Dictionary<int, PendingRealThrow> _pendingRealThrows = new();
     private readonly IRoundState _roundState = new RoundState();
     private readonly PerformanceMetrics _performance = new();
+    private int _cachedTacticalRoundKey = -1;
+    private CompetitiveRoundPlanSnapshot? _cachedTacticalPlan;
+    private float _nextTacticalPlanRefreshAt;
+    private CCSGameRulesProxy? _cachedGameRulesProxy;
+    private float _nextGameRulesRefreshAt;
 
     private enum RealThrowConfirmationState
     {
@@ -208,10 +391,12 @@ public class NadeSystemPlugin : BasePlugin
     // key = (listener controller index, source controller index). A sound is
     // memory for the bots that could actually hear it, never a team-wide fact.
     private Dictionary<(uint ListenerId, uint SourceId), List<SoundPoint>> _heardSoundPoints = new();
+    private readonly List<(uint ListenerId, uint SourceId)> _soundKeyScratch = new();
     // key = controller index, value = last weapon_fire time (global, all players)
     private Dictionary<uint, float> _botLastFireTime = new();
     // Sound trail capture radius (a recorded sound point counts as "info" within this range)
     private const float SoundInfoRadius = 100f;
+    private const int MaxSoundPointsPerPair = 12;
     // Footstep speed threshold (horizontal velocity above this makes audible footstep sound)
     private const float FootstepSpeedThreshold = 150f;
     // Max distance at which a sound point can be heard by an enemy.
@@ -306,6 +491,9 @@ public class NadeSystemPlugin : BasePlugin
 
     public override void Load(bool hotReload)
     {
+        Capabilities.RegisterPluginCapability(
+            LineupCatalogCapability,
+            () => _lineupCatalog);
         _profile = ProfilePolicy.Resolve(
             ProfileConfig.Load(ProfileConfig.DefaultPath(Server.GameDirectory)),
             IsEntertainmentMode());
@@ -338,6 +526,18 @@ public class NadeSystemPlugin : BasePlugin
             CancelPendingRealThrows();
             _utilityLedgers.Clear();
             _defuseSmokeUsers.Clear();
+            _pendingTacticalRequests.Clear();
+            _pendingTacticalRequestStartedAt.Clear();
+            _timedOutTacticalRequests.Clear();
+            _probFailCooldown.Clear();
+            _cachedTacticalRoundKey = -1;
+            _cachedTacticalPlan = null;
+            _nextTacticalPlanRefreshAt = 0f;
+            _tacticalRequestsBySlot.Clear();
+            _cachedGameRulesProxy = null;
+            _nextGameRulesRefreshAt = 0f;
+            _lineupSiteById.Clear();
+            _tacticalLineupIndex.Clear();
         });
         
         AddCommand("bot_nades", "Control bots' nade throw mode (off/normal/more/max)", CmdBotNades);
@@ -345,7 +545,7 @@ public class NadeSystemPlugin : BasePlugin
         if (hotReload)
             AddTimer(0.1f, SynchronizeRoundPhaseFromGameRules);
         
-        Server.PrintToConsole($"[NadeSystem] Loaded — profile={_profile}, mode={_botNadesMode}, grenades={_db.Count}, utilityLedger=per-bot");
+        Server.PrintToConsole($"[NadeSystem] Loaded — profile={_profile}, mode={_botNadesMode}, grenades={_mapNades.Count}, utilityLedger=per-bot");
     }
 
     public override void OnAllPluginsLoaded(bool hotReload)
@@ -358,9 +558,40 @@ public class NadeSystemPlugin : BasePlugin
         {
             _botController = null;
         }
-
+        try
+        {
+            _tacticalPlans = RoundPlanCapability.Get();
+        }
+        catch
+        {
+            _tacticalPlans = null;
+        }
         Server.PrintToConsole(
             $"[NadeSystem] real inventory throw API = {RealThrowApiAvailable}");
+    }
+
+    public override void Unload(bool hotReload)
+    {
+        CancelPendingRealThrows();
+        _db.Clear();
+        _mapNades.Clear();
+        _mapNadeById.Clear();
+        _zoneIndex.Clear();
+        _zoneCandidatesScratch.Clear();
+        _maxZoneRadius = 0f;
+        _lineupSiteById.Clear();
+        _tacticalLineupIndex.Clear();
+        _tacticalRequestsBySlot.Clear();
+        _controllerScratch.Clear();
+        _cachedGameRulesProxy = null;
+        _pendingTacticalRequests.Clear();
+        _pendingTacticalRequestStartedAt.Clear();
+        _timedOutTacticalRequests.Clear();
+        _probFailCooldown.Clear();
+        _heardSoundPoints.Clear();
+        _botInFlashZone.Clear();
+        _utilityLedgers.Clear();
+        _cooldowns.Clear();
     }
 
     [ConsoleCommand("css_nade_perf", "Print NadeSystem phase latency percentiles")]
@@ -371,6 +602,17 @@ public class NadeSystemPlugin : BasePlugin
         {
             _performance.FormatSnapshot(PerformancePhase.NormalTick),
             _performance.FormatSnapshot(PerformancePhase.SoundMaintenance),
+            _performance.FormatSnapshot(PerformancePhase.NadePlanning),
+            _performance.FormatSnapshot(PerformancePhase.NadeExecution),
+            _performance.FormatSnapshot(
+                PerformancePhase.NadePlanning,
+                PerformanceWindow.Startup),
+            _performance.FormatSnapshot(
+                PerformancePhase.NadePlanning,
+                PerformanceWindow.Stable),
+            FormatMemorySnapshot(),
+            $"counters nadeCandidates={_performance.ReadCounter(PerformanceCounter.NadeCandidates)} "
+                + $"entityScans={_performance.ReadCounter(PerformanceCounter.EntityScans)}",
         };
         foreach (string line in lines)
             command.ReplyToCommand($"[NadeSystem] {line}");
@@ -385,8 +627,32 @@ public class NadeSystemPlugin : BasePlugin
     //  but the mapName field inside each entry is authoritative.
     // ═══════════════════════════════════════════════════════════
 
+    private string FormatMemorySnapshot()
+    {
+        var start = _performance.RoundStartMemory;
+        var latest = _performance.LatestMemory;
+        var startup = _performance.MemorySnapshot(PerformanceWindow.Startup);
+        var endgame = _performance.MemorySnapshot(PerformanceWindow.Endgame);
+        return $"memory managed={latest.ManagedHeapBytes}B "
+            + $"rss={latest.WorkingSetBytes}B "
+            + $"deltaManaged={latest.ManagedHeapBytes - start.ManagedHeapBytes}B "
+            + $"deltaRss={latest.WorkingSetBytes - start.WorkingSetBytes}B "
+            + $"gc={latest.Gen0Collections}/{latest.Gen1Collections}/{latest.Gen2Collections} "
+            + $"startupPeakRss={startup.PeakWorkingSetBytes}B "
+            + $"endgameSamples={endgame.Samples}";
+    }
+
     private void LoadDb()
     {
+        // Runtime only needs the active map. Keeping every map's deserialized
+        // object graph alive doubled the lineup memory and made map changes
+        // retain a large, otherwise unreachable working set until the next GC.
+        _db.Clear();
+        _mapNades.Clear();
+        _mapNadeById.Clear();
+        _zoneIndex.Clear();
+        _zoneCandidatesScratch.Clear();
+        _maxZoneRadius = 0f;
         int loaded = 0;
         foreach (var file in Directory.GetFiles(DataDir, "*.json"))
         {
@@ -411,8 +677,20 @@ public class NadeSystemPlugin : BasePlugin
                     else
                         entry.TeamTag = "";
                 }
-                _db.AddRange(list);
                 loaded += list.Count;
+                foreach (var entry in list)
+                {
+                    if (string.Equals(
+                            entry.MapName,
+                            Server.MapName,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        _mapNades.Add(entry);
+                        _mapNadeById[entry.Id] = entry;
+                        _zoneIndex.Add(entry, entry.ZoneX, entry.ZoneY);
+                        _maxZoneRadius = MathF.Max(_maxZoneRadius, entry.ZoneRadius);
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -420,11 +698,12 @@ public class NadeSystemPlugin : BasePlugin
                     $"[NadeSystem] Failed to load {Path.GetFileName(file)}: {ex.Message}");
             }
         }
-        // Pre-filter to current map
-        _mapNades = _db
-            .Where(g => string.Equals(g.MapName, Server.MapName, StringComparison.OrdinalIgnoreCase))
-            .ToList();
-        Server.PrintToConsole($"[NadeSystem] Loaded {loaded} grenades from {DataDir}");
+        _lineupCatalog.Rebuild(Server.MapName, _mapNades);
+        RebuildLineupSiteIndex();
+        RebuildTacticalLineupIndex();
+        Server.PrintToConsole(
+            $"[NadeSystem] Loaded {loaded} grenades from {DataDir} "
+            + $"(activeMap={_mapNades.Count})");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -435,7 +714,21 @@ public class NadeSystemPlugin : BasePlugin
 
     private void CheckBotZones()
     {
-        var rules = Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault();
+        if (_cachedGameRulesProxy?.IsValid != true
+            || Server.CurrentTime >= _nextGameRulesRefreshAt)
+        {
+            _cachedGameRulesProxy = Utilities
+                .FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules")
+                .FirstOrDefault();
+            _nextGameRulesRefreshAt = Server.CurrentTime + 1f;
+            _performance.Increment(PerformanceCounter.EntityScans);
+        }
+        var rules = _cachedGameRulesProxy;
+        if (_cachedTacticalRoundKey < 0
+            && rules?.GameRules is { } gameRules)
+        {
+            _cachedTacticalRoundKey = gameRules.TotalRoundsPlayed;
+        }
         if (rules?.GameRules?.FreezePeriod == true)
         {
             _roundState.SetPhase(RoundPhase.Freeze);
@@ -453,12 +746,35 @@ public class NadeSystemPlugin : BasePlugin
 
         // Materialize the controller list once per scan; every sub-check below
         // reuses it instead of re-walking the entity table.
-        var allControllers = Utilities
-            .FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
-            .ToList();
+        _controllerScratch.Clear();
+        foreach (var controller in Utilities
+                     .FindAllEntitiesByDesignerName<CCSPlayerController>(
+                         "cs_player_controller"))
+        {
+            if (controller.IsValid)
+                _controllerScratch.Add(controller);
+        }
+        var allControllers = _controllerScratch;
+        _performance.Increment(PerformanceCounter.EntityScans);
 
         bool hasLiveEnemyT  = HasLiveEnemyForTeam((int)CsTeam.Terrorist, allControllers);
         bool hasLiveEnemyCT = HasLiveEnemyForTeam((int)CsTeam.CounterTerrorist, allControllers);
+
+        bool hasTacticalPlan = ProfilePolicy.IsCompetitive(_profile)
+            && TryGetCurrentTacticalPlan(out var tacticalPlan)
+            && string.Equals(
+                tacticalPlan.Side,
+                "T",
+                StringComparison.OrdinalIgnoreCase);
+        int tacticalRoundKey = _cachedTacticalRoundKey;
+        TacticalPlanStage tacticalStage = ParseTacticalPlanStage(
+            tacticalPlan?.Stage);
+        if (_tacticalPlans?.TryGetRoundStage(
+                tacticalRoundKey,
+                out var reportedStage) == true)
+        {
+            tacticalStage = ParseTacticalPlanStage(reportedStage);
+        }
 
         foreach (var bot in allControllers)
         {
@@ -476,7 +792,35 @@ public class NadeSystemPlugin : BasePlugin
             var pos = pawn.AbsOrigin;
             if (pos == null) continue;
 
-            foreach (var g in mapNades)
+            if (ProfilePolicy.IsCompetitive(_profile)
+                && bot.Team == CsTeam.Terrorist
+                && hasTacticalPlan)
+            {
+                long planningStartedAt = _performance.Start();
+                TryRunTacticalUtilityRequests(
+                    bot,
+                    allControllers,
+                    tacticalRoundKey,
+                    tacticalStage);
+                _performance.Stop(
+                    PerformancePhase.NadePlanning,
+                    ResolvePerformanceWindow(),
+                    planningStartedAt);
+                // In a T competitive round, a JSON lineup is an execution
+                // candidate for a claimed RoundPlan request. Merely walking
+                // through a trigger zone must not invent a new throw.
+                continue;
+            }
+
+            _zoneIndex.CopyCandidates(
+                pos.X,
+                pos.Y,
+                _maxZoneRadius,
+                _zoneCandidatesScratch);
+            _performance.Increment(
+                PerformanceCounter.NadeCandidates,
+                _zoneCandidatesScratch.Count);
+            foreach (var g in _zoneCandidatesScratch)
             {
                 var gtype = g.GrenadeType; // lowercase since LoadDb
                 float viewOffsetZ = 64f;
@@ -512,12 +856,7 @@ public class NadeSystemPlugin : BasePlugin
                 if (gtype == "smoke")
                 {
                     float lx = g.LandingPosition.X, ly = g.LandingPosition.Y, lz = g.LandingPosition.Z;
-                    bool tooClose = _cooldowns
-                        .Where(c => c.ExpiresAt > Server.CurrentTime)
-                        .Select(c => _mapNades.FirstOrDefault(d => d.Id == c.GrenadeId))
-                        .Any(d => d != null
-                               && string.Equals(d.GrenadeType, "smoke", StringComparison.OrdinalIgnoreCase)
-                               && Dist3D(lx, ly, lz, d.LandingPosition.X, d.LandingPosition.Y, d.LandingPosition.Z) < 100f);
+                    bool tooClose = IsActiveSmokeNear(lx, ly, lz, 100f);
                     if (tooClose) continue;
                 }
 
@@ -555,17 +894,7 @@ public class NadeSystemPlugin : BasePlugin
                         if (gtype == "molotov")
                         {
                             float now = Server.CurrentTime;
-                            bool intoSmoke = _cooldowns.Any(cd =>
-                            {
-                                if (cd.ExpiresAt <= now) return false;
-                                var s = _mapNades.FirstOrDefault(d => d.Id == cd.GrenadeId
-                                    && string.Equals(d.GrenadeType, "smoke", StringComparison.OrdinalIgnoreCase));
-                                if (s == null) return false;
-                                float ddx = lx - s.LandingPosition.X;
-                                float ddy = ly - s.LandingPosition.Y;
-                                float ddz = lz - s.LandingPosition.Z;
-                                return ddx*ddx + ddy*ddy + ddz*ddz < 200f * 200f;
-                            });
+                            bool intoSmoke = IsActiveSmokeNear(lx, ly, lz, 200f);
                             if (intoSmoke) continue;
                         }
                     }
@@ -707,6 +1036,8 @@ public class NadeSystemPlugin : BasePlugin
                     && Server.CurrentTime - last.RecordedAt < 0.25f)
                     continue;
             }
+            if (list.Count >= MaxSoundPointsPerPair)
+                list.RemoveAt(0);
             list.Add(new SoundPoint(ox, oy, oz, Server.CurrentTime));
         }
     }
@@ -1064,8 +1395,7 @@ public class NadeSystemPlugin : BasePlugin
             var pawn = GetActiveLivePawn(p);
             if (pawn == null)
             {
-                foreach (var key in _heardSoundPoints.Keys.Where(key => key.SourceId == sourceId).ToList())
-                    _heardSoundPoints.Remove(key);
+                RemoveSoundEntriesForSource(sourceId);
                 continue;
             }
             var origin = pawn.AbsOrigin;
@@ -1073,15 +1403,23 @@ public class NadeSystemPlugin : BasePlugin
 
             float cx = origin.X, cy = origin.Y, cz = origin.Z;
 
-            foreach (var key in _heardSoundPoints.Keys.Where(key => key.SourceId == sourceId).ToList())
+            _soundKeyScratch.Clear();
+            foreach (var key in _heardSoundPoints.Keys)
+            {
+                if (key.SourceId == sourceId)
+                    _soundKeyScratch.Add(key);
+            }
+
+            foreach (var key in _soundKeyScratch)
             {
                 if (!_heardSoundPoints.TryGetValue(key, out var list)) continue;
                 var listener = Utilities.GetEntityFromIndex<CCSPlayerController>((int)key.ListenerId);
                 var listenerOrigin = listener == null ? null : GetActiveLivePawn(listener)?.AbsOrigin;
                 float hearR2 = SoundHearRadius * SoundHearRadius;
                 float infoR2 = SoundInfoRadius * SoundInfoRadius;
-                list.RemoveAll(pt =>
+                for (int index = list.Count - 1; index >= 0; index--)
                 {
+                    var pt = list[index];
                     float dx = pt.X - cx, dy = pt.Y - cy, dz = pt.Z - cz;
                     bool stale = Server.CurrentTime - pt.RecordedAt > 3f;
                     bool sourceMoved = dx * dx + dy * dy + dz * dz > infoR2;
@@ -1089,8 +1427,9 @@ public class NadeSystemPlugin : BasePlugin
                         || ((pt.X - listenerOrigin.X) * (pt.X - listenerOrigin.X)
                             + (pt.Y - listenerOrigin.Y) * (pt.Y - listenerOrigin.Y)
                             + (pt.Z - listenerOrigin.Z) * (pt.Z - listenerOrigin.Z) > hearR2);
-                    return stale || sourceMoved || listenerMoved;
-                });
+                    if (stale || sourceMoved || listenerMoved)
+                        list.RemoveAt(index);
+                }
                 if (list.Count == 0) _heardSoundPoints.Remove(key);
             }
 
@@ -1106,6 +1445,32 @@ public class NadeSystemPlugin : BasePlugin
                 }
             }
         }
+    }
+
+    private void RemoveSoundEntriesForSource(uint sourceId)
+    {
+        _soundKeyScratch.Clear();
+        foreach (var key in _heardSoundPoints.Keys)
+        {
+            if (key.SourceId == sourceId)
+                _soundKeyScratch.Add(key);
+        }
+
+        foreach (var key in _soundKeyScratch)
+            _heardSoundPoints.Remove(key);
+    }
+
+    private void RemoveSoundEntriesForPlayer(uint playerId)
+    {
+        _soundKeyScratch.Clear();
+        foreach (var key in _heardSoundPoints.Keys)
+        {
+            if (key.ListenerId == playerId || key.SourceId == playerId)
+                _soundKeyScratch.Add(key);
+        }
+
+        foreach (var key in _soundKeyScratch)
+            _heardSoundPoints.Remove(key);
     }
 
     // True if this listener has a retained sound point for this particular
@@ -1223,16 +1588,334 @@ public class NadeSystemPlugin : BasePlugin
     //  Grenade Replay
     // ═══════════════════════════════════════════════════════════
 
-    private void TryReplay(CCSPlayerController bot, GrenadeData g, List<CCSPlayerController> allControllers)
+    private bool HasActiveTacticalPlan()
+        => TryGetCurrentTacticalPlan(out var plan)
+            && string.Equals(plan.Side, "T", StringComparison.OrdinalIgnoreCase);
+
+    private bool TryGetCurrentTacticalPlan(out CompetitiveRoundPlanSnapshot plan)
     {
-        if (_botNadesMode == "off") return;
+        plan = null!;
+        if (_tacticalPlans is null)
+            return false;
+
+        int roundKey = CurrentTacticalRoundKey();
+        if (_cachedTacticalRoundKey != roundKey)
+        {
+            _cachedTacticalRoundKey = roundKey;
+            _cachedTacticalPlan = null;
+            _nextTacticalPlanRefreshAt = 0f;
+        }
+
+        if (Server.CurrentTime >= _nextTacticalPlanRefreshAt)
+        {
+            var previousPlan = _cachedTacticalPlan;
+            _tacticalPlans.TryGetRoundPlan(roundKey, out var refreshedPlan);
+            _cachedTacticalPlan = refreshedPlan;
+            if (!string.Equals(
+                    previousPlan?.PlanId,
+                    refreshedPlan?.PlanId,
+                    StringComparison.Ordinal)
+                || previousPlan?.Version != refreshedPlan?.Version)
+            {
+                RebuildTacticalRequestIndex(refreshedPlan);
+            }
+            _nextTacticalPlanRefreshAt = Server.CurrentTime + 0.25f;
+        }
+
+        if (_cachedTacticalPlan is null)
+            return false;
+        plan = _cachedTacticalPlan;
+        return true;
+    }
+
+    private void RebuildTacticalRequestIndex(
+        CompetitiveRoundPlanSnapshot? plan)
+    {
+        _tacticalRequestsBySlot.Clear();
+        if (plan is null)
+            return;
+
+        var grouped = new Dictionary<int, List<TacticalUtilityRequestSnapshot>>();
+        foreach (var request in plan.UtilityRequests)
+        {
+            if (!request.Required)
+                continue;
+
+            if (!grouped.TryGetValue(request.Slot, out var requests))
+            {
+                requests = new List<TacticalUtilityRequestSnapshot>();
+                grouped[request.Slot] = requests;
+            }
+
+            requests.Add(request);
+        }
+
+        foreach (var entry in grouped)
+            _tacticalRequestsBySlot[entry.Key] = entry.Value.ToArray();
+    }
+
+    private void TryRunTacticalUtilityRequests(
+        CCSPlayerController bot,
+        List<CCSPlayerController> allControllers,
+        int roundKey,
+        TacticalPlanStage currentStage)
+    {
+        if (_tacticalPlans is null
+            || _pendingTacticalRequests.ContainsKey((int)bot.Index)
+            || bot.PlayerPawn?.Value?.AbsOrigin is not { } origin)
+            return;
+
+        if (!_tacticalRequestsBySlot.TryGetValue(
+                (int)bot.Index,
+                out var requests))
+            return;
+
+        foreach (var request in requests)
+        {
+            if (!Enum.TryParse<TacticalPlanStage>(
+                    request.Stage,
+                    ignoreCase: true,
+                    out var requestStage)
+                || currentStage != requestStage)
+            {
+                continue;
+            }
+
+            var key = (
+                Type: NormalizeTacticalUtility(request.UtilityType),
+                Site: NormalizeTacticalSite(request.TargetSite));
+            _tacticalLineupIndex.TryGetValue(key, out var candidates);
+            GrenadeData? lineup = null;
+            float bestDistance = float.MaxValue;
+            if (candidates is not null)
+            {
+                _performance.Increment(
+                    PerformanceCounter.NadeCandidates,
+                    candidates.Length);
+                foreach (var entry in candidates)
+                {
+                    if (IsOnCooldown(entry.Id))
+                        continue;
+                    float distance = DistanceSquared(
+                        origin.X,
+                        origin.Y,
+                        origin.Z,
+                        entry.ProjectilePosition.X,
+                        entry.ProjectilePosition.Y,
+                        entry.ProjectilePosition.Z);
+                    if (distance >= bestDistance)
+                        continue;
+                    bestDistance = distance;
+                    lineup = entry;
+                }
+            }
+            if (lineup is null)
+            {
+                if (candidates is null || candidates.Length == 0)
+                {
+                    _tacticalPlans.ReportUtilityResult(new TacticalUtilityResult(
+                        roundKey,
+                        request.RequestId,
+                        (int)bot.Index,
+                        TacticalUtilityOutcome.Failed,
+                        "no-lineup-for-site"));
+                }
+                continue;
+            }
+
+            if (!TacticalUtilityExecutionPolicy.CanClaim(
+                    currentStage,
+                    requestStage,
+                    MathF.Sqrt(bestDistance))
+                || !_tacticalPlans.TryClaimUtilityRequest(
+                    request.RequestId,
+                    (int)bot.Index))
+            {
+                continue;
+            }
+
+            _pendingTacticalRequests[(int)bot.Index] = request.RequestId;
+            _pendingTacticalRequestStartedAt[(int)bot.Index] = Server.CurrentTime;
+            long executionStartedAt = _performance.Start();
+            bool replayed = TryReplay(
+                    bot,
+                    lineup,
+                    allControllers,
+                    request.RequestId);
+            _performance.Stop(
+                PerformancePhase.NadeExecution,
+                ResolvePerformanceWindow(),
+                executionStartedAt);
+            if (replayed)
+            {
+                _tacticalPlans.ReportUtilityResult(new TacticalUtilityResult(
+                    roundKey,
+                    request.RequestId,
+                    (int)bot.Index,
+                    TacticalUtilityOutcome.Issued,
+                    "lineup-issued"));
+            }
+            else
+            {
+                _pendingTacticalRequests.Remove((int)bot.Index);
+                _pendingTacticalRequestStartedAt.Remove((int)bot.Index);
+                _tacticalPlans.ReportUtilityResult(new TacticalUtilityResult(
+                    roundKey,
+                    request.RequestId,
+                    (int)bot.Index,
+                    TacticalUtilityOutcome.Failed,
+                    "inventory-or-trajectory-rejected"));
+            }
+            break;
+        }
+    }
+
+    private int CurrentTacticalRoundKey()
+    {
+        if (_cachedTacticalRoundKey >= 0)
+            return _cachedTacticalRoundKey;
+
+        try
+        {
+            _cachedTacticalRoundKey = Utilities
+                .FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules")
+                .FirstOrDefault()?.GameRules?.TotalRoundsPlayed ?? 0;
+        }
+        catch
+        {
+            _cachedTacticalRoundKey = 0;
+        }
+
+        return _cachedTacticalRoundKey;
+    }
+
+    private string ResolveLineupSite(GrenadeData entry)
+    {
+        if (_lineupSiteById.TryGetValue(entry.Id, out var indexedSite))
+            return indexedSite;
+        return string.Empty;
+    }
+
+    private void RebuildLineupSiteIndex()
+    {
+        var targets = new List<(string Site, Vector Origin)>();
+        foreach (var target in Utilities
+                     .FindAllEntitiesByDesignerName<CBombTarget>("func_bomb_target"))
+        {
+            if (target.IsValid && target.AbsOrigin is { } origin)
+                targets.Add((target.IsBombSiteB ? "B" : "A", origin));
+        }
+        _lineupSiteById.Clear();
+        if (targets.Count == 0)
+            return;
+        foreach (var entry in _mapNades)
+            _lineupSiteById[entry.Id] = FindNearestBombSite(targets, entry.LandingPosition);
+    }
+
+    private static string FindNearestBombSite(
+        IReadOnlyList<(string Site, Vector Origin)> targets,
+        Vec3 landing)
+    {
+        string nearestSite = string.Empty;
+        float nearestDistance = float.MaxValue;
+        foreach (var target in targets)
+        {
+            float distance = DistanceSquared(
+                target.Origin.X,
+                target.Origin.Y,
+                target.Origin.Z,
+                landing.X,
+                landing.Y,
+                landing.Z);
+            if (distance >= nearestDistance)
+                continue;
+
+            nearestDistance = distance;
+            nearestSite = target.Site;
+        }
+
+        return nearestSite;
+    }
+
+    private void RebuildTacticalLineupIndex()
+    {
+        _tacticalLineupIndex.Clear();
+        var grouped = new Dictionary<(string Type, string Site), List<GrenadeData>>();
+        foreach (var entry in _mapNades)
+        {
+            string site = ResolveLineupSite(entry);
+            if (site.Length == 0)
+                continue;
+
+            var key = (
+                Type: NormalizeTacticalUtility(entry.GrenadeType),
+                Site: site);
+            if (!grouped.TryGetValue(key, out var candidates))
+            {
+                candidates = new List<GrenadeData>();
+                grouped[key] = candidates;
+            }
+            candidates.Add(entry);
+        }
+
+        foreach (var entry in grouped)
+            _tacticalLineupIndex[entry.Key] = entry.Value.ToArray();
+    }
+
+    private static string NormalizeTacticalUtility(string? type)
+        => type?.ToLowerInvariant() switch
+        {
+            "fire" or "molotov" or "incendiary" or "incgrenade" => "FIRE",
+            "flash" or "flashbang" => "FLASH",
+            "he" or "grenade" or "hegrenade" => "HE",
+            "smoke" or "smokegrenade" => "SMOKE",
+            _ => type?.ToUpperInvariant() ?? string.Empty,
+        };
+
+    private static string NormalizeTacticalSite(string? site)
+        => site?.ToUpperInvariant() switch
+        {
+            "A" => "A",
+            "B" => "B",
+            _ => string.Empty,
+        };
+
+    private static TacticalPlanStage ParseTacticalPlanStage(string? stage)
+        => Enum.TryParse<TacticalPlanStage>(
+            stage,
+            ignoreCase: true,
+            out var parsed)
+            ? parsed
+            : TacticalPlanStage.Stage;
+
+    private static float DistanceSquared(
+        float ax,
+        float ay,
+        float az,
+        float bx,
+        float by,
+        float bz)
+    {
+        float dx = ax - bx;
+        float dy = ay - by;
+        float dz = az - bz;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private bool TryReplay(
+        CCSPlayerController bot,
+        GrenadeData g,
+        List<CCSPlayerController> allControllers,
+        string? tacticalRequestId = null)
+    {
+        if (_botNadesMode == "off") return false;
         // In case the bot has been taken over
         bool isTakenOver = bot.HasBeenControlledByPlayerThisRound;
-        if (isTakenOver) return;
+        if (isTakenOver) return false;
 
         if (GrenadeExecutionPolicy.Resolve(_profile, RealThrowApiAvailable).Route
             == GrenadeExecutionRoute.Cancel)
-            return;
+            return false;
 
         var gtype = g.GrenadeType; // lowercase since LoadDb
 
@@ -1252,14 +1935,14 @@ public class NadeSystemPlugin : BasePlugin
             if (gtype is "flash" or "he" or "molotov")
             {
                 int OptionalTotal = teamCount.Flash + teamCount.HE + teamCount.Molotov;
-                if (OptionalTotal >= 3 * teamSize) return;
+                if (OptionalTotal >= 3 * teamSize) return false;
             }
 
             if (gtype == "flash")
             {
                 var cv  = ConVar.Find("ammo_grenade_limit_flashbang");
                 int max = (cv?.GetPrimitiveValue<int>() ?? 2) * teamSize;
-                if (teamCount.Flash >= max) return;
+                if (teamCount.Flash >= max) return false;
             }
             else
             {
@@ -1270,7 +1953,7 @@ public class NadeSystemPlugin : BasePlugin
                     "molotov" => teamCount.Molotov,
                     _         => 99,
                 };
-                if (used >= teamSize) return;
+                if (used >= teamSize) return false;
             }
         }
         // The only two differences between more and normal modes are the round limit and the early smoke limit
@@ -1281,7 +1964,7 @@ public class NadeSystemPlugin : BasePlugin
 
         // BotBuy owns the cash transaction. NadeSystem only consumes the
         // utility item that BotBuy placed in the bot's inventory.
-        if (!TryPrepareUtility(bot, gtype, UtilitySource.LineupThrow)) return;
+        if (!TryPrepareUtility(bot, gtype, UtilitySource.LineupThrow)) return false;
 
         _replayBots.Add((uint)bot.Index);
         RegisterCooldown(g.Id, gtype);
@@ -1298,6 +1981,23 @@ public class NadeSystemPlugin : BasePlugin
             g,
             (spawned, allowPhysicalRestore) =>
             {
+                if (tacticalRequestId is not null)
+                {
+                    _pendingTacticalRequests.Remove((int)bot.Index);
+                    _pendingTacticalRequestStartedAt.Remove((int)bot.Index);
+                    bool wasTimedOut = _timedOutTacticalRequests.Remove(tacticalRequestId);
+                    if (!wasTimedOut)
+                    {
+                        _tacticalPlans?.ReportUtilityResult(new TacticalUtilityResult(
+                            CurrentTacticalRoundKey(),
+                            tacticalRequestId,
+                            (int)bot.Index,
+                            spawned
+                                ? TacticalUtilityOutcome.Confirmed
+                                : TacticalUtilityOutcome.Failed,
+                            spawned ? "grenade-thrown" : "throw-failed"));
+                    }
+                }
                 if (spawned) return;
                 RefundUtility(
                     bot,
@@ -1316,6 +2016,7 @@ public class NadeSystemPlugin : BasePlugin
 
         // Allow bot to throw another grenade after this window
         AddTimer(1f, () => _replayBots.Remove((uint)bot.Index));
+        return true;
     }
 
     private void SpawnProjectile(
@@ -1621,6 +2322,34 @@ public class NadeSystemPlugin : BasePlugin
 
     private bool IsOnCooldown(string id)
         => _cooldowns.Any(c => c.GrenadeId == id && c.ExpiresAt > Server.CurrentTime);
+
+    private bool IsActiveSmokeNear(
+        float x,
+        float y,
+        float z,
+        float radius)
+    {
+        float now = Server.CurrentTime;
+        float radiusSquared = radius * radius;
+        foreach (var cooldown in _cooldowns)
+        {
+            if (cooldown.ExpiresAt <= now
+                || !_mapNadeById.TryGetValue(cooldown.GrenadeId, out var smoke)
+                || !string.Equals(
+                    smoke.GrenadeType,
+                    "smoke",
+                    StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            float dx = x - smoke.LandingPosition.X;
+            float dy = y - smoke.LandingPosition.Y;
+            float dz = z - smoke.LandingPosition.Z;
+            if (dx * dx + dy * dy + dz * dz < radiusSquared)
+                return true;
+        }
+
+        return false;
+    }
 
     private void RegisterCooldown(string id, string gtype)
     {
@@ -1931,6 +2660,8 @@ public class NadeSystemPlugin : BasePlugin
 
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
+        _performance.Reset();
+        _performance.CaptureRoundStartMemory();
         _roundOver  = false;
         _freezeEndTime = 0f;
         _roundCountByTeam.Clear();
@@ -1942,6 +2673,16 @@ public class NadeSystemPlugin : BasePlugin
         CancelPendingRealThrows();
         _utilityLedgers.Clear();
         _defuseSmokeUsers.Clear();
+        _pendingTacticalRequests.Clear();
+        _pendingTacticalRequestStartedAt.Clear();
+        _timedOutTacticalRequests.Clear();
+        _cachedTacticalRoundKey = -1;
+        _cachedTacticalPlan = null;
+        _nextTacticalPlanRefreshAt = 0f;
+        _tacticalRequestsBySlot.Clear();
+        _cachedGameRulesProxy = null;
+        _nextGameRulesRefreshAt = 0f;
+        _probFailCooldown.Clear();
         _defuseFlashUsed  = false;
         _plantSmokeUsed   = false;
         _botMolotovDmgStart.Clear();
@@ -1954,16 +2695,25 @@ public class NadeSystemPlugin : BasePlugin
         // Information System
         _heardSoundPoints.Clear();
         _botLastFireTime.Clear();
-        foreach (var key in _probFailCooldown.Where(kv => kv.Value <= Server.CurrentTime).Select(kv => kv.Key).ToList())
-            _probFailCooldown.Remove(key);
         return HookResult.Continue;
     }
 
     private HookResult OnFreezeEnd(EventRoundFreezeEnd @event, GameEventInfo info)
     {
+        long startedAt = _performance.Start();
+        _performance.CaptureMemorySnapshot(PerformanceWindow.Startup);
         _freezeEndTime = Server.CurrentTime;
+        if (_lineupSiteById.Count == 0)
+        {
+            _lineupCatalog.Rebuild(Server.MapName, _mapNades);
+            RebuildLineupSiteIndex();
+        }
+        if (_tacticalLineupIndex.Count == 0)
+            RebuildTacticalLineupIndex();
+        _nextTacticalPlanRefreshAt = 0f;
         _roundState.SetPhase(RoundPhase.Live);
         AddTimer(0.6f, SynchronizeUtilityLedgers);
+        _performance.Stop(PerformancePhase.RoundFreezeEnd, startedAt);
         return HookResult.Continue;
     }
 
@@ -1996,8 +2746,14 @@ public class NadeSystemPlugin : BasePlugin
 
     private HookResult OnRoundEnd(EventRoundEnd @event, GameEventInfo info)
     {
+        _performance.CaptureMemorySnapshot(PerformanceWindow.Endgame);
         _roundOver = true;
         _roundState.SetPhase(RoundPhase.RoundEnd);
+        _pendingTacticalRequests.Clear();
+        _pendingTacticalRequestStartedAt.Clear();
+        _tacticalRequestsBySlot.Clear();
+        _cachedTacticalPlan = null;
+        _controllerScratch.Clear();
         return HookResult.Continue;
     }
 
@@ -2006,13 +2762,7 @@ public class NadeSystemPlugin : BasePlugin
     {
         var player = @event.Userid;
         if (player != null && player.IsValid)
-        {
-            uint id = (uint)player.Index;
-            foreach (var key in _heardSoundPoints.Keys
-                .Where(key => key.ListenerId == id || key.SourceId == id)
-                .ToList())
-                _heardSoundPoints.Remove(key);
-        }
+            RemoveSoundEntriesForPlayer((uint)player.Index);
         return HookResult.Continue;
     }
 
@@ -2139,10 +2889,12 @@ public class NadeSystemPlugin : BasePlugin
                 foreach (var cd in _cooldowns)
                 {
                     if (cd.ExpiresAt <= now) continue;
-                    var smokeRecord = _mapNades.FirstOrDefault(d =>
-                        d.Id == cd.GrenadeId &&
-                        string.Equals(d.GrenadeType, "smoke", StringComparison.OrdinalIgnoreCase));
-                    if (smokeRecord == null) continue;
+                    if (!_mapNadeById.TryGetValue(cd.GrenadeId, out var smokeRecord)
+                        || !string.Equals(
+                            smokeRecord.GrenadeType,
+                            "smoke",
+                            StringComparison.OrdinalIgnoreCase))
+                        continue;
                     float sx = smokeRecord.LandingPosition.X;
                     float sy = smokeRecord.LandingPosition.Y;
                     float sz = smokeRecord.LandingPosition.Z;
@@ -2185,12 +2937,7 @@ public class NadeSystemPlugin : BasePlugin
             float lx = g.LandingPosition.X, ly = g.LandingPosition.Y, lz = g.LandingPosition.Z;
 
             //  Smoke Overlap Check < 250u
-            bool tooClose = _cooldowns
-                .Where(c => c.ExpiresAt > Server.CurrentTime)
-                .Select(c => _mapNades.FirstOrDefault(d => d.Id == c.GrenadeId))
-                .Any(d => d != null
-                       && string.Equals(d.GrenadeType, "smoke", StringComparison.OrdinalIgnoreCase)
-                       && Dist3D(lx, ly, lz, d.LandingPosition.X, d.LandingPosition.Y, d.LandingPosition.Z) < 250f);
+            bool tooClose = IsActiveSmokeNear(lx, ly, lz, 250f);
             if (tooClose) return false;
 
             // Normal mode: Don't throw all your smoke right after freezeend
@@ -2887,10 +3634,44 @@ public class NadeSystemPlugin : BasePlugin
     //  Tick
     // ═══════════════════════════════════════════════════════════
 
+    private void ExpirePendingTacticalRequests()
+    {
+        if (_pendingTacticalRequests.Count == 0)
+            return;
+
+        float now = Server.CurrentTime;
+        _expiredTacticalBotScratch.Clear();
+        foreach (var pending in _pendingTacticalRequestStartedAt)
+        {
+            if (!TacticalUtilityTimeoutPolicy.ShouldExpire(now, pending.Value)
+                || !_pendingTacticalRequests.ContainsKey(pending.Key))
+                continue;
+
+            _expiredTacticalBotScratch.Add(pending.Key);
+        }
+
+        foreach (int botIndex in _expiredTacticalBotScratch)
+        {
+            if (!_pendingTacticalRequests.TryGetValue(botIndex, out var requestId))
+                continue;
+
+            _pendingTacticalRequests.Remove(botIndex);
+            _pendingTacticalRequestStartedAt.Remove(botIndex);
+            _timedOutTacticalRequests.Add(requestId);
+            _tacticalPlans?.ReportUtilityResult(new TacticalUtilityResult(
+                CurrentTacticalRoundKey(),
+                requestId,
+                botIndex,
+                TacticalUtilityOutcome.TimedOut,
+                "grenade-thrown-confirmation-timeout"));
+        }
+    }
+
     private void OnTick()
     {
         long tickStartedAt = _performance.Start();
         _tick++;
+        ExpirePendingTacticalRequests();
         // Game events record weapon/jump/grenade sounds immediately. The
         // periodic pass only needs to prune trails and add movement footsteps,
         // so keep that work at 1/4 of the tick rate.
@@ -2898,7 +3679,10 @@ public class NadeSystemPlugin : BasePlugin
         {
             long soundStartedAt = _performance.Start();
             UpdateSoundTrails(recordFootsteps: true);
-            _performance.Stop(PerformancePhase.SoundMaintenance, soundStartedAt);
+            _performance.Stop(
+                PerformancePhase.SoundMaintenance,
+                ResolvePerformanceWindow(),
+                soundStartedAt);
         }
 
         // Lineup proximity is a planning concern, not a per-tick requirement.
@@ -2906,7 +3690,19 @@ public class NadeSystemPlugin : BasePlugin
         // removing repeated entity-table walks from the hot path.
         if (_tick % 8 == 0) CheckBotZones();
         if (_tick % 256 == 0) PruneCooldowns();
-        _performance.Stop(PerformancePhase.NormalTick, tickStartedAt);
+        _performance.Stop(
+            PerformancePhase.NormalTick,
+            ResolvePerformanceWindow(),
+            tickStartedAt);
+    }
+
+    private PerformanceWindow ResolvePerformanceWindow()
+    {
+        if (_roundState.Current.Phase == RoundPhase.Freeze)
+            return PerformanceWindow.FreezeBuy;
+        if (Server.CurrentTime - _freezeEndTime < 2f)
+            return PerformanceWindow.Startup;
+        return PerformanceWindow.Stable;
     }
 
     private static class BotControllerBridge

@@ -18,5 +18,6 @@
 
   <ItemGroup>
     <ProjectReference Include="../../addons/counterstrikesharp/shared/CompetitiveBotCore/CompetitiveBotCore.csproj" />
+    <ProjectReference Include="../../addons/counterstrikesharp/shared/CompetitiveTacticalApi/CompetitiveTacticalApi.csproj" />
   </ItemGroup>
 </Project>

@@ -108,6 +108,7 @@ foreach ($Target in $RayTraceCompileTargets) {
 
 $Projects = @(
     "addons/counterstrikesharp/shared/BotControllerApi/BotControllerApi.csproj",
+    "addons/counterstrikesharp/shared/CompetitiveTacticalApi/CompetitiveTacticalApi.csproj",
     "addons/counterstrikesharp/shared/CompetitiveBotCore/CompetitiveBotCore.csproj",
     "addons/counterstrikesharp/plugins/BotControllerImpl/BotControllerImpl.csproj",
     "addons/counterstrikesharp/plugins/BotAI/BotAI.csproj",
@@ -184,6 +185,14 @@ New-Item -ItemType Directory -Path $BotControllerApiDestinationDirectory -Force 
 Copy-IfPresent (Join-Path $BotControllerApiSourceDirectory "BotControllerApi.dll") $BotControllerApiDestinationDirectory
 Copy-IfPresent (Join-Path $BotControllerApiSourceDirectory "BotControllerApi.deps.json") $BotControllerApiDestinationDirectory
 Copy-IfPresent (Join-Path $BotControllerApiSourceDirectory "BotControllerApi.pdb") $BotControllerApiDestinationDirectory
+
+$CompetitiveTacticalApiSourceDirectory = Join-Path $Root "addons/counterstrikesharp/shared/CompetitiveTacticalApi/bin/Release/net10.0"
+$CompetitiveTacticalApiDestinationDirectory = Join-Path $Staging "addons/counterstrikesharp/shared/CompetitiveTacticalApi"
+Require-File (Join-Path $CompetitiveTacticalApiSourceDirectory "CompetitiveTacticalApi.dll")
+New-Item -ItemType Directory -Path $CompetitiveTacticalApiDestinationDirectory -Force | Out-Null
+Copy-IfPresent (Join-Path $CompetitiveTacticalApiSourceDirectory "CompetitiveTacticalApi.dll") $CompetitiveTacticalApiDestinationDirectory
+Copy-IfPresent (Join-Path $CompetitiveTacticalApiSourceDirectory "CompetitiveTacticalApi.deps.json") $CompetitiveTacticalApiDestinationDirectory
+Copy-IfPresent (Join-Path $CompetitiveTacticalApiSourceDirectory "CompetitiveTacticalApi.pdb") $CompetitiveTacticalApiDestinationDirectory
 
 $SourceGrenades = Join-Path $Root "addons/counterstrikesharp/plugins/NadeSystem/grenades"
 $DestinationGrenades = Join-Path $Staging "addons/counterstrikesharp/plugins/NadeSystem/grenades"

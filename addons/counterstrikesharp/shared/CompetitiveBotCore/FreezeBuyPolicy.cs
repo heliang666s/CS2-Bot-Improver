@@ -40,6 +40,18 @@ public static class FreezeBuyPolicy
                 Math.Max(MinimumFreezeSeconds, freezeDurationSeconds)
                     - ExecutionWindowSeconds);
 
+    public static float ObservationAt(
+        float roundStartAt,
+        float freezeDurationSeconds)
+        => roundStartAt + Math.Min(
+            10f,
+            Math.Max(MinimumFreezeSeconds, freezeDurationSeconds));
+
+    public static bool ShouldRefreshObservation(
+        long revision,
+        long previousRevision)
+        => revision != previousRevision;
+
     public static float EndAt(float roundStartAt, float freezeDurationSeconds)
         => roundStartAt + Math.Max(MinimumFreezeSeconds, freezeDurationSeconds);
 
