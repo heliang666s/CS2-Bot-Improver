@@ -760,12 +760,18 @@ public class NadeSystemPlugin : BasePlugin
         bool hasLiveEnemyT  = HasLiveEnemyForTeam((int)CsTeam.Terrorist, allControllers);
         bool hasLiveEnemyCT = HasLiveEnemyForTeam((int)CsTeam.CounterTerrorist, allControllers);
 
-        bool hasTacticalPlan = ProfilePolicy.IsCompetitive(_profile)
-            && TryGetCurrentTacticalPlan(out var tacticalPlan)
+        CompetitiveRoundPlanSnapshot? tacticalPlan = null;
+        bool hasTacticalPlan = false;
+        if (ProfilePolicy.IsCompetitive(_profile)
+            && TryGetCurrentTacticalPlan(out var currentPlan)
             && string.Equals(
-                tacticalPlan.Side,
+                currentPlan.Side,
                 "T",
-                StringComparison.OrdinalIgnoreCase);
+                StringComparison.OrdinalIgnoreCase))
+        {
+            tacticalPlan = currentPlan;
+            hasTacticalPlan = true;
+        }
         int tacticalRoundKey = _cachedTacticalRoundKey;
         TacticalPlanStage tacticalStage = ParseTacticalPlanStage(
             tacticalPlan?.Stage);
