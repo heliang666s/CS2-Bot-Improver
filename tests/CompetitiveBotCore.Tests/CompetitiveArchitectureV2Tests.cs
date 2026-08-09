@@ -103,6 +103,186 @@ public sealed class CompetitiveArchitectureV2Tests
         {
             ArmorLevel = ArmorLevel.None,
         }));
+
+        Assert.True(BuyPlanner.IsCombatLegal(plan with
+        {
+            ArmorLevel = ArmorLevel.None,
+            PrimaryWeapon = "weapon_awp",
+        }));
+    }
+
+    [Fact]
+    public void FullArmorGalilBeatsHalfArmorAkInTeamPlanning()
+    {
+        var candidates = new PlayerBuyPlan[]
+        {
+            new(
+                BuyPhase.FullBuy,
+                ArmorLevel.Full,
+                "weapon_galilar",
+                null,
+                BuysHelmet: true,
+                BuysDefuser: false,
+                Utility: Array.Empty<string>(),
+                EstimatedCost: 2800)
+            {
+                Tier = BuyPlanner.GetTier(
+                    ArmorLevel.Full,
+                    "weapon_galilar",
+                    null),
+            },
+            new(
+                BuyPhase.FullBuy,
+                ArmorLevel.Half,
+                "weapon_ak47",
+                null,
+                BuysHelmet: false,
+                BuysDefuser: false,
+                Utility: Array.Empty<string>(),
+                EstimatedCost: 3350)
+            {
+                Tier = BuyPlanner.GetTier(
+                    ArmorLevel.Half,
+                    "weapon_ak47",
+                    null),
+            },
+        };
+        var members = new[]
+        {
+            new TeamPlanningMember(
+                Slot: 1,
+                IsBot: true,
+                IsAwper: false,
+                Money: 4000,
+                Candidates: candidates,
+                CurrentPrimary: null,
+                SavedTier: 0),
+        };
+
+        var result = BoundedTeamBuyPlanner.Optimize(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            members,
+            currentMinTier: 0,
+            buyMode: TeamBuyMode.Full);
+
+        Assert.Equal("weapon_galilar", result.BotPlans[1].PrimaryWeapon);
+        Assert.Equal(ArmorLevel.Full, result.BotPlans[1].ArmorLevel);
+    }
+
+    [Fact]
+    public void SameBudgetCandidateChainPrefersRifleOverSmg()
+    {
+        var candidates = BuyPlanner.BuildCandidatePlans(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            money: 3000,
+            designatedAwper: false,
+            opponentEcoLikely: false);
+
+        Assert.Contains(candidates, plan => plan.PrimaryWeapon == "weapon_galilar");
+        Assert.Contains(candidates, plan => plan.PrimaryWeapon == "weapon_mac10");
+
+        var result = BoundedTeamBuyPlanner.Optimize(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            [new TeamPlanningMember(
+                Slot: 1,
+                IsBot: true,
+                IsAwper: false,
+                Money: 3000,
+                Candidates: candidates,
+                CurrentPrimary: null,
+                SavedTier: 0)],
+            currentMinTier: 0,
+            buyMode: TeamBuyMode.Full);
+
+        Assert.Equal("weapon_galilar", result.BotPlans[1].PrimaryWeapon);
+    }
+
+    [Fact]
+    public void BudgetConstrainedCandidateChainRetainsLowPricePrimary()
+    {
+        var candidates = BuyPlanner.BuildCandidatePlans(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            money: 1700,
+            designatedAwper: false,
+            opponentEcoLikely: false);
+
+        Assert.Contains(candidates, plan => plan.PrimaryWeapon == "weapon_mac10");
+        Assert.All(candidates, plan => Assert.True(plan.EstimatedCost <= 1700));
+
+        var result = BoundedTeamBuyPlanner.Optimize(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            [new TeamPlanningMember(
+                Slot: 1,
+                IsBot: true,
+                IsAwper: false,
+                Money: 1700,
+                Candidates: candidates,
+                CurrentPrimary: null,
+                SavedTier: 0)],
+            currentMinTier: 0,
+            buyMode: TeamBuyMode.Full);
+
+        Assert.Equal("weapon_mac10", result.BotPlans[1].PrimaryWeapon);
+    }
+
+    [Fact]
+    public void TimeoutFallbackUsesTheSameRifleOrderingAsFrontier()
+    {
+        var candidates = Enumerable.Range(0, 12)
+            .Select(index => new PlayerBuyPlan(
+                BuyPhase.FullBuy,
+                ArmorLevel.Full,
+                index % 2 == 0 ? "weapon_galilar" : "weapon_mac10",
+                null,
+                BuysHelmet: false,
+                BuysDefuser: false,
+                Utility: index % 3 == 0 ? ["smoke", "flash"] : [],
+                EstimatedCost: index % 2 == 0 ? 2800 : 2050)
+            {
+                Tier = index % 2 == 0 ? 8 : 7,
+            })
+            .ToArray();
+        var members = Enumerable.Range(1, 100)
+            .Select(slot => new TeamPlanningMember(
+                Slot: slot,
+                IsBot: true,
+                IsAwper: false,
+                Money: 4000,
+                Candidates: candidates,
+                CurrentPrimary: null,
+                SavedTier: 0))
+            .ToArray();
+
+        var frontier = BoundedTeamBuyPlanner.Optimize(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            members,
+            currentMinTier: 0,
+            options: new BoundedPlannerOptions(
+                MaxCandidatesPerBot: 6,
+                MaxFrontierStates: 256,
+                HardBudgetMilliseconds: 1000),
+            buyMode: TeamBuyMode.Full);
+        var fallback = BoundedTeamBuyPlanner.Optimize(
+            TeamSide.Terrorist,
+            BuyPhase.FullBuy,
+            members,
+            currentMinTier: 0,
+            options: new BoundedPlannerOptions(
+                MaxCandidatesPerBot: 6,
+                MaxFrontierStates: 256,
+                HardBudgetMilliseconds: 1),
+            buyMode: TeamBuyMode.Full);
+
+        Assert.True(fallback.Diagnostics.TimedOut);
+        Assert.Equal(
+            frontier.Plan.BotPlans.OrderBy(entry => entry.Key).Select(entry => entry.Value.PrimaryWeapon),
+            fallback.Plan.BotPlans.OrderBy(entry => entry.Key).Select(entry => entry.Value.PrimaryWeapon));
     }
 
     [Fact]

@@ -1992,8 +1992,10 @@ public static class BuyPlanner
     {
         return GetWeaponTier(primary) switch
         {
-            3 => armor == ArmorLevel.Full ? 9 : 8,
-            2 => armor == ArmorLevel.Full ? 7 : 6,
+            // Keep full armor ahead of the next weapon tier: a full Galil/Famas
+            // is a better competitive package than a half-armor AK/M4.
+            3 => armor == ArmorLevel.Full ? 9 : 7,
+            2 => armor == ArmorLevel.Full ? 8 : 6,
             1 => armor == ArmorLevel.Full ? 5 : 4,
             _ => secondary is not null
                 ? armor == ArmorLevel.Full ? 3 : armor == ArmorLevel.Half ? 2 : 1
@@ -3633,8 +3635,74 @@ public enum TacticalDirective
     Save,
 }
 
+public readonly record struct SmokeVolume(
+    float X,
+    float Y,
+    float Z,
+    float Radius);
+
+public readonly record struct AimPoint(float X, float Y, float Z);
+
+public static class AimJitterPolicy
+{
+    public static AimPoint Apply(
+        float enemyOriginX,
+        float enemyOriginY,
+        AimPoint target,
+        float targetJitterUnits,
+        float burstStability,
+        int jitterSeed)
+    {
+        float dx = target.X - enemyOriginX;
+        float dy = target.Y - enemyOriginY;
+        float length = MathF.Sqrt(dx * dx + dy * dy);
+        if (targetJitterUnits <= 0f || length <= 0.1f)
+            return target;
+
+        float direction = (jitterSeed & 1) == 0 ? 1f : -1f;
+        float stabilityMultiplier = 1f
+            + (1f - burstStability) * 0.5f;
+        float jitter = targetJitterUnits * stabilityMultiplier * direction;
+        return new AimPoint(
+            target.X - dy / length * jitter,
+            target.Y + dx / length * jitter,
+            target.Z + ((jitterSeed % 3) - 1)
+                * targetJitterUnits * 0.35f);
+    }
+}
+
 public static class VisibilityGeometry
 {
+    public static bool SegmentIntersectsAnySmoke(
+        float startX,
+        float startY,
+        float startZ,
+        float endX,
+        float endY,
+        float endZ,
+        IReadOnlyList<SmokeVolume> smokes)
+    {
+        foreach (SmokeVolume smoke in smokes)
+        {
+            if (SegmentIntersectsSphere(
+                    startX,
+                    startY,
+                    startZ,
+                    endX,
+                    endY,
+                    endZ,
+                    smoke.X,
+                    smoke.Y,
+                    smoke.Z,
+                    smoke.Radius))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public static bool SegmentIntersectsSphere(
         float startX,
         float startY,

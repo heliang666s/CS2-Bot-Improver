@@ -86,4 +86,50 @@ public sealed class TacticalCoreTests
             500f, 250f, 0f,
             120f));
     }
+
+    [Fact]
+    public void SmokeVisibilityChecksTheActualAimPointNotOnlyEnemyCenter()
+    {
+        var smokes = new[]
+        {
+            new SmokeVolume(500f, 0f, 64f, 120f),
+        };
+
+        Assert.True(VisibilityGeometry.SegmentIntersectsAnySmoke(
+            0f, 0f, 64f,
+            1000f, 0f, 64f,
+            smokes));
+        Assert.False(VisibilityGeometry.SegmentIntersectsAnySmoke(
+            0f, 0f, 200f,
+            1000f, 0f, 200f,
+            smokes));
+    }
+
+    [Fact]
+    public void FinalPistolJitterPointIsRecheckedAgainstSmoke()
+    {
+        var smokes = new[]
+        {
+            new SmokeVolume(500f, 100f, 30f, 20f),
+        };
+        var original = new AimPoint(1040f, 0f, 64f);
+
+        Assert.False(VisibilityGeometry.SegmentIntersectsAnySmoke(
+            0f, 0f, 64f,
+            original.X, original.Y, original.Z,
+            smokes));
+
+        var jittered = AimJitterPolicy.Apply(
+            enemyOriginX: 1000f,
+            enemyOriginY: 0f,
+            target: original,
+            targetJitterUnits: 200f,
+            burstStability: 1f,
+            jitterSeed: 0);
+
+        Assert.True(VisibilityGeometry.SegmentIntersectsAnySmoke(
+            0f, 0f, 64f,
+            jittered.X, jittered.Y, jittered.Z,
+            smokes));
+    }
 }

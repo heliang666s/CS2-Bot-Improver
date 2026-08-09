@@ -1055,8 +1055,8 @@ public sealed class BuyPlannerTests
 
         Assert.DoesNotContain(10, plan.BotPlans.Keys);
         Assert.Equal(5, plan.HumanObservations[10].Tier);
-        Assert.InRange(plan.HumanTierPenalty, 0, 1);
-        Assert.InRange(plan.BotPlans[11].Tier, 5, 7);
+        Assert.InRange(plan.HumanTierPenalty, 0, 2);
+        Assert.InRange(plan.BotPlans[11].Tier, 5, 8);
     }
 
     [Fact]

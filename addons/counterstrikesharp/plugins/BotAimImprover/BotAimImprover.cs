@@ -18,6 +18,8 @@ namespace BotAimImprover;
 [MinimumApiVersion(305)]
 public class BotAimImprover : BasePlugin
 {
+    private const float SmokeBlockRadius = 160f;
+
     public override string ModuleName => "BotAimImprover";
     public override string ModuleVersion => "2.1.3";
     public override string ModuleAuthor => "ed0ard & htfy96 & XBribo";
@@ -143,6 +145,7 @@ public class BotAimImprover : BasePlugin
     private AimDifficultyTier _aimDifficulty = AimDifficultyTier.Medium;
     private bool _isPistolRound;
     private readonly IVisibilityPolicy _visibilityPolicy = new CompetitiveVisibilityPolicy();
+    private IReadOnlyList<SmokeVolume> _activeSmokeVolumes = Array.Empty<SmokeVolume>();
     private static readonly PluginCapability<CRayTraceInterface> _rayTraceCapability =
         new("raytrace:craytraceinterface");
 
@@ -213,9 +216,12 @@ public class BotAimImprover : BasePlugin
         {
             _botToControllerUserId.Clear();
             _pistolAimReadyAt.Clear();
+            _activeSmokeVolumes = Array.Empty<SmokeVolume>();
             _isPistolRound = ResolvePistolRound();
             return HookResult.Continue;
         });
+
+        RegisterListener<Listeners.OnTick>(RefreshActiveSmokeVolumes);
 
         RegisterEventHandler<EventPlayerDisconnect>((ev, _) =>
         {
@@ -324,17 +330,15 @@ public class BotAimImprover : BasePlugin
             if (enemyOrigin == null)
                 return HookResult.Continue;
 
-            bool smokeObscured = _profile == BotMatchProfile.Competitive
-                && IsSmokeObscured(
-                    botEye,
-                    new Vector(enemyOrigin.X, enemyOrigin.Y, enemyOrigin.Z + 64f));
             if (!_visibilityPolicy.CanOverrideAim(
                     rayTraceAvailable: true,
                     nativeTargetVisible: true,
-                    smokeObscured: smokeObscured,
+                    smokeObscured: false,
                     infoIsFresh: true,
                     isHistoricalPosition: false))
                 return HookResult.Continue;
+
+            IReadOnlyList<SmokeVolume> smokeVolumes = _activeSmokeVolumes;
 
             string? wpn = botController.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value?.DesignerName;
 
@@ -391,7 +395,15 @@ public class BotAimImprover : BasePlugin
             {
                 if (!TryComputePartPos(enemyPawn, idx, out float x, out float y, out float z))
                     continue;
-                if (!PointVisibleFromEye(botEye, x, y, z))
+                if (!PointVisibleFromEye(botEye, x, y, z)
+                    || VisibilityGeometry.SegmentIntersectsAnySmoke(
+                        botEye.X,
+                        botEye.Y,
+                        botEye.Z,
+                        x,
+                        y,
+                        z,
+                        smokeVolumes))
                     continue;
                 chosenIdx = idx;
                 rx = x; ry = y; rz = z;
@@ -402,22 +414,30 @@ public class BotAimImprover : BasePlugin
 
             if (competitivePistolRound && pistolAimAdjustment.TargetJitterUnits > 0f)
             {
-                float dx = rx - enemyOrigin.X;
-                float dy = ry - enemyOrigin.Y;
-                float length = MathF.Sqrt(dx * dx + dy * dy);
-                if (length > 0.1f)
-                {
-                    float direction = (pistolAimAdjustment.JitterSeed & 1) == 0 ? 1f : -1f;
-                    float stabilityMultiplier = 1f
-                        + (1f - pistolAimAdjustment.BurstStability) * 0.5f;
-                    float jitter = pistolAimAdjustment.TargetJitterUnits
-                        * stabilityMultiplier * direction;
-                    rx += -dy / length * jitter;
-                    ry += dx / length * jitter;
-                    rz += ((pistolAimAdjustment.JitterSeed % 3) - 1)
-                        * pistolAimAdjustment.TargetJitterUnits * 0.35f;
-                }
+                var jittered = AimJitterPolicy.Apply(
+                    enemyOrigin.X,
+                    enemyOrigin.Y,
+                    new CompetitiveBotCore.AimPoint(rx, ry, rz),
+                    pistolAimAdjustment.TargetJitterUnits,
+                    pistolAimAdjustment.BurstStability,
+                    pistolAimAdjustment.JitterSeed);
+                rx = jittered.X;
+                ry = jittered.Y;
+                rz = jittered.Z;
             }
+
+            // Jitter changes the final line of sight. Revalidate the exact
+            // point after applying it before replacing the native target.
+            if (!PointVisibleFromEye(botEye, rx, ry, rz)
+                || VisibilityGeometry.SegmentIntersectsAnySmoke(
+                    botEye.X,
+                    botEye.Y,
+                    botEye.Z,
+                    rx,
+                    ry,
+                    rz,
+                    smokeVolumes))
+                return HookResult.Continue;
 
             // 6) Overwrite only m_targetSpot.xyz.
             unsafe
@@ -491,8 +511,23 @@ public class BotAimImprover : BasePlugin
         return true;
     }
 
-    private static bool IsSmokeObscured(Vector eye, Vector target)
+    private void RefreshActiveSmokeVolumes()
     {
+        try
+        {
+            _activeSmokeVolumes = _profile == BotMatchProfile.Competitive
+                ? GetActiveSmokeVolumes()
+                : Array.Empty<SmokeVolume>();
+        }
+        catch
+        {
+            _activeSmokeVolumes = Array.Empty<SmokeVolume>();
+        }
+    }
+
+    private static IReadOnlyList<SmokeVolume> GetActiveSmokeVolumes()
+    {
+        var volumes = new List<SmokeVolume>();
         foreach (var smoke in Utilities
                      .FindAllEntitiesByDesignerName<CSmokeGrenadeProjectile>(
                          "smokegrenade_projectile"))
@@ -504,15 +539,14 @@ public class BotAimImprover : BasePlugin
             if (center is null)
                 continue;
 
-            if (VisibilityGeometry.SegmentIntersectsSphere(
-                    eye.X, eye.Y, eye.Z,
-                    target.X, target.Y, target.Z,
-                    center.X, center.Y, center.Z,
-                    radius: 160f))
-                return true;
+            volumes.Add(new SmokeVolume(
+                center.X,
+                center.Y,
+                center.Z,
+                SmokeBlockRadius));
         }
 
-        return false;
+        return volumes;
     }
 
     private static bool ResolvePistolRound()

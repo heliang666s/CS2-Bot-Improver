@@ -32,6 +32,7 @@ public class BotState : BasePlugin
     private const int KnifeDefinitionIndex = 9001;
     private const float ExpandedSmokeLength = 500f;
     private const float NormalSmokeLength = 50f;
+    private const float CompetitiveSmokeLength = 0f;
     private const float SmokeRestoreDelay = 1.0f;
     private const float TacticalContactHearingRange = 3000f;
 
@@ -200,8 +201,10 @@ public class BotState : BasePlugin
             Server.GameDirectory,
             ConVar.Find("bot_difficulty")?.GetPrimitiveValue<int>() ?? 2);
         _smokeVisibilityCvar = ConVar.Find("bot_max_visible_smoke_length");
+        ApplySmokeVisibilityPolicy();
         RegisterListener<Listeners.OnMapStart>(_ =>
         {
+            ApplySmokeVisibilityPolicy();
             _terroristScore = 0;
             _counterTerroristScore = 0;
             _matchState.ResetForMapOrHotReload();
@@ -646,6 +649,12 @@ public class BotState : BasePlugin
         else
             Server.ExecuteCommand($"bot_max_visible_smoke_length {value}");
     }
+
+    private void ApplySmokeVisibilityPolicy()
+        => SetSmokeVisibility(IsCompetitiveProfile()
+            ? CompetitiveSmokeLength
+            : NormalSmokeLength);
+
     //---------------------------------------------------------------------------------------
     private HookResult OnPlayerBlind(EventPlayerBlind @event, GameEventInfo info)
     {
@@ -3406,6 +3415,7 @@ public class BotState : BasePlugin
     // Clears per-round state and releases elimination knife locks
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
+        ApplySmokeVisibilityPolicy();
         ClearSaveMode();
         _ctGambleTargets.Clear();
         _ctEcoTargets.Clear();

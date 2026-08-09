@@ -1560,10 +1560,10 @@ public static class BoundedTeamBuyPlanner
                 usefulWeight: 10,
                 excessPenalty: 2);
         int spreadPenalty = Math.Max(0, state.MaxTier - state.MinTier) * 14;
-        int limitedSmgPenalty = state.LimitedSmgCount * 8;
+        int limitedSmgPenalty = state.LimitedSmgCount * 24;
         return state.MinTier * 1000
             + state.TierSum * 100
-            + state.PreferredRifleCount * 28
+            + state.PreferredRifleCount * 40
             + state.AwpCount * 18
             + utility
             + typedUtility
@@ -1827,18 +1827,20 @@ public static class BoundedTeamBuyPlanner
     {
         int weaponScore = plan.PrimaryWeapon switch
         {
-            "weapon_ak47" or "weapon_m4a1" or "weapon_m4a1_silencer" => 80,
-            "weapon_awp" => designatedAwper ? 86 : 72,
-            "weapon_aug" or "weapon_sg556" => 70,
-            "weapon_galilar" or "weapon_famas" => 48,
-            "weapon_mp9" or "weapon_mac10" => 30,
+            "weapon_ak47" or "weapon_m4a1" or "weapon_m4a1_silencer" => 100,
+            "weapon_awp" => designatedAwper ? 120 : 95,
+            "weapon_aug" or "weapon_sg556" => 96,
+            "weapon_galilar" or "weapon_famas" => 82,
+            "weapon_ssg08" or "weapon_scar20" or "weapon_g3sg1" => 70,
+            "weapon_mp9" or "weapon_mac10" => 35,
+            _ when EquipmentEconomy.IsLowTierPrimary(plan.PrimaryWeapon) => 35,
             null => 0,
             _ => 24,
         };
         int armorScore = plan.ArmorLevel switch
         {
-            ArmorLevel.Full => 24,
-            ArmorLevel.Half => 12,
+            ArmorLevel.Full => 50,
+            ArmorLevel.Half => 20,
             _ => 0,
         };
         int structureScore = (plan.BuysHelmet ? 4 : 0)
