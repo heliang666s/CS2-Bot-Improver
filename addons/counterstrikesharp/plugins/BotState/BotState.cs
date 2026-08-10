@@ -23,6 +23,7 @@ public class BotState : BasePlugin
 
     private const float ExpandedValue = 500f;
     private const float NormalValue = 50f;
+    private const float CompetitiveSmokeValue = 0f;
     private const float RestoreDelay = 1.0f;
     private const int KnifeDefinitionIndex = 9001;
     private const float ReloadInterruptCooldown = 0.75f;
@@ -93,6 +94,8 @@ public class BotState : BasePlugin
     public override void Load(bool hotReload)
     {
         _smokeConVar = ConVar.Find("bot_max_visible_smoke_length");
+        ApplySmokeVisibilityPolicy();
+        RegisterListener<Listeners.OnMapStart>(_ => ApplySmokeVisibilityPolicy());
         RegisterEventHandler<EventRoundStart>(OnRoundStart);
         RegisterEventHandler<EventPlayerHurt>(OnPlayerHurt);
         RegisterEventHandler<EventPlayerSpawn>(OnPlayerSpawn);
@@ -164,6 +167,9 @@ public class BotState : BasePlugin
     //---------------------------------------------------------------------------------------
     private HookResult OnPlayerHurt(EventPlayerHurt @event, GameEventInfo _)
     {
+        if (IsCompetitiveMode())
+            return HookResult.Continue;
+
         try
         {
             var victim = @event.Userid;
@@ -190,6 +196,26 @@ public class BotState : BasePlugin
             _smokeConVar.SetValue(value);
         else
             Server.ExecuteCommand($"bot_max_visible_smoke_length {value}");
+    }
+
+    private void ApplySmokeVisibilityPolicy()
+        => SetSmokeLength(IsCompetitiveMode()
+            ? CompetitiveSmokeValue
+            : NormalValue);
+
+    private static bool IsCompetitiveMode()
+    {
+        if (string.Equals(
+                ConVar.Find("bot_quota_mode")?.StringValue,
+                "competitive",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        int gameType = ConVar.Find("game_type")?.GetPrimitiveValue<int>() ?? -1;
+        int gameMode = ConVar.Find("game_mode")?.GetPrimitiveValue<int>() ?? -1;
+        return gameType == 0 && gameMode == 1;
     }
 
     // Restores plugin-owned state before the plugin unloads
@@ -233,6 +259,7 @@ public class BotState : BasePlugin
 
     private void StartDefuseSmokeCycle()
     {
+        if (IsCompetitiveMode()) return;
         if (_defuseExpandTimer != null) return;
 
         _defuseExpandTimer = AddTimer(3.5f, () =>
@@ -802,6 +829,7 @@ public class BotState : BasePlugin
     // Clears per-round state and releases elimination knife locks
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
+        ApplySmokeVisibilityPolicy();
         ReleaseKnifeLocks();
         _eliminationHandled = false;
         _isFreezeTime = true;

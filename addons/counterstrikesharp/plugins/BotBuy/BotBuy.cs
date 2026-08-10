@@ -4,6 +4,7 @@ using CounterStrikeSharp.API.Core.Attributes.Registration;
 using CounterStrikeSharp.API.Modules.Utils;
 using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Modules.Timers;
+using BotBehaviorPolicy;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -325,6 +326,8 @@ public sealed class BotBuyPatch : BasePlugin
                 }
             }
         });
+
+        AddTimer(0.8f, ApplyCompetitiveRiflePreference);
         // Buy Defuser
         AddTimer(3.0f, () =>
         {
@@ -561,6 +564,183 @@ public sealed class BotBuyPatch : BasePlugin
         });
         return HookResult.Continue;
     }
+
+    private void ApplyCompetitiveRiflePreference()
+    {
+        if (!IsCompetitiveMode())
+            return;
+
+        foreach (var player in Utilities
+                     .FindAllEntitiesByDesignerName<CCSPlayerController>(
+                         "cs_player_controller"))
+        {
+            if (!player.IsValid || !player.IsBot || player.InGameMoneyServices == null)
+                continue;
+
+            var pawn = player.PlayerPawn?.Value;
+            if (pawn == null || !pawn.IsValid)
+                continue;
+
+            string? currentPrimary = CurrentPrimaryWeapon(player);
+            PurchaseArmor currentArmor = ToPurchaseArmor(pawn.ArmorValue);
+            var selected = RiflePurchasePolicy.SelectBestAffordable(
+                BuildPrimaryCandidates(player.Team),
+                player.InGameMoneyServices.Account,
+                currentArmor);
+            if (selected is not { } candidate)
+                continue;
+
+            bool weaponReady = string.Equals(
+                currentPrimary,
+                candidate.Weapon,
+                StringComparison.Ordinal);
+            if (!weaponReady && currentPrimary != null)
+            {
+                var current = new PrimaryPurchaseCandidate(
+                    currentPrimary,
+                    0,
+                    currentArmor);
+                if (!RiflePurchasePolicy.ShouldReplace(current, candidate))
+                {
+                    continue;
+                }
+            }
+            if (!weaponReady)
+            {
+                weaponReady = currentPrimary == null
+                    ? Buy(player, candidate.Weapon)
+                    : Swap(player, currentPrimary, candidate.Weapon);
+            }
+
+            if (!weaponReady)
+                continue;
+
+            if (candidate.Armor > currentArmor)
+            {
+                if (candidate.Armor == PurchaseArmor.Full)
+                    Buy(player, "item_assaultsuit");
+                else if (candidate.Armor == PurchaseArmor.Half)
+                    Buy(player, "item_kevlar");
+            }
+
+            Server.PrintToConsole(
+                $"[BotBuy] RiflePreference slot={player.Slot} "
+                + $"weapon={candidate.Weapon} armor={candidate.Armor}");
+        }
+    }
+
+    private static IEnumerable<PrimaryPurchaseCandidate> BuildPrimaryCandidates(CsTeam team)
+    {
+        if (team == CsTeam.Terrorist)
+        {
+            foreach (var candidate in BuildWeaponCandidates(
+                         ("weapon_galilar", 1800),
+                         ("weapon_ak47", 2700),
+                         ("weapon_sg556", 3000),
+                         ("weapon_g3sg1", 5000),
+                         ("weapon_ssg08", 1700),
+                         ("weapon_negev", 1700),
+                         ("weapon_m249", 5200),
+                         ("weapon_mac10", 1050),
+                         ("weapon_mp7", 1500),
+                         ("weapon_mp5sd", 1500),
+                         ("weapon_ump45", 1200),
+                         ("weapon_bizon", 1400),
+                         ("weapon_p90", 2350),
+                         ("weapon_nova", 1050),
+                         ("weapon_xm1014", 2000),
+                         ("weapon_sawedoff", 1100),
+                         ("weapon_awp", 4750)))
+            {
+                yield return candidate;
+            }
+        }
+        else if (team == CsTeam.CounterTerrorist)
+        {
+            foreach (var candidate in BuildWeaponCandidates(
+                         ("weapon_famas", 1950),
+                         ("weapon_m4a1", 2900),
+                         ("weapon_m4a1_silencer", 2900),
+                         ("weapon_aug", 3300),
+                         ("weapon_scar20", 5000),
+                         ("weapon_ssg08", 1700),
+                         ("weapon_negev", 1700),
+                         ("weapon_m249", 5200),
+                         ("weapon_mp9", 1250),
+                         ("weapon_mp7", 1500),
+                         ("weapon_mp5sd", 1500),
+                         ("weapon_ump45", 1200),
+                         ("weapon_bizon", 1400),
+                         ("weapon_p90", 2350),
+                         ("weapon_nova", 1050),
+                         ("weapon_xm1014", 2000),
+                         ("weapon_mag7", 1300),
+                         ("weapon_awp", 4750)))
+            {
+                yield return candidate;
+            }
+        }
+    }
+
+    private static IEnumerable<PrimaryPurchaseCandidate> BuildWeaponCandidates(
+        params (string Weapon, int Price)[] values)
+    {
+        foreach (var value in values)
+        {
+            string weapon = value.Weapon;
+            int price = value.Price;
+            yield return new PrimaryPurchaseCandidate(weapon, price, PurchaseArmor.Full);
+            yield return new PrimaryPurchaseCandidate(weapon, price, PurchaseArmor.Half);
+            if (weapon == "weapon_awp" || !RiflePurchasePolicy.IsRifle(weapon))
+                yield return new PrimaryPurchaseCandidate(weapon, price, PurchaseArmor.None);
+        }
+    }
+
+    private static PurchaseArmor ToPurchaseArmor(int armor)
+        => armor > 99 ? PurchaseArmor.Full
+            : armor > 0 ? PurchaseArmor.Half
+            : PurchaseArmor.None;
+
+    private static bool IsCompetitiveMode()
+    {
+        if (string.Equals(
+                ConVar.Find("bot_quota_mode")?.StringValue,
+                "competitive",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        int gameType = ConVar.Find("game_type")?.GetPrimitiveValue<int>() ?? -1;
+        int gameMode = ConVar.Find("game_mode")?.GetPrimitiveValue<int>() ?? -1;
+        return gameType == 0 && gameMode == 1;
+    }
+
+    private static string? CurrentPrimaryWeapon(CCSPlayerController player)
+    {
+        var weapons = player.PlayerPawn?.Value?.WeaponServices?.MyWeapons;
+        if (weapons == null)
+            return null;
+
+        foreach (var handle in weapons)
+        {
+            string? weapon = handle.Value?.DesignerName;
+            if (weapon != null && IsPrimaryWeapon(weapon))
+                return weapon;
+        }
+
+        return null;
+    }
+
+    private static bool IsPrimaryWeapon(string weapon)
+        => weapon is "weapon_ak47" or "weapon_m4a1" or "weapon_m4a1_silencer"
+            or "weapon_aug" or "weapon_sg556" or "weapon_galilar"
+            or "weapon_famas" or "weapon_ssg08" or "weapon_awp"
+            or "weapon_scar20" or "weapon_g3sg1" or "weapon_mp9"
+            or "weapon_mac10" or "weapon_mp7" or "weapon_mp5sd"
+            or "weapon_ump45" or "weapon_bizon" or "weapon_p90"
+            or "weapon_nova" or "weapon_xm1014" or "weapon_sawedoff"
+            or "weapon_mag7" or "weapon_negev" or "weapon_m249";
 
     [GameEventHandler]
     public HookResult OnRoundFreezeEnd(EventRoundFreezeEnd @event, GameEventInfo info)
