@@ -173,10 +173,6 @@ try {
         }
     }
 
-    $BotControllerApiDestinationDirectory = Join-Path $Staging "addons/counterstrikesharp/shared/BotControllerApi"
-    New-Item -ItemType Directory -Path $BotControllerApiDestinationDirectory -Force | Out-Null
-    Copy-Item -LiteralPath $BotControllerApi -Destination $BotControllerApiDestinationDirectory -Force
-
     $SourceGrenades = Join-Path $Root "addons/counterstrikesharp/plugins/NadeSystem/grenades"
     $DestinationGrenades = Join-Path $Staging "addons/counterstrikesharp/plugins/NadeSystem/grenades"
     if (Test-Path -LiteralPath $DestinationGrenades) {
