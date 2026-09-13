@@ -64,21 +64,33 @@ function Copy-IfPresent {
 function Assert-BotControllerAbi {
     param([Parameter(Mandatory = $true)][string]$NativeLibraryPath)
 
-    $escapedPath = $NativeLibraryPath.Replace('\', '\\').Replace('"', '\"')
     $probeSource = @"
 using System;
 using System.Runtime.InteropServices;
 
 public static class BotControllerAbiProbe
 {
-    [DllImport("$escapedPath", CallingConvention = CallingConvention.Cdecl)]
-    private static extern int BotController_GetVersion();
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int GetVersionDelegate();
 
-    public static int Read() => BotController_GetVersion();
+    public static int Read(string libraryPath)
+    {
+        IntPtr library = NativeLibrary.Load(libraryPath);
+        try
+        {
+            IntPtr export = NativeLibrary.GetExport(library, "BotController_GetVersion");
+            var getVersion = Marshal.GetDelegateForFunctionPointer<GetVersionDelegate>(export);
+            return getVersion();
+        }
+        finally
+        {
+            NativeLibrary.Free(library);
+        }
+    }
 }
 "@
     Add-Type -TypeDefinition $probeSource -Language CSharp -ErrorAction Stop | Out-Null
-    $actualAbi = [BotControllerAbiProbe]::Read()
+    $actualAbi = [BotControllerAbiProbe]::Read($NativeLibraryPath)
     if ($actualAbi -ne $ExpectedBotControllerAbi) {
         throw "BotController ABI mismatch. Expected $ExpectedBotControllerAbi, got $actualAbi from $NativeLibraryPath"
     }
