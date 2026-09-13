@@ -24,7 +24,6 @@ $VpkEditUri = "https://github.com/craftablescience/VPKEdit/releases/download/$Vp
 $VpkEditSha256 = "d9ceaf3f16aea17c06e3be79da93c55a597af1487eed8a1b42dada1ea8d54503"
 $CreatedCompileFiles = [System.Collections.Generic.List[string]]::new()
 $CompileBackups = [System.Collections.Generic.List[object]]::new()
-$ExpectedBotControllerAbi = 17
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $Root "artifacts"
@@ -61,52 +60,90 @@ function Copy-IfPresent {
     }
 }
 
+function Read-BotControllerManagedAbi {
+    param([Parameter(Mandatory = $true)][string]$ManagedPluginPath)
+
+    $Assembly = [Reflection.Assembly]::LoadFrom($ManagedPluginPath)
+    $Type = $Assembly.GetType("BotControllerApi.BotController", $false)
+    if ($null -eq $Type) {
+        throw "BotController managed plugin does not contain BotControllerApi.BotController: $ManagedPluginPath"
+    }
+
+    $Field = $Type.GetField(
+        "ExpectedAbiVersion",
+        [Reflection.BindingFlags]::NonPublic -bor [Reflection.BindingFlags]::Static)
+    if ($null -eq $Field) {
+        throw "BotController managed plugin does not expose an ExpectedAbiVersion constant: $ManagedPluginPath"
+    }
+
+    return [Convert]::ToInt32($Field.GetRawConstantValue())
+}
+
 function Assert-BotControllerAbi {
-    param([Parameter(Mandatory = $true)][string]$NativeLibraryPath)
+    param(
+        [Parameter(Mandatory = $true)][string]$NativeLibraryPath,
+        [Parameter(Mandatory = $true)][int]$ExpectedAbi
+    )
 
     $probeSource = @"
 using System;
-using System.IO;
 using System.Runtime.InteropServices;
 
 public static class BotControllerAbiProbe
 {
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate int GetVersionDelegate();
+    private const uint DontResolveDllReferences = 0x00000001;
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr LoadLibraryEx(string fileName, IntPtr file, uint flags);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+    private static extern IntPtr GetProcAddress(IntPtr module, string name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetDllDirectory(string path);
+    private static extern bool FreeLibrary(IntPtr module);
 
-    public static int Read(string libraryPath)
+    public static int Read(string libraryPath, int expectedAbi)
     {
-        string libraryDirectory = Path.GetDirectoryName(libraryPath);
-        if (string.IsNullOrWhiteSpace(libraryDirectory) || !SetDllDirectory(libraryDirectory))
-            throw new InvalidOperationException($"Unable to set native DLL search directory: {libraryDirectory}");
+        IntPtr module = LoadLibraryEx(libraryPath, IntPtr.Zero, DontResolveDllReferences);
+        if (module == IntPtr.Zero)
+            throw new InvalidOperationException($"Unable to map native DLL without resolving dependencies: {libraryPath} (Win32 {Marshal.GetLastWin32Error()})");
 
-        IntPtr library = IntPtr.Zero;
         try
         {
-            library = NativeLibrary.Load(libraryPath);
-            IntPtr export = NativeLibrary.GetExport(library, "BotController_GetVersion");
-            var getVersion = Marshal.GetDelegateForFunctionPointer<GetVersionDelegate>(export);
-            return getVersion();
+            IntPtr export = GetProcAddress(module, "BotController_GetVersion");
+            if (export == IntPtr.Zero)
+                throw new InvalidOperationException($"BotController_GetVersion export is missing: {libraryPath}");
+
+            byte[] code = new byte[32];
+            Marshal.Copy(export, code, 0, code.Length);
+            int actualAbi = 0;
+            bool foundAbiReturn = false;
+            for (int index = 0; index <= code.Length - 6; index++)
+            {
+                if (code[index] != 0xb8 || code[index + 5] != 0xc3)
+                    continue;
+                actualAbi = BitConverter.ToInt32(code, index + 1);
+                foundAbiReturn = true;
+                break;
+            }
+            if (!foundAbiReturn)
+                throw new InvalidOperationException($"BotController_GetVersion has no recognizable ABI return: {libraryPath}");
+
+            if (actualAbi != expectedAbi)
+                throw new InvalidOperationException($"BotController ABI mismatch. Managed plugin expects {expectedAbi}, native library reports {actualAbi}: {libraryPath}");
+            return actualAbi;
         }
         finally
         {
-            if (library != IntPtr.Zero)
-                NativeLibrary.Free(library);
-            SetDllDirectory(null);
+            FreeLibrary(module);
         }
     }
 }
 "@
     Add-Type -TypeDefinition $probeSource -Language CSharp -ErrorAction Stop | Out-Null
-    $actualAbi = [BotControllerAbiProbe]::Read($NativeLibraryPath)
-    if ($actualAbi -ne $ExpectedBotControllerAbi) {
-        throw "BotController ABI mismatch. Expected $ExpectedBotControllerAbi, got $actualAbi from $NativeLibraryPath"
-    }
-    Write-Host "BotController native ABI: $actualAbi"
+    $actualAbi = [BotControllerAbiProbe]::Read($NativeLibraryPath, $ExpectedAbi)
+    Write-Host "BotController ABI: $actualAbi (managed plugin/native static consistency; runtime probe requires CS2 host)"
     return $actualAbi
 }
 
@@ -138,12 +175,15 @@ try {
     $Staging = $BaseDirectory
     $RayTraceApi = Join-Path $Staging "addons/counterstrikesharp/shared/RayTraceApi/RayTraceApi.dll"
     $BotControllerApi = Join-Path $Staging "addons/counterstrikesharp/shared/BotControllerApi/BotControllerApi.dll"
+    $BotControllerManaged = Join-Path $Staging "addons/counterstrikesharp/plugins/BotControllerImpl/BotControllerImpl.dll"
     Require-File (Join-Path $Staging "addons/RayTrace/bin/win64/RayTrace.dll")
     $BotControllerNative = Join-Path $Staging "addons/BotController/bin/win64/BotController.dll"
     Require-File $BotControllerNative
     Require-File $RayTraceApi
     Require-File $BotControllerApi
-    $BotControllerAbi = Assert-BotControllerAbi $BotControllerNative
+    Require-File $BotControllerManaged
+    $ExpectedBotControllerAbi = Read-BotControllerManagedAbi $BotControllerManaged
+    $BotControllerAbi = Assert-BotControllerAbi $BotControllerNative $ExpectedBotControllerAbi
 
     $RayTraceCompileTargets = @(
         "addons/counterstrikesharp/plugins/BotAimImprover/libs",
