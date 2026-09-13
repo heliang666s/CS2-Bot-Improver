@@ -6,8 +6,10 @@ using CounterStrikeSharp.API.Core.Attributes;
 using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Utils;
 using CounterStrikeSharp.API.Modules.Memory.DynamicFunctions;
+using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Core.Capabilities;
 using RayTraceAPI;
+using BotBehaviorPolicy;
 using Microsoft.Extensions.Logging;
 
 
@@ -16,6 +18,8 @@ namespace BotAimImprover;
 [MinimumApiVersion(305)]
 public class BotAimImprover : BasePlugin
 {
+    private const float SmokeBlockRadius = 160f;
+
     public override string ModuleName => "BotAimImprover";
     public override string ModuleVersion => "2.1.3";
     public override string ModuleAuthor => "ed0ard & htfy96 & XBribo";
@@ -129,6 +133,8 @@ public class BotAimImprover : BasePlugin
     private Offsets _off;
 
     private MemoryFunctionVoid<IntPtr>? _pickNewAimSpot;
+    private IReadOnlyList<SmokeVolume> _activeSmokeVolumes = Array.Empty<SmokeVolume>();
+    private bool _smokeVolumesAvailable;
     private static readonly PluginCapability<CRayTraceInterface> _rayTraceCapability =
         new("raytrace:craytraceinterface");
 
@@ -184,8 +190,12 @@ public class BotAimImprover : BasePlugin
         RegisterEventHandler<EventRoundStart>((_, _) =>
         {
             _botToControllerUserId.Clear();
+            _activeSmokeVolumes = Array.Empty<SmokeVolume>();
+            _smokeVolumesAvailable = false;
             return HookResult.Continue;
         });
+
+        RegisterListener<Listeners.OnTick>(RefreshActiveSmokeVolumes);
 
         RegisterEventHandler<EventPlayerDisconnect>((ev, _) =>
         {
@@ -253,7 +263,9 @@ public class BotAimImprover : BasePlugin
 
             // 1) Gate: enemy must be generally visible before we
             //    spend any raytraces. Otherwise the native used last-known position.
-            if (ReadByte(pCCSBot + _off.IsVisible) == 0)
+            if (ReadByte(pCCSBot + _off.IsVisible) == 0
+                || (IsCompetitiveMode()
+                    && (_rayTraceCapability.Get() == null || !_smokeVolumesAvailable)))
                 return HookResult.Continue;
 
             // 2) Resolve enemy pawn from m_enemy CHandle.
@@ -295,7 +307,15 @@ public class BotAimImprover : BasePlugin
             {
                 if (!TryComputePartPos(enemyPawn, idx, out float x, out float y, out float z))
                     continue;
-                if (!PointVisibleFromEye(botEye, x, y, z))
+                if (!PointVisibleFromEye(botEye, x, y, z)
+                    || VisibilityGeometry.SegmentIntersectsAnySmoke(
+                        botEye.X,
+                        botEye.Y,
+                        botEye.Z,
+                        x,
+                        y,
+                        z,
+                        _activeSmokeVolumes))
                     continue;
                 chosenIdx = idx;
                 rx = x; ry = y; rz = z;
@@ -408,19 +428,74 @@ public class BotAimImprover : BasePlugin
                  || float.IsInfinity(x) || float.IsInfinity(y) || float.IsInfinity(z));
     }
 
+    private void RefreshActiveSmokeVolumes()
+    {
+        if (!IsCompetitiveMode())
+        {
+            _activeSmokeVolumes = Array.Empty<SmokeVolume>();
+            _smokeVolumesAvailable = true;
+            return;
+        }
+
+        try
+        {
+            var volumes = new List<SmokeVolume>();
+            foreach (var smoke in Utilities
+                         .FindAllEntitiesByDesignerName<CSmokeGrenadeProjectile>(
+                             "smokegrenade_projectile"))
+            {
+                if (!smoke.IsValid || !smoke.DidSmokeEffect)
+                    continue;
+
+                var center = smoke.SmokeDetonationPos;
+                if (center is null)
+                    continue;
+
+                volumes.Add(new SmokeVolume(
+                    center.X,
+                    center.Y,
+                    center.Z,
+                    SmokeBlockRadius));
+            }
+
+            _activeSmokeVolumes = volumes;
+            _smokeVolumesAvailable = true;
+        }
+        catch
+        {
+            _activeSmokeVolumes = Array.Empty<SmokeVolume>();
+            _smokeVolumesAvailable = false;
+        }
+    }
+
+    private static bool IsCompetitiveMode()
+    {
+        if (string.Equals(
+                ConVar.Find("bot_quota_mode")?.StringValue,
+                "competitive",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        int gameType = ConVar.Find("game_type")?.GetPrimitiveValue<int>() ?? -1;
+        int gameMode = ConVar.Find("game_mode")?.GetPrimitiveValue<int>() ?? -1;
+        return gameType == 0 && gameMode == 1;
+    }
+
     // World-only LoS test from eye to target point. True if unobstructed (>= 0.999).
     private bool PointVisibleFromEye(Vector eye, float tx, float ty, float tz)
     {
         try
         {
             var rt = _rayTraceCapability.Get();
-            if (rt == null) return true; // RayTrace not loaded -> don't block
+            if (rt == null) return !IsCompetitiveMode();
             var end = new Vector(tx, ty, tz);
             var opts = new TraceOptions(InteractionLayers.MASK_WORLD_ONLY);
             rt.TraceEndShape(eye, end, null, opts, out TraceResult res);
             return res.Fraction >= 0.999f;
         }
-        catch { return true; }
+        catch { return !IsCompetitiveMode(); }
     }
 
     // ============================================================

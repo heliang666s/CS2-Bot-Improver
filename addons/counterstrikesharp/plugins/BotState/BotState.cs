@@ -23,6 +23,8 @@ public class BotState : BasePlugin
     public override string ModuleAuthor => "ed0ard & XBribo & unicbm";
     public override string ModuleDescription => "Make bots smarter";
 
+    private const float NormalSmokeLength = 50f;
+    private const float CompetitiveSmokeLength = 0f;
     private const float HurtRevealSeconds = 0.8f;
     private const float DefuseRevealSeconds = 1.5f;
     private const float DefuseHiddenSeconds = 3.5f;
@@ -77,6 +79,7 @@ public class BotState : BasePlugin
     private readonly HashSet<int> _pendingDefuseRestore = new();
     private readonly Dictionary<int, long> _fakeDefuseSuppressionIds = new();
     private bool _isFreezeTime = false;
+    private ConVar? _smokeVisibilityConVar;
 
     // 360 FOV patch tracking for fake defuse search
     private sealed record FovPatchDefinition(
@@ -174,6 +177,9 @@ public class BotState : BasePlugin
     // Registers game events and the per-tick bot behavior listener
     public override void Load(bool hotReload)
     {
+        _smokeVisibilityConVar = ConVar.Find("bot_max_visible_smoke_length");
+        ApplySmokeVisibilityPolicy();
+        RegisterListener<Listeners.OnMapStart>(_ => ApplySmokeVisibilityPolicy());
         InstallDefuseBombHook();
         InstallBotBlindHook();
         InitializeFovPatches();
@@ -244,6 +250,9 @@ public class BotState : BasePlugin
     // Further damage from the same source only pushes the window out. Windows never stack.
     private HookResult OnPlayerHurt(EventPlayerHurt @event, GameEventInfo _)
     {
+        if (IsCompetitiveMode())
+            return HookResult.Continue;
+
         try
         {
             var victim = @event.Userid;
@@ -308,6 +317,34 @@ public class BotState : BasePlugin
         Server.ExecuteCommand("bv_reveal clear");
     }
 
+    private void SetSmokeVisibilityLength(float length)
+    {
+        if (_smokeVisibilityConVar != null)
+            _smokeVisibilityConVar.SetValue(length);
+        else
+            Server.ExecuteCommand($"bot_max_visible_smoke_length {length}");
+    }
+
+    private void ApplySmokeVisibilityPolicy()
+        => SetSmokeVisibilityLength(IsCompetitiveMode()
+            ? CompetitiveSmokeLength
+            : NormalSmokeLength);
+
+    private static bool IsCompetitiveMode()
+    {
+        if (string.Equals(
+                ConVar.Find("bot_quota_mode")?.StringValue,
+                "competitive",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        int gameType = ConVar.Find("game_type")?.GetPrimitiveValue<int>() ?? -1;
+        int gameMode = ConVar.Find("game_mode")?.GetPrimitiveValue<int>() ?? -1;
+        return gameType == 0 && gameMode == 1;
+    }
+
     // Restores plugin-owned state before the plugin unloads
     public override void Unload(bool hotReload)
     {
@@ -317,6 +354,7 @@ public class BotState : BasePlugin
         RestoreAllFovPatches();
         ReleaseKnifeLocks();
         ClearReveals();
+        SetSmokeVisibilityLength(NormalSmokeLength);
         _defuseRevealTimer?.Kill();
         _gunReequipTimer?.Kill();
     }
@@ -359,6 +397,7 @@ public class BotState : BasePlugin
     // Reveals the bomb-defuser for 1.5s out of every 5s of defusing
     private void StartDefuseRevealCycle()
     {
+        if (IsCompetitiveMode()) return;
         if (_defuseRevealTimer != null) return;
 
         _defuseRevealTimer = AddTimer(DefuseHiddenSeconds, () =>
@@ -936,6 +975,7 @@ public class BotState : BasePlugin
     // Clears per-round state and releases elimination knife locks
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
+        ApplySmokeVisibilityPolicy();
         ReleaseKnifeLocks();
         StopDefuseReveal();
         ClearReveals();
