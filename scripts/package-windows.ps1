@@ -73,18 +73,29 @@ public static class BotControllerAbiProbe
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate int GetVersionDelegate();
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetDllDirectory(string? path);
+
     public static int Read(string libraryPath)
     {
-        IntPtr library = NativeLibrary.Load(libraryPath);
+        string? libraryDirectory = Path.GetDirectoryName(libraryPath);
+        if (string.IsNullOrWhiteSpace(libraryDirectory) || !SetDllDirectory(libraryDirectory))
+            throw new InvalidOperationException($"Unable to set native DLL search directory: {libraryDirectory}");
+
+        IntPtr library = IntPtr.Zero;
         try
         {
+            library = NativeLibrary.Load(libraryPath);
             IntPtr export = NativeLibrary.GetExport(library, "BotController_GetVersion");
             var getVersion = Marshal.GetDelegateForFunctionPointer<GetVersionDelegate>(export);
             return getVersion();
         }
         finally
         {
-            NativeLibrary.Free(library);
+            if (library != IntPtr.Zero)
+                NativeLibrary.Free(library);
+            SetDllDirectory(null);
         }
     }
 }
