@@ -66,6 +66,7 @@ function Assert-BotControllerAbi {
 
     $probeSource = @"
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
 
 public static class BotControllerAbiProbe
@@ -75,11 +76,11 @@ public static class BotControllerAbiProbe
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetDllDirectory(string? path);
+    private static extern bool SetDllDirectory(string path);
 
     public static int Read(string libraryPath)
     {
-        string? libraryDirectory = Path.GetDirectoryName(libraryPath);
+        string libraryDirectory = Path.GetDirectoryName(libraryPath);
         if (string.IsNullOrWhiteSpace(libraryDirectory) || !SetDllDirectory(libraryDirectory))
             throw new InvalidOperationException($"Unable to set native DLL search directory: {libraryDirectory}");
 
